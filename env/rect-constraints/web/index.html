@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>矩形几何约束编辑器</title>
+<link rel="stylesheet" href="/css/app.css" />
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand">▭ 矩形约束编辑器</div>
+    <div class="toolbar">
+      <button id="btn-add-rect" title="添加矩形 (A)">＋ 矩形</button>
+      <span class="sep"></span>
+      <button id="btn-undo" title="撤销 (Ctrl+Z)">↶ 撤销</button>
+      <button id="btn-redo" title="重做 (Ctrl+Y / Ctrl+Shift+Z)">↷ 重做</button>
+      <span class="sep"></span>
+      <button id="btn-snap" class="primary">🔗 添加约束…</button>
+      <button id="btn-delete" class="danger" disabled>删除所选</button>
+      <span class="spacer"></span>
+      <span id="hash-chip" class="chip" title="当前解的确定性指纹（位置+约束成败+冲突）">hash —</span>
+      <span id="save-chip" class="chip muted">未保存</span>
+    </div>
+  </header>
+
+  <main class="main">
+    <!-- 画布 -->
+    <section class="canvas-wrap" id="canvas-wrap">
+      <svg id="canvas" viewBox="0 0 1000 700" preserveAspectRatio="xMidYMid meet">
+        <defs>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M40 0H0V40" fill="none" stroke="#e6e9ef" stroke-width="1"/>
+          </pattern>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L7,3 L0,6 Z" fill="#8a93a6"/>
+          </marker>
+        </defs>
+        <rect id="canvas-bg" x="0" y="0" width="1000" height="700" fill="url(#grid)" stroke="#c2c9d6"/>
+        <g id="edge-layer"></g>
+        <g id="rect-layer"></g>
+        <g id="overlay-layer"></g>
+      </svg>
+      <div id="hint" class="hint">拖动矩形移动；Shift+点击加入多选 / 框选成组；双击重命名；选中矩形后用顶部「添加约束」。</div>
+    </section>
+
+    <!-- 右侧面板 -->
+    <aside class="side">
+      <div class="tabs">
+        <button class="tab active" data-tab="constraints">约束</button>
+        <button class="tab" data-tab="props">属性</button>
+        <button class="tab" data-tab="conflicts">冲突 <span id="conflict-count" class="badge">0</span></button>
+      </div>
+
+      <div class="tab-body" data-body="constraints">
+        <div id="constraint-list" class="list"></div>
+      </div>
+
+      <div class="tab-body hidden" data-body="props">
+        <div id="props-panel" class="props"></div>
+      </div>
+
+      <div class="tab-body hidden" data-body="conflicts">
+        <div id="conflict-panel" class="conflicts"></div>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<!-- 添加约束对话框 -->
+<div id="dlg" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <span id="dlg-title">添加约束</span>
+      <button id="dlg-close" class="icon-btn">✕</button>
+    </div>
+    <div id="dlg-body"></div>
+    <div class="modal-foot">
+      <span id="dlg-error" class="dlg-error"></span>
+      <span class="spacer"></span>
+      <button id="dlg-cancel">取消</button>
+      <button id="dlg-ok" class="primary">提交约束</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>

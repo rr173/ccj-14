@@ -1,0 +1,18 @@
+services:
+  rect-constraints:
+    build: .
+    image: rect-constraints:latest
+    container_name: rect-constraints
+    ports:
+      - "8080:8080"
+    volumes:
+      - rect-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  rect-data:
