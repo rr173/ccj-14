@@ -1,6 +1,7 @@
 import { Store } from './geom/store.js';
 import { View } from './geom/view.js';
 import { ConstraintDialog } from './geom/dialog.js';
+import { VersionPanel } from './geom/versionpanel.js';
 import {
   newRect, newSnap, newMinGap, newContain, newLock,
 } from './geom/model.js';
@@ -52,6 +53,8 @@ const view = new View($('#canvas'), store, {
 const dialog = new ConstraintDialog($('#dlg'), store);
 dialog.factoryFns = { newSnap, newMinGap, newContain, newLock };
 dialog.hooks = { onCycle: (cyc) => view.setCycleHighlight(cyc) };
+
+const versionPanel = new VersionPanel(store, { toast });
 
 let activeTab = 'constraints';
 
@@ -123,10 +126,35 @@ store.addEventListener('reject', (e) => {
   }
 });
 
+/* ---------- 布局版本 / 保存状态事件 ---------- */
+
+store.addEventListener('versions', (e) => {
+  versionPanel.render();
+  updateVersionChip();
+  if (e.detail?.type === 'restore') view.clearSelection(); // 旧选择可能指向已不存在的矩形
+});
+store.addEventListener('persist', () => { $('#save-chip').textContent = '保存中…'; });
+store.addEventListener('saved', () => { $('#save-chip').textContent = '已保存'; });
+store.addEventListener('saveerror', () => { $('#save-chip').textContent = '保存失败（已存本地）'; });
+store.addEventListener('saveconflict', () => {
+  // 旧页面提交被服务器拒绝：必须重新加载，绝不能覆盖另一页已保存的内容
+  $('#save-chip').textContent = '版本冲突';
+  $('#conflict-banner').classList.remove('hidden');
+  toast('版本冲突：另一个页面已保存了更新的内容，当前页面的修改未保存。请重新加载。', 'error');
+});
+$('#btn-reload').onclick = () => location.reload();
+// 加载/静默重载（其他页面保存了更新内容，本页无未保存修改时自动跟随）后整体刷新
+store.addEventListener('load', () => {
+  renderPanels();
+  $('#save-chip').textContent = '已保存';
+  $('#conflict-banner').classList.add('hidden');
+});
+
 function renderPanels() {
   renderConstraintList();
   renderProps();
   renderConflicts();
+  versionPanel.render();
   updateButtons();
   updateChips();
 }
@@ -333,10 +361,22 @@ function updateChips() {
   const rep = store.report;
   $('#hash-chip').textContent = 'hash ' + rep.hash.slice(0, 8);
   $('#hash-chip').title = `完整指纹 ${rep.hash}\n位置 + 每个约束的成败 + 冲突链`;
-  $('#save-chip').textContent = '已保存';
-  clearTimeout(updateChips._t);
-  updateChips._t = setTimeout(() => ($('#save-chip').textContent = '已保存'), 400);
-  $('#save-chip').textContent = '保存中…';
+  updateVersionChip();
+}
+
+function updateVersionChip() {
+  const chip = $('#version-chip');
+  const v = store.currentVersion;
+  if (!v) {
+    chip.textContent = '未保存版本';
+    chip.title = '当前编辑内容还没有保存为任何版本（在「版本」页保存）';
+    return;
+  }
+  const dirty = store.current?.hash !== v.hash;
+  chip.textContent = `版本:${v.name}${dirty ? '*' : ''}`;
+  chip.title = dirty
+    ? `基于版本「${v.name}」，已有修改（* 表示当前内容与该版本不同）`
+    : `当前内容与版本「${v.name}」一致`;
 }
 
 function toast(text, level = '') {

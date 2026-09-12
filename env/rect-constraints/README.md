@@ -49,6 +49,24 @@ ants 多边形标出。`contain → 画布` 不算矩形间边，不会参与成
 - 持久化：后端 `PUT /api/doc`（原子写、串行版本号队列防止旧快照覆盖新快照），
   后端不可用时自动回退 `localStorage`。
 
+## 布局版本
+
+「版本」页把当前**矩形 + 约束 + 求解结果 + 冲突报告**保存成带名称的**只读快照**：
+
+- **保存**：版本一旦创建不可修改；同名/空名被拒绝。保存后它成为「当前版本」
+  （顶栏 chip 显示版本名，内容与版本有出入时带 `*`）。
+- **比较**：任选两个版本，确定性地输出——矩形 新增/删除/移动/尺寸变化、
+  约束 新增/删除/同 id 修改、冲突数量变化与 新增未满足/已解决 清单。
+  比较选择随文档持久化，刷新后结果逐字节一致。
+- **恢复**：把版本内容提交为**新的当前编辑版本**（一次可撤销的历史），
+  原版本保持只读、绝不被改写。
+- **删除保护**：当前版本与已标记「发布」的版本不能删除。
+- **乐观并发**：文档带单调递增 `rev`，保存时携带 `baseRev`。两个页面基于同一版本
+  同时编辑时，后提交的页面会收到 `409`：页面顶部出现红色「版本冲突」横幅并要求
+  **重新加载**，本地修改保留在内存中但**不会覆盖**另一页已保存的内容；
+  若本页没有未保存修改，则静默跟随服务器最新内容，不打断编辑。
+- 版本列表、当前版本、发布标记、比较选择全部随文档持久化，刷新后保持一致。
+
 ## 运行
 
 ### Docker（推荐）
@@ -77,22 +95,25 @@ DATA_PATH=./data/doc.json HOST=127.0.0.1 PORT=8080 python3 server/server.py
 ## 测试
 
 ```bash
-npm test          # 求解器单元测试（15 个：贴齐/间距/包含/锁定/优先级/环/确定性/幂等）
+npm test          # 单元测试（求解器 15 个 + 布局版本 9 个：比较/只读/删除保护/并发冲突）
 # 端到端（需要先启动 server）：
 DATA_PATH=/tmp/rc.json python3 server/server.py &
-npm run test:e2e  # Store ↔ HTTP：提交、环拒绝、冲突链、undo/redo、刷新一致性
+npm run test:e2e  # Store ↔ HTTP：提交、环拒绝、冲突链、undo/redo、刷新一致性、
+                  # 版本保存/比较/恢复/发布、409 并发冲突不覆盖
 ```
 
 ## 目录
 
 ```
-server/server.py        零依赖 HTTP：静态文件 + /api/doc（原子持久化）
+server/server.py        零依赖 HTTP：静态文件 + /api/doc（原子持久化 + baseRev 乐观并发 409）
 web/index.html
 web/css/app.css
-web/js/app.js           装配：工具栏 / 面板 / 快捷键 / toast
+web/js/app.js           装配：工具栏 / 面板 / 版本事件 / 冲突横幅 / 快捷键 / toast
 web/js/geom/solver.js   确定性求解器 + 环检测 + 指纹（核心，无 DOM 依赖）
 web/js/geom/model.js    数据模型 / 校验 / 规范化
-web/js/geom/store.js    历史栈（undo/redo）+ 持久化
+web/js/geom/store.js    历史栈（undo/redo）+ 布局版本 + 持久化（乐观并发）
+web/js/geom/versions.js 版本快照 + 版本间差异比较（纯函数，无 DOM 依赖）
+web/js/geom/versionpanel.js  版本页 UI（保存/恢复/发布/删除/比较）
 web/js/geom/view.js     SVG 渲染与统一指针手势（拖动/组拖/框选/调尺寸）
 web/js/geom/dialog.js   添加约束对话框（环拒绝时定位）
 test/                   单元测试 + HTTP 端到端冒烟

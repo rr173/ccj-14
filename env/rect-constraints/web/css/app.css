@@ -203,3 +203,50 @@ rect-constraint rect:hover .handle, .rect-g.selected .handle { opacity: 1; }
 }
 .toast.error { background: var(--danger); }
 .toast.warn { background: var(--warn); }
+
+/* ---- 版本冲突横幅 ---- */
+#conflict-banner {
+  display: flex; align-items: center; gap: 14px; padding: 9px 16px;
+  background: var(--danger-soft); color: var(--danger);
+  border-bottom: 1px solid #e8a4a4; font-size: 13px;
+}
+#conflict-banner span { flex: 1; }
+#conflict-banner button { background: var(--danger); border-color: var(--danger); color: #fff; }
+#conflict-banner button:hover { background: #b93a3a; }
+
+/* ---- 版本面板 ---- */
+.ver-save { display: flex; gap: 8px; margin-bottom: 12px; }
+.ver-save input {
+  flex: 1; padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px; font: inherit; min-width: 0;
+}
+.ver-item { border: 1px solid var(--line); border-radius: 9px; padding: 9px 10px; background: #fff; }
+.ver-item.current { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.vrow1 { display: flex; align-items: center; gap: 7px; }
+.vname { font-weight: 700; font-size: 13px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vtag { font-size: 10px; padding: 1px 6px; border-radius: 4px; font-weight: 700; white-space: nowrap; }
+.tag-current { background: var(--accent-soft); color: var(--accent); }
+.tag-pub { background: var(--ok-soft); color: var(--ok); }
+.vmeta { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.6; }
+.vactions { display: flex; gap: 5px; margin-top: 7px; }
+.ver-h { margin: 16px 0 8px; font-size: 13px; color: var(--muted); }
+.ver-cmp { display: flex; align-items: center; gap: 7px; margin-bottom: 10px; }
+.ver-cmp select {
+  flex: 1; padding: 5px 7px; border: 1px solid var(--line); border-radius: 6px; font: inherit; min-width: 0;
+}
+.cmp-arrow { color: var(--muted); }
+.empty-note { color: var(--muted); font-size: 13px; text-align: center; margin-top: 24px; line-height: 1.7; }
+
+/* 比较结果 */
+.diff-sum {
+  font-size: 12px; font-weight: 700; padding: 7px 10px; border-radius: 7px;
+  background: var(--warn-soft); color: var(--warn); margin-bottom: 8px;
+}
+.diff-sum.same { background: var(--ok-soft); color: var(--ok); }
+.diff-group { border: 1px solid var(--line); border-radius: 9px; padding: 8px 10px; margin-bottom: 8px; background: #fff; }
+.dg-title { font-size: 12px; font-weight: 700; color: var(--muted); margin-bottom: 5px; }
+.diff-item { font-size: 12px; margin: 3px 0; line-height: 1.5; }
+.diff-item.add { color: var(--ok); }
+.diff-item.del { color: var(--danger); }
+.diff-item.mod { color: #43506a; }
+.diff-fields { display: block; color: var(--muted); font-size: 11px; margin-left: 16px; }
+.diff-none { font-size: 12px; color: var(--muted); }

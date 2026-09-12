@@ -101,5 +101,127 @@ const { solve } = await import('../web/js/geom/solver.js');
 const rep2 = solve(store2.model, null);
 ok(rep2.hash === store2.report.hash, '同一模型重复求解 hash 不变（确定性）');
 
+// 11) 布局版本：保存 / 比较 / 恢复 / 删除保护 / 发布标记
+const { compareVersions } = await import('../web/js/geom/versions.js');
+const vs = new Store({ base: BASE });
+await vs.load();
+const sv1 = vs.saveVersion('初版');
+ok(sv1.ok, '保存版本「初版」（矩形+约束+求解结果+冲突报告）');
+ok(vs.currentVersionId === sv1.version.id, '保存后它成为当前版本');
+ok(!vs.saveVersion('初版').ok, '同名版本被拒绝');
+ok(!vs.saveVersion('   ').ok, '空名称被拒绝');
+
+// 继续编辑：新增一对矩形 + 两条互相矛盾的约束（制造冲突），再移动锚点矩形。
+// 用全新矩形做锚点/跟随者：它们没有既有约束边，保证不成环、位置不被求解器回拉。
+const cr1 = vs.commit((m) => {
+  const n1 = newRect(600, 480, 110, 70, '比较甲');
+  const n2 = newRect(100, 480, 110, 70, '比较乙');
+  m.rects.push(n1, n2);
+  m.constraints.push(newSnap(n2.id, n1.id, 'x', 'l', 'l', 0, 95));
+  m.constraints.push(newSnap(n2.id, n1.id, 'x', 'r', 'l', 0, 5));
+});
+ok(cr1.ok, '新增矩形与矛盾约束提交成功');
+const anchorId = vs.model.rects.find((r) => r.name === '比较甲').id;
+const existingId = vs.model.rects.find((r) => r.name === '卡片A').id;
+const cr2 = vs.commit((m) => {
+  const r = m.rects.find((x) => x.id === anchorId);
+  r.x += 137; r.y += 49;
+  const e = m.rects.find((x) => x.id === existingId);
+  e.x += 60; e.y += 40; // 移动一个 sv1 中已存在的矩形，供 moved 检出
+});
+ok(cr2.ok, '移动锚点矩形提交成功');
+const sv2 = vs.saveVersion('第二版');
+ok(sv2.ok, '保存版本「第二版」');
+
+const diff = vs.compareById(sv1.version.id, sv2.version.id);
+ok(diff.rects.moved.some((x) => x.id === existingId), '比较检出矩形位置变化');
+ok(diff.rects.added.length === 2, `比较检出新增矩形（${diff.rects.added.length} 个）`);
+ok(diff.constraints.added.length === 2, `比较检出新增约束（${diff.constraints.added.length} 条）`);
+ok(diff.conflicts.after > diff.conflicts.before, `比较检出冲突数量变化（${diff.conflicts.before} → ${diff.conflicts.after}）`);
+ok(diff.conflicts.newUnmet.length >= 1, '比较检出新增未满足项');
+
+// 恢复初版：成为新的当前编辑版本，原版本只读不变
+const v1Hash = sv1.version.hash;
+ok(vs.restoreVersion(sv1.version.id).ok, '恢复「初版」成功');
+ok(vs.currentVersionId === sv1.version.id, '恢复后当前版本指向「初版」');
+ok(vs.current.hash === v1Hash, '恢复后的解与版本快照逐字节一致（确定性）');
+ok(vs.versions.find((v) => v.id === sv1.version.id).hash === v1Hash, '原版本未被改写');
+ok(vs.canUndo, '恢复本身可撤销');
+
+// 删除保护：当前版本 / 已发布版本
+ok(!vs.deleteVersion(sv1.version.id).ok, '当前版本不能删除');
+vs.setPublished(sv2.version.id, true);
+ok(!vs.deleteVersion(sv2.version.id).ok, '已发布版本不能删除');
+vs.setPublished(sv2.version.id, false);
+vs.setCompare(sv1.version.id, sv2.version.id);
+ok(vs.deleteVersion(sv2.version.id).ok, '取消发布后可删除');
+ok(vs.compare.b === null, '被删版本从比较选择中移除');
+
+// 再编辑并存第三版（带发布标记），固定比较对后落盘
+vs.commit((m) => m.rects.push(newRect(700, 100, 100, 70, '第三版矩形')));
+const n3id = vs.model.rects.find((r) => r.name === '第三版矩形').id;
+vs.commit((m) => { const r = m.rects.find((x) => x.id === n3id); r.x += 88; r.y += 44; });
+const sv3 = vs.saveVersion('第三版');
+vs.setPublished(sv3.version.id, true);
+vs.setCompare(sv1.version.id, sv3.version.id);
+await vs.flushed();
+
+// 12) 刷新一致性：版本列表 / 当前版本 / 发布标记 / 比较选择与比较结果
+const reload1 = new Store({ base: BASE });
+await reload1.load();
+ok(reload1.versions.length === vs.versions.length, `刷新后版本列表一致（${reload1.versions.length} 个）`);
+ok(reload1.currentVersionId === vs.currentVersionId, '刷新后当前版本一致');
+ok(reload1.versions.find((v) => v.id === sv3.version.id)?.published === true, '刷新后发布标记一致');
+ok(reload1.compare.a === sv1.version.id && reload1.compare.b === sv3.version.id, '刷新后比较选择一致');
+ok(JSON.stringify(reload1.compareById(sv1.version.id, sv3.version.id)) ===
+   JSON.stringify(vs.compareById(sv1.version.id, sv3.version.id)), '刷新后比较结果逐字节一致');
+ok(!reload1.deleteVersion(sv3.version.id).ok, '刷新后已发布版本仍不能删除');
+
+// 13) 并发：两个页面基于同一版本编辑，旧页面保存必须冲突且不覆盖
+const page1 = new Store({ base: BASE });
+await page1.load();
+const page2 = new Store({ base: BASE });
+await page2.load();
+ok(page1.rev === page2.rev, '两个页面基于同一服务端版本号');
+
+page1.commit((m) => m.rects.push(newRect(50, 550, 90, 60, '页面1的矩形')));
+await page1.flushed();
+ok(!page1.saveConflict, '页面1 保存成功');
+
+page2.commit((m) => m.rects.push(newRect(850, 550, 90, 60, '页面2的矩形')));
+await page2.flushed();
+ok(page2.saveConflict === true, '页面2 的旧版本提交被检测为版本冲突');
+ok(page2.model.rects.some((r) => r.name === '页面2的矩形'), '页面2 的本地修改仍保留（未丢失）');
+
+const check = new Store({ base: BASE });
+await check.load();
+ok(check.model.rects.some((r) => r.name === '页面1的矩形'), '服务器保留页面1的内容');
+ok(!check.model.rects.some((r) => r.name === '页面2的矩形'), '页面2的提交没有覆盖服务器');
+ok(check.rev === page1.rev, '服务器版本号只被页面1推进');
+
+// 14) 原始 HTTP：过期 baseRev 返回 409，缺少 baseRev 返回 422
+const curDoc = await (await fetch(BASE + '/api/doc')).json();
+ok(Number.isFinite(curDoc.rev), 'GET 返回文档版本号');
+const stale = await fetch(BASE + '/api/doc', {
+  method: 'PUT', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ ...curDoc, baseRev: curDoc.rev - 1 }),
+});
+ok(stale.status === 409, `过期 baseRev 被服务器拒绝（${stale.status}）`);
+const staleBody = await stale.json();
+ok(staleBody.rev === curDoc.rev, '409 响应带回当前版本号');
+const noRev = await fetch(BASE + '/api/doc', {
+  method: 'PUT', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ entries: curDoc.entries, idx: curDoc.idx }),
+});
+ok(noRev.status === 422, `缺少 baseRev 的提交被拒（${noRev.status}）`);
+const goodPut = await fetch(BASE + '/api/doc', {
+  method: 'PUT', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ ...curDoc, baseRev: curDoc.rev }),
+});
+ok(goodPut.status === 200, '正确 baseRev 保存成功');
+const afterDoc = await (await fetch(BASE + '/api/doc')).json();
+ok(afterDoc.rev === curDoc.rev + 1, '保存后版本号 +1');
+ok(afterDoc.versions.length === curDoc.versions.length, '版本列表在保存后保持');
+
 console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

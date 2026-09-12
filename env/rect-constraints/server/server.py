@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-矩形约束编辑器 —— 静态文件 + 单文档 JSON 持久化。
+矩形约束编辑器 —— 静态文件 + 单文档 JSON 持久化（含布局版本与乐观并发）。
 仅使用 Python 标准库（http.server / threading），便于极小镜像部署。
 
   GET  /                 -> web/index.html
-  GET  /api/doc          -> 当前文档（含 undo/redo 历史）
-  PUT  /api/doc          -> 整体覆盖保存（原子写 + 基本校验）
+  GET  /api/doc          -> 当前文档（含 undo/redo 历史、布局版本、rev）
+  PUT  /api/doc          -> 整体覆盖保存（原子写 + 结构校验 + baseRev 乐观并发检查）
   POST /api/reset        -> 删除服务端存档（客户端随后会重建）
+
+乐观并发：文档带单调递增的 rev。客户端保存时必须携带自己基于的 baseRev；
+与服务器当前 rev 不一致说明另一个页面已经保存过，返回 409 并拒绝覆盖，
+由客户端提示“版本冲突，请重新加载”。
 
 数据文件由 DATA_PATH 环境变量决定（默认 /data/doc.json），
 Docker 中挂载为卷；本地裸跑回退到 ./data/doc.json。
@@ -81,6 +85,21 @@ def _valid_shape(doc):
         m = e.get("model")
         if not isinstance(m, dict) or not isinstance(m.get("rects"), list) or not isinstance(m.get("constraints"), list):
             return False
+    # 乐观并发：客户端必须声明自己基于的服务端版本号
+    if not isinstance(doc.get("baseRev"), int) or isinstance(doc.get("baseRev"), bool) or doc["baseRev"] < 0:
+        return False
+    # 布局版本：只读快照列表（可为空）
+    versions = doc.get("versions", [])
+    if not isinstance(versions, list):
+        return False
+    for v in versions:
+        if not isinstance(v, dict):
+            return False
+        if not isinstance(v.get("id"), str) or not isinstance(v.get("name"), str):
+            return False
+        m = v.get("model")
+        if not isinstance(m, dict) or not isinstance(m.get("rects"), list) or not isinstance(m.get("constraints"), list):
+            return False
     return True
 
 
@@ -147,8 +166,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(422, {"error": "invalid-document"})
             return
         with _lock:
+            cur = _load_doc()
+            cur_rev = cur.get("rev", 0) if isinstance(cur, dict) else 0
+            if not isinstance(cur_rev, int) or isinstance(cur_rev, bool):
+                cur_rev = 0
+            if doc["baseRev"] != cur_rev:
+                # 旧页面提交：服务端已有更新的内容，拒绝覆盖，告知当前版本号
+                self._send_json(409, {"error": "revision-conflict", "rev": cur_rev})
+                return
+            doc.pop("baseRev", None)
+            doc["rev"] = cur_rev + 1
             _save_doc(doc)
-        self._send_json(200, {"ok": True, "entries": len(doc["entries"]), "idx": doc["idx"]})
+            self._send_json(200, {"ok": True, "rev": doc["rev"], "entries": len(doc["entries"]), "idx": doc["idx"]})
 
     def do_POST(self):
         if self.path.split("?", 1)[0] == "/api/reset":
