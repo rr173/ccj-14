@@ -1,49 +1,58 @@
 /*
- * Store：文档状态 + 撤销/重做 + 布局版本 + 持久化
+ * Store：文档状态 + 审计事件流 + 分支 + 撤销/重做 + 布局版本 + 持久化
  *
- * 关键约定：
- * - 历史里每条 entry = { model, report, hash }。report（每个约束成败、冲突链、
- *   位置指纹）一并入栈，undo/redo 恢复“同一组位置、约束和冲突结果”，而不是事后重算
- *   可能漂移的结果。
- * - 只有 model 是真相来源；report 是它的纯函数缓存（solver 确定性保证两者永远一致），
- *   同时缓存让刷新后的冲突高亮与提交时逐字节相同。
- * - 拖动中只更新视图不入栈；pointerup 提交一次历史。
- * - 任何修改前先过 validate + findCycle，环一律拒绝（由 UI 定位高亮）。
+ * 审计与分支（见 audit.js）：
+ * - events[] 是全局 append-only 的审计事件表，事件深冻结、永不修改/删除；
+ *   每次对矩形/约束的提交都追加一条，记录操作者、时间、提交前后指纹、
+ *   结构化变更（compareVersions）和当时的冲突结果。
+ * - branches[] 的每个分支由 parentId 链串起 root..head；undo/redo 沿链行走，
+ *   undo 后新提交会让旧链成为“支线”（detached），事件本身仍在审计流里可浏览、可回放。
+ * - replayEventId 非空时处于只读回放：current 取该事件快照，一切写操作被拒绝。
+ *   退出回放回到分支 head；从回放事件 fork 会创建带来源关系的新分支。
  *
- * 布局版本：
- * - versions[] 是带名称的只读快照（矩形 + 约束 + 求解结果 + 冲突报告），
- *   恢复版本 = 把快照提交为新的当前编辑版本（新历史条目），原版本不被改写。
- * - currentVersionId 指向最近保存/恢复到的版本；当前版本与已发布版本不能删除。
- * - compare = {a, b} 记录比较选择，随文档持久化，刷新后比较结果一致。
- *
- * 乐观并发：
- * - 服务端文档带单调递增 rev；保存时携带 baseRev，不一致 -> 409。
- * - 本页有未保存修改时收到 409：置 saveConflict，停止一切写入（绝不覆盖
- *   其他页面已保存的内容），由 UI 提示“版本冲突，请重新加载”。
- * - 本页没有未保存修改时收到 409：静默重新加载，跟随服务器最新内容。
+ * 乐观并发（分支头序号）：
+ * - 保存携带 baseHeads = { [branchId]: headEventId }（“所依据的事件序号”）。
+ * - 服务端若发现当前分支 head 已前进 -> 409「分支已前进」，明确拒绝覆盖。
+ * - 若过期提交发生在另一个页面新建/编辑的*不同分支*上，服务端按 mergeDocs
+ *   合流（事件不可变、按 id 并集），两边编辑都保留。
+ * - 本页有未保存修改时收到 409：锁定写入并提示；无修改时静默跟随。
  */
 
-import { solve, findCycle, fingerprint } from './solver.js';
+import { solve, findCycle } from './solver.js';
 import { validate, normalize, seedModel, uid } from './model.js';
 import { snapshotVersion, compareVersions } from './versions.js';
+import {
+  MAIN_BRANCH, makeRootEvent, makeEvent, makeForkRootEvent,
+  sanitizeAudit, migrateLegacy, timelineFor, localSeqOf, isAncestor,
+  mergeDocs, assessConflict, freeze,
+} from './audit.js';
 
-const LIMIT = 100;
-const LS_KEY = 'rect-constraints-doc-v1';
+const LS_KEY = 'rect-constraints-doc-v2';
+const LS_KEY_LEGACY = 'rect-constraints-doc-v1';
+const ACTOR_KEY = 'rect-constraints-actor';
 
 export class Store extends EventTarget {
   constructor({ base = '' } = {}) {
     super();
-    this.base = base; // 浏览器内为 ''（同源相对路径）
-    this.entries = [];
-    this.idx = -1;
-    this.dragPreview = null; // 拖动中的临时解（不入历史）
+    this.base = base;
+    this.events = [];
+    this.eventsById = new Map();
+    this.branches = [];
+    this.currentBranchId = MAIN_BRANCH;
+    this.replayEventId = null;   // 只读回放指向的事件 id
+    this.actor = localStorage.getItem(ACTOR_KEY) || '';
 
-    this.rev = 0;                 // 服务端文档版本号（乐观并发）
-    this.versions = [];           // 布局版本（只读快照）
-    this.currentVersionId = null; // 最近保存/恢复到的版本
-    this.compare = { a: null, b: null }; // 版本比较选择（持久化）
-    this.saveConflict = false;    // 409 后锁定：不再写任何存储
-    this._dirty = false;          // 自上次加载以来是否有未保存的本地修改
+    this.rev = 0;
+    this.versions = [];
+    this.currentVersionId = null;
+    this.compare = { a: null, b: null };
+    this.branchCompare = { a: null, b: null }; // 分支比较选择（持久化）
+    this.auditWarnings = [];
+
+    this.dragPreview = null;
+    this.saveConflict = null;   // null | { reason, branchName, headSeq }
+    this._dirty = false;
+    this._syncedHeads = {};     // 服务端已确认的各分支 headEventId
   }
 
   /* ---------- 装载 / 保存 ---------- */
@@ -56,56 +65,110 @@ export class Store extends EventTarget {
       console.warn('后端不可用，回退 localStorage:', e.message);
     }
     if (!doc) {
-      try { doc = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); } catch { doc = null; }
+      try { doc = JSON.parse(localStorage.getItem(LS_KEY) || localStorage.getItem(LS_KEY_LEGACY) || 'null'); } catch { doc = null; }
     }
-    if (!doc || !doc.entries || !doc.entries.length) {
-      doc = { entries: [], idx: -1 };
+    await this._adopt(doc, { seed: true });
+    this._dirty = false;
+    // 首次播种 / 迁移后立即回写并等待确认；正常加载不产生版本号竞争
+    if (this._needsInitialPersist) {
+      this._needsInitialPersist = false;
+      this._dirty = true;
+      this.persist();
+      await this.flushed();
     }
-    this.entries = doc.entries;
-    this.idx = Math.min(doc.idx ?? this.entries.length - 1, this.entries.length - 1);
-    this.rev = Number.isFinite(doc.rev) ? doc.rev : 0;
+    this._emit('load');
+  }
+
+  /** 把一个（可能是旧版、可能损坏的）文档装载为当前状态。 */
+  async _adopt(doc, { seed = false } = {}) {
+    let seeded = false;
+    if (!doc || (!(Array.isArray(doc.events) && doc.events.length) && Array.isArray(doc.entries))) {
+      // 旧版文档：entries/idx 迁移为不可变审计事件链
+      if (doc && Array.isArray(doc.entries) && doc.entries.length) {
+        doc = migrateLegacy(doc);
+        seeded = true;
+      } else {
+        doc = null;
+      }
+    }
+    if (!doc || !Array.isArray(doc.events) || !doc.events.length) {
+      const root = makeRootEvent(MAIN_BRANCH, { model: seedModel(), actor: this.actor || '系统' });
+      doc = {
+        events: [root],
+        branches: [freeze({
+          id: MAIN_BRANCH, name: '主分支', createdAt: root.t,
+          rootEventId: root.id, headEventId: root.id, redoTipId: null, source: null,
+        })],
+        currentBranchId: MAIN_BRANCH,
+        versions: [], currentVersionId: null,
+        compare: { a: null, b: null }, branchCompare: { a: null, b: null },
+        actor: this.actor,
+      };
+      seeded = true;
+    }
+
+    const clean = sanitizeAudit(doc);
+    this.events = clean.events;
+    this.eventsById = clean.eventsById;
+    this.branches = clean.branches;
+    this.currentBranchId = clean.branchesById.has(doc.currentBranchId) ? doc.currentBranchId : clean.currentBranchId;
+    this.actor = clean.actor || this.actor;
+    this.auditWarnings = clean.warnings;
+
+    if (clean.needSeed) {
+      // 主分支完全不可回放：用种子布局另立主分支，坏审计事件保留可见
+      const root = makeRootEvent(MAIN_BRANCH, { model: seedModel(), actor: this.actor || '系统' });
+      this.events = [...this.events, root];
+      this.eventsById.set(root.id, root);
+      this.branches = this.branches.filter((b) => b.id !== MAIN_BRANCH);
+      this.branches.push(freeze({
+        id: MAIN_BRANCH, name: '主分支', createdAt: root.t,
+        rootEventId: root.id, headEventId: root.id, redoTipId: null, source: null,
+      }));
+      this.currentBranchId = MAIN_BRANCH;
+      seeded = true;
+    }
+
+    if (seed) this._needsInitialPersist = seeded;
+
     this.versions = sanitizeVersions(doc.versions);
-    this.currentVersionId = this.versions.some((v) => v.id === doc.currentVersionId)
-      ? doc.currentVersionId : null;
+    this.currentVersionId = this.versions.some((v) => v.id === doc.currentVersionId) ? doc.currentVersionId : null;
     const cmp = doc.compare || {};
     this.compare = {
       a: this.versions.some((v) => v.id === cmp.a) ? cmp.a : null,
       b: this.versions.some((v) => v.id === cmp.b) ? cmp.b : null,
     };
-    this.saveConflict = false;
+    const bc = doc.branchCompare || {};
+    this.branchCompare = {
+      a: this.branches.some((b) => b.id === bc.a) ? bc.a : null,
+      b: this.branches.some((b) => b.id === bc.b) ? bc.b : null,
+    };
 
-    let seeded = false;
-    if (!this.entries.length) { this.resetToSeed({ persist: false }); seeded = true; }
-    const beforeHash = this.current?.hash;
-    this._recomputeCurrent(); // 防御性重算：旧数据/损坏数据也收敛到确定结果
-    this._dirty = false;
-    // 只有内容真的变化（或首次播种）才回写，避免多页面同时打开时无谓的版本号竞争
-    if (seeded || this.current.hash !== beforeHash) await this.persist();
-    this._emit('load');
-  }
-
-  resetToSeed({ persist = true } = {}) {
-    const model = seedModel();
-    this.entries = [this._entry(model)];
-    this.idx = 0;
-    this._dirty = true;
-    if (persist) this.persist();
+    this.replayEventId = null;
+    this.dragPreview = null;
+    this.saveConflict = null;
+    this._syncedHeads = {};
+    for (const b of this.branches) this._syncedHeads[b.id] = b.headEventId;
+    this.rev = Number.isFinite(doc.rev) ? doc.rev : 0;
   }
 
   async _fetchDoc() {
     const res = await fetch(this.base + '/api/doc');
     if (!res.ok) throw new Error(`GET /api/doc ${res.status}`);
     const data = await res.json();
-    return data && data.entries ? data : null;
+    return data && (Array.isArray(data.events) || Array.isArray(data.entries)) ? data : null;
   }
 
   _payload() {
     return {
-      entries: this.entries,
-      idx: this.idx,
+      events: this.events,
+      branches: this.branches,
+      currentBranchId: this.currentBranchId,
       versions: this.versions,
       currentVersionId: this.currentVersionId,
       compare: this.compare,
+      branchCompare: this.branchCompare,
+      actor: this.actor,
     };
   }
 
@@ -113,44 +176,138 @@ export class Store extends EventTarget {
   _saveChain = Promise.resolve();
   _saveVersion = 0;
   persist() {
-    if (this.saveConflict) return; // 冲突未解决：不再写任何存储，防止覆盖他人内容
+    if (this.saveConflict) return; // 冲突未解决：不再写任何存储
     const payload = this._payload();
+    let merged = null;
     try {
-      // localStorage 是同源多页面共享的：写入前检查，别人存过更新的 rev 就不覆盖
-      const prev = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
-      if (prev && Number.isFinite(prev.rev) && prev.rev > this.rev) {
-        this._onSaveConflict(prev.rev);
-        return;
+      let prev = JSON.parse(localStorage.getItem(LS_KEY) || 'null')
+        || JSON.parse(localStorage.getItem(LS_KEY_LEGACY) || 'null');
+      if (prev) {
+        // 连续同步 commit 时，第一次的防抖 PUT 可能还没发出，localStorage 里
+        // 尚不含本页刚追加的事件：只把本页已知事件按 id 并集补进去
+        // （绝不能快进磁盘上的分支 head，否则会掩盖别的页签对同分支的推进）。
+        const known = new Map((prev.events || []).map((e) => [e.id, e]));
+        for (const e of this.events) if (!known.has(e.id)) known.set(e.id, e);
+        prev = { ...prev, events: [...known.values()] };
+        merged = this._checkLocalConflict(prev, payload);
+        if (this.saveConflict) return;
       }
-      localStorage.setItem(LS_KEY, JSON.stringify({ ...payload, rev: this.rev }));
+      // 本地多页签合流：merged 已含本页当前分支最新提交，直接落合并结果
+      localStorage.setItem(LS_KEY, JSON.stringify(merged || { ...payload, rev: this.rev }));
     } catch {}
     this._emit('persist');
-    // 每次变更生成新版本号；120ms 合并连续修改，最终以最新版本 PUT。
-    // 串行链保证请求顺序：旧快照绝不可能覆盖新快照（避免竞态静默回滚）。
     ++this._saveVersion;
     clearTimeout(this._saveTimer);
     this._saveTimer = setTimeout(() => this._sendLatest(), 120);
   }
+
+  /**
+   * localStorage 多页面冲突检测（离线 / 服务端不可用时的同源多页签协调）。
+   * 入参 stored：磁盘文档，其事件已补入本页已知事件，但【分支 head 保持磁盘原样】。
+   * - 磁盘当前分支 head 不在本页基线链上 -> 另一页签推进了同分支，冲突锁；
+   * - 推进在别的分支 / 新分支 -> 合流；
+   * - 在本页链上（本页更新或无变化）-> 常规覆盖，返回 null。
+   */
+  _checkLocalConflict(stored, payload) {
+    const myHead = this.branch.headEventId;
+    const myBase = this._syncedHeads[this.currentBranchId];
+    const storedBranch = stored.branches?.find?.((b) => b.id === this.currentBranchId);
+    const storedHead = storedBranch?.headEventId;
+    if (!storedBranch || !storedHead || storedHead === myHead || !myBase) return null;
+    const byId = new Map((stored.events || []).map((e) => [e.id, e]));
+
+    // 判定磁盘当前分支 head 与本页 head 的关系（事件不可变，只看父链）：
+    //  - 磁盘 head 是本页已知事件（本页刚提交/undo/redo 过）：本页自己写的，可覆盖
+    //  - 磁盘 head 沿父链能走到【本页 head】：本页已包含磁盘提交 -> 可覆盖
+    //  - 磁盘 head 与本页 head 在同基线上分叉：同分支外来推进 -> 冲突
+    //  - 走不到本页 base：跨分支/新分支，交给 assessConflict 决定能否合流
+    const selfWrote = this.eventsById.has(storedHead);
+    if (selfWrote || isAncestor(storedHead, myHead, byId)) {
+      // 当前分支本页领先/一致。仅当 stored 含本页不知道的外来事件/分支（别的页签
+      // 在*其他分支*上的提交）时才合流；否则常规覆盖，避免无谓改动 rev/状态。
+      const hasForeignEvents = (stored.events || []).some((e) => !this.eventsById.has(e.id));
+      const hasForeignBranches = (stored.branches || []).some((b) => !this.branches.some((x) => x.id === b.id));
+      if (!hasForeignEvents && !hasForeignBranches) return null;
+      const merged = mergeDocs(stored, { ...payload, baseHeads: this._syncedHeads });
+      merged.rev = Math.max(Number.isFinite(stored.rev) ? stored.rev : 0, this.rev) + 1;
+      this.rev = merged.rev;
+      if (merged.events.length > this.events.length) {
+        this.events = merged.events;
+        this.eventsById = new Map(merged.events.map((e) => [e.id, e]));
+      }
+      for (const mb of merged.branches) {
+        const local = this.branches.find((x) => x.id === mb.id);
+        if (!local) this.branches = [...this.branches, mb];
+        if (mb.id !== this.currentBranchId) this._syncedHeads[mb.id] = mb.headEventId;
+      }
+      return merged;
+    }
+
+    const reachesBase = isAncestor(myBase, storedHead, byId);
+    const client = { ...payload, baseHeads: this._syncedHeads };
+    if (reachesBase) {
+      // 同一分支、同一基线上的分叉：另一个页签已提交，明确拒绝覆盖
+      const info = { reason: 'branch-advanced', branchId: this.currentBranchId, branchName: storedBranch.name, headEventId: storedHead, headSeq: byId.get(storedHead)?.seq ?? null };
+      this._onSaveConflict(info, stored.rev);
+      return null;
+    }
+    const verdict = assessConflict(stored, client);
+    if (!verdict.mergeable) {
+      this._onSaveConflict(verdict, stored.rev);
+      return null;
+    }
+    const merged = mergeDocs(stored, client);
+    merged.rev = Math.max(Number.isFinite(stored.rev) ? stored.rev : 0, this.rev) + 1;
+    this.rev = merged.rev;
+    if (merged.events.length > this.events.length) {
+      this.events = merged.events;
+      this.eventsById = new Map(merged.events.map((e) => [e.id, e]));
+    }
+    for (const mb of merged.branches) {
+      const local = this.branches.find((x) => x.id === mb.id);
+      if (!local) this.branches = [...this.branches, mb];
+      if (mb.id !== this.currentBranchId) this._syncedHeads[mb.id] = mb.headEventId;
+    }
+    return merged;
+  }
+
   _sendLatest() {
     if (this.saveConflict) return this._saveChain;
     const v = this._saveVersion;
-    const snapshot = JSON.stringify({ ...this._payload(), baseRev: this.rev });
+    // baseHeads：每个分支“所依据的服务端事件序号”。当前分支取已确认的 synced
+    // （不含本地未确认推进，否则会误判自己已合入）；其余分支取本地 head
+    // （它们未被本页编辑，与服务端一致或更新——更新的情况说明来自加载到的最新文档）。
+    const baseHeads = {};
+    for (const b of this.branches) {
+      baseHeads[b.id] = b.id === this.currentBranchId
+        ? (this._syncedHeads[b.id] ?? b.headEventId)
+        : b.headEventId;
+    }
+    const snapshot = JSON.stringify({ ...this._payload(), baseRev: this.rev, baseHeads });
     this._saveChain = this._saveChain.then(async () => {
-      if (v !== this._saveVersion || this.saveConflict) return; // 已被更新的版本取代
+      if (v !== this._saveVersion || this.saveConflict) return;
       try {
         const res = await fetch(this.base + '/api/doc', {
           method: 'PUT', headers: { 'content-type': 'application/json' },
           body: snapshot,
         });
         if (res.status === 409) {
-          // 旧页面提交：服务端版本号已前进，拒绝覆盖
           const data = await res.json().catch(() => ({}));
-          this._onSaveConflict(Number.isFinite(data?.rev) ? data.rev : null);
+          this._onSaveConflict(data, Number.isFinite(data?.rev) ? data.rev : null);
           return;
         }
         if (!res.ok) { console.warn('保存失败', res.status); this._emit('saveerror', { status: res.status }); return; }
         const data = await res.json().catch(() => ({}));
+        if (data.merged && data.doc) {
+          // 与另一页面的不同分支编辑合流：采用合并后的权威文档
+          await this._adopt(data.doc, { seed: false });
+          this._dirty = false;
+          this._emit('load');
+          this._emit('saved', { rev: this.rev, merged: true });
+          return;
+        }
         if (Number.isFinite(data?.rev)) this.rev = data.rev;
+        this._syncedHeads[this.currentBranchId] = this.branch.headEventId;
         this._emit('saved', { rev: this.rev });
       } catch (e) {
         console.warn('保存失败（已写入 localStorage）:', e.message);
@@ -160,17 +317,22 @@ export class Store extends EventTarget {
     return this._saveChain;
   }
 
-  _onSaveConflict(serverRev) {
+  _onSaveConflict(info, serverRev) {
     if (this.saveConflict) return;
+    const reason = info?.reason === 'branch-advanced' ? 'branch-advanced' : 'revision';
     if (!this._dirty) {
-      // 本地没有未保存的修改：静默跟随服务器最新内容，不打断用户
+      // 本地没有未保存修改：静默跟随最新内容
       this.load().catch(() => {});
       return;
     }
-    this.saveConflict = true;
+    this.saveConflict = {
+      reason,
+      branchName: info?.branchName || this.branch?.name || '当前分支',
+      headSeq: info?.headSeq ?? null,
+      serverRev,
+    };
     clearTimeout(this._saveTimer);
-    this._emit('saveconflict', { rev: serverRev });
-    // 用服务器权威内容刷新本地缓存，避免 localStorage 残留未保存的本地修改
+    this._emit('saveconflict', this.saveConflict);
     this._fetchDoc().then((doc) => {
       if (doc) try { localStorage.setItem(LS_KEY, JSON.stringify(doc)); } catch {}
     }).catch(() => {});
@@ -182,99 +344,259 @@ export class Store extends EventTarget {
     await this._sendLatest();
   }
 
-  /* ---------- 条目 ---------- */
+  /* ---------- 分支 / 当前状态 ---------- */
 
-  _entry(model) {
-    const m = normalize(model);
-    const report = solve(m, null);
-    return { model: m, report, hash: report.hash };
+  get branchesById() { return new Map(this.branches.map((b) => [b.id, b])); }
+  get branch() {
+    return this.branches.find((b) => b.id === this.currentBranchId)
+      || this.branches.find((b) => b.id === MAIN_BRANCH);
   }
-
-  _recomputeCurrent() {
-    // 用规范化后的 model 重新求解，并把求解后的确定位置回写到模型（idempotent fixpoint）
-    const e = this.entries[this.idx];
-    if (!e) return;
-    const m = normalize(e.model);
-    const rep = solve(m, null);
-    for (const r of m.rects) {
-      const p = rep.rects[r.id];
-      if (p) { r.x = p.x; r.y = p.y; r.w = p.w; r.h = p.h; }
+  get headEvent() {
+    if (this.replayEventId) {
+      const ev = this.eventsById.get(this.replayEventId);
+      if (ev && !ev.corrupt) return ev;
     }
-    e.model = m;
-    e.report = rep;
-    e.hash = rep.hash;
+    return this.eventsById.get(this.branch.headEventId);
   }
-
-  get current() { return this.entries[this.idx]; }
-  get model() { return this.current.model; }
-  get report() { return this.dragPreview || this.current.report; }
+  get current() { return this.headEvent; }
+  get model() { return this.dragPreview ? this._dragModel : this.headEvent.model; }
+  get report() { return this.dragPreview || this.headEvent.report; }
+  get replaying() {
+    // 显式进入回放即只读（哪怕回放到的恰是 head 事件），直到 exitReplay
+    if (!this.replayEventId) return false;
+    const ev = this.eventsById.get(this.replayEventId);
+    return !!ev && !ev.corrupt;
+  }
 
   /* ---------- 修改 ---------- */
 
   /**
-   * 提交一次修改。mutator(modelDraft) 直接改草稿。
-   * 返回 {ok, errors, cycle}；环 / 结构错误一律拒绝，不产生历史。
+   * 提交一次修改：结构校验 + 环检测通过后，求解并【追加】一条不可变审计事件。
+   * 返回 {ok, errors, cycle}；回放模式 / 冲突锁定 / 环 / 结构错误一律拒绝。
    */
-  commit(mutator, { label = '' } = {}) {
-    const draft = structuredClone(this.current.model);
+  commit(mutator, { label = '编辑' } = {}) {
+    if (this.replaying) {
+      this._emit('replayblocked', {});
+      return { ok: false, errors: ['回放模式为只读，请先退出回放或另存为新分支'], cycle: null };
+    }
+    if (this.saveConflict) {
+      return { ok: false, errors: ['版本冲突未解决，请先重新加载'], cycle: null };
+    }
+    const parent = this.headEvent;
+    const draft = structuredClone(parent.model);
     mutator(draft);
 
     const { errors } = validate(draft);
     if (errors.length) { this._emit('reject', { errors, cycle: null, label }); return { ok: false, errors, cycle: null }; }
-
     const cycle = findCycle(draft.constraints);
-    if (cycle) {
-      this._emit('reject', { errors: [], cycle, label });
-      return { ok: false, errors: [], cycle };
-    }
+    if (cycle) { this._emit('reject', { errors: [], cycle, label }); return { ok: false, errors: [], cycle }; }
 
     const norm = normalize(draft);
     const report = solve(norm, null);
-    // 求解后把确定位置固化进模型（刷新后从同一不动点继续）
     for (const r of norm.rects) {
       const p = report.rects[r.id];
       if (p) { r.x = p.x; r.y = p.y; r.w = p.w; r.h = p.h; }
     }
 
-    this.entries = this.entries.slice(0, this.idx + 1);
-    this.entries.push({ model: norm, report, hash: report.hash, label, t: Date.now() });
-    if (this.entries.length > LIMIT) this.entries.shift();
-    this.idx = this.entries.length - 1;
+    const ev = makeEvent(parent, this.currentBranchId, norm, report,
+      { actor: this.actor || '未署名', label, t: Date.now() });
+    this._appendEvent(ev, { newHead: true });
     this._dirty = true;
     this.persist();
     this._emit('change', { label, conflicts: report.conflicts });
     return { ok: true, errors: [], cycle: null, report };
   }
 
+  _appendEvent(ev, { newHead }) {
+    this.events = [...this.events, ev];
+    this.eventsById.set(ev.id, ev);
+    const b = this.branch;
+    this._replaceBranch({
+      ...b,
+      headEventId: ev.id,
+      redoTipId: newHead ? null : b.redoTipId,
+    });
+  }
+
+  _replaceBranch(next) {
+    this.branches = this.branches.map((b) => (b.id === next.id ? freeze(next) : b));
+  }
+
   undo() {
-    if (!this.canUndo) return;
-    this.idx--;
+    if (this.replaying || !this.canUndo) return;
+    const b = this.branch;
+    const cur = this.eventsById.get(b.headEventId);
+    const tipWas = b.redoTipId || cur.id;
+    this._replaceBranch({ ...b, headEventId: cur.parentId, redoTipId: tipWas });
     this.dragPreview = null;
     this._dirty = true;
     this.persist();
     this._emit('change', { label: 'undo' });
   }
+
   redo() {
-    if (!this.canRedo) return;
-    this.idx++;
+    if (this.replaying || !this.canRedo) return;
+    const b = this.branch;
+    // redo 候选 = head 之后、沿 redoTip 向上走时其父为 head 的第一条（支线则取支线顶端）
+    const nextId = this._redoNext(b);
+    if (!nextId) return;
+    // 走到 redoTip 顶端后清空候选；否则保持 tip 供继续 redo
+    const redoTipId = nextId === b.redoTipId ? null : b.redoTipId;
+    this._replaceBranch({ ...b, headEventId: nextId, redoTipId });
     this.dragPreview = null;
     this._dirty = true;
     this.persist();
     this._emit('change', { label: 'redo' });
   }
-  get canUndo() { return this.idx > 0; }
-  get canRedo() { return this.idx < this.entries.length - 1; }
+
+  _redoNext(b) {
+    // 直接子事件（head 在 redoTip 链上）
+    let tip = b.redoTipId ? this.eventsById.get(b.redoTipId) : null;
+    if (!tip) {
+      // 无 redoTip 时回退到全表查找 head 的直接子事件
+      const kids = this.events.filter((e) => e.branch === b.id && e.parentId === b.headEventId);
+      if (!kids.length) return null;
+      kids.sort((a, c) => (a.t - c.t) || (a.id < c.id ? -1 : 1));
+      return kids[0].id;
+    }
+    const chain = [];
+    let cur = tip, guard = 0;
+    while (cur && guard++ < 100000) {
+      chain.push(cur);
+      if (cur.id === b.headEventId) break;
+      cur = cur.parentId ? this.eventsById.get(cur.parentId) : null;
+    }
+    if (!cur) {
+      // redoTip 已不锚定 head：回退到全表
+      const kids = this.events.filter((e) => e.branch === b.id && e.parentId === b.headEventId);
+      if (!kids.length) return null;
+      kids.sort((a, c) => (a.t - c.t) || (a.id < c.id ? -1 : 1));
+      return kids[0].id;
+    }
+    return chain[chain.length - 2]?.id || null;
+  }
+
+  get canUndo() {
+    if (this.replaying) return false;
+    const cur = this.eventsById.get(this.branch.headEventId);
+    return !!cur && cur.kind === 'edit' && !!cur.parentId;
+  }
+  get canRedo() {
+    if (this.replaying) return false;
+    return !!this._redoNext(this.branch);
+  }
+
+  /* ---------- 审计浏览 / 回放 / 分支 ---------- */
+
+  setActor(name) {
+    this.actor = String(name || '').slice(0, 40);
+    try { localStorage.setItem(ACTOR_KEY, this.actor); } catch {}
+  }
+
+  timeline(branchId = this.currentBranchId) {
+    const b = this.branches.find((x) => x.id === branchId);
+    if (!b) return null;
+    return timelineFor(b, this.eventsById, this.branchesById);
+  }
+
+  /** 进入只读回放：把画布重放到指定事件那一刻的完整布局。 */
+  replay(eventId) {
+    const ev = this.eventsById.get(eventId);
+    if (!ev) return { ok: false, error: '审计事件不存在' };
+    if (ev.corrupt || !ev.model || !ev.report) {
+      return { ok: false, error: `该事件无法回放：${ev.corruptReason || '快照损坏'}` };
+    }
+    this.replayEventId = eventId;
+    this.dragPreview = null;
+    this._emit('replay', { eventId });
+    this._emit('change', { label: 'replay' });
+    return { ok: true };
+  }
+
+  /** 退出回放，回到分支 head（不改写任何事件）。 */
+  exitReplay() {
+    if (!this.replayEventId) return;
+    this.replayEventId = null;
+    this.dragPreview = null;
+    this._emit('replayexit', {});
+    this._emit('change', { label: 'replay-exit' });
+  }
+
+  /**
+   * 从某条历史事件另存为新的编辑分支：
+   * - fork-root 事件是来源快照的只读克隆（同指纹），带 provenance 来源关系；
+   * - 原事件与原分支任何内容都不被改写。
+   */
+  forkFromEvent(eventId, name) {
+    name = String(name ?? '').trim();
+    if (!name) return { ok: false, error: '分支名称不能为空' };
+    if (this.branches.some((b) => b.name === name)) return { ok: false, error: `已存在同名分支「${name}」` };
+    const source = this.eventsById.get(eventId);
+    if (!source || source.corrupt || !source.model) return { ok: false, error: '该事件损坏，无法另存为分支' };
+    const sourceBranch = this.branches.find((b) => b.id === source.branch)
+      || (source.provenance ? this.branches.find((b) => b.id === source.provenance.branchId) : null);
+
+    const id = uid('b');
+    const root = makeForkRootEvent(id, source, sourceBranch || { id: source.branch, name: source.branch },
+      { actor: this.actor || '未署名' });
+    this.events = [...this.events, root];
+    this.eventsById.set(root.id, root);
+    const branch = freeze({
+      id, name, createdAt: root.t,
+      rootEventId: root.id, headEventId: root.id, redoTipId: null,
+      source: { branchId: sourceBranch?.id || source.branch, eventId: source.id },
+    });
+    this.branches = [...this.branches, branch];
+    this.currentBranchId = id;
+    this.replayEventId = null;
+    this._syncedHeads[id] = root.id;
+    this._dirty = true;
+    this.persist();
+    this._emit('branch', { type: 'fork', id, sourceEventId: eventId });
+    this._emit('change', { label: 'fork' });
+    return { ok: true, branch, event: root };
+  }
+
+  switchBranch(id) {
+    const b = this.branches.find((x) => x.id === id);
+    if (!b || id === this.currentBranchId) return { ok: false };
+    this.currentBranchId = id;
+    this.replayEventId = null;
+    this.dragPreview = null;
+    this._dirty = true; // 记住用户最后停留的分支
+    this.persist();
+    this._emit('branch', { type: 'switch', id });
+    this._emit('change', { label: 'switch-branch' });
+    return { ok: true };
+  }
+
+  /** 比较两个分支的当前 head（矩形/约束/冲突差异）。 */
+  compareBranches(aId, bId) {
+    const a = this.eventsById.get(this.branches.find((b) => b.id === aId)?.headEventId);
+    const b2 = this.eventsById.get(this.branches.find((b) => b.id === bId)?.headEventId);
+    if (!a || !b2) return null;
+    return compareVersions(
+      { model: a.model, report: a.report, hash: a.hash },
+      { model: b2.model, report: b2.report, hash: b2.hash },
+    );
+  }
+
+  setBranchCompare(a, b) {
+    this.branchCompare = { a: a || null, b: b || null };
+    this._dirty = true;
+    this.persist();
+    this._emit('branch', { type: 'compare' });
+  }
 
   /* ---------- 布局版本（只读快照） ---------- */
 
   get currentVersion() { return this.versions.find((v) => v.id === this.currentVersionId) || null; }
 
-  /** 把当前矩形/约束/求解结果/冲突报告保存成带名称的只读版本。 */
   saveVersion(name) {
     name = String(name ?? '').trim();
     if (!name) return { ok: false, error: '版本名称不能为空' };
     if (this.versions.some((v) => v.name === name)) return { ok: false, error: `已存在同名版本「${name}」` };
-    const v = snapshotVersion(uid('v'), name, this.current);
+    const v = snapshotVersion(uid('v'), name, this.headEvent);
     this.versions.push(v);
     this.currentVersionId = v.id;
     this._dirty = true;
@@ -283,7 +605,7 @@ export class Store extends EventTarget {
     return { ok: true, version: v };
   }
 
-  /** 恢复版本：快照内容提交为新的当前编辑版本（可撤销），原版本保持只读。 */
+  /** 恢复版本：快照内容作为新的审计事件提交（新事件追加，历史与版本都不被改写）。 */
   restoreVersion(id) {
     const v = this.versions.find((x) => x.id === id);
     if (!v) return { ok: false, error: '版本不存在（可能已被其他页面删除）' };
@@ -300,7 +622,6 @@ export class Store extends EventTarget {
     return { ok: true };
   }
 
-  /** 删除版本。当前版本与已发布版本受保护，拒绝删除。 */
   deleteVersion(id) {
     const v = this.versions.find((x) => x.id === id);
     if (!v) return { ok: false, error: '版本不存在' };
@@ -315,7 +636,6 @@ export class Store extends EventTarget {
     return { ok: true };
   }
 
-  /** 标记/取消发布。已发布版本不能删除。 */
   setPublished(id, flag) {
     const v = this.versions.find((x) => x.id === id);
     if (!v) return { ok: false, error: '版本不存在' };
@@ -326,7 +646,6 @@ export class Store extends EventTarget {
     return { ok: true };
   }
 
-  /** 记录比较选择（随文档持久化，刷新后比较结果保持一致）。 */
   setCompare(a, b) {
     this.compare = { a: a || null, b: b || null };
     this._dirty = true;
@@ -334,7 +653,6 @@ export class Store extends EventTarget {
     this._emit('versions', { type: 'compare' });
   }
 
-  /** 按 id 比较两个版本；任一不存在返回 null。 */
   compareById(aId, bId) {
     const a = this.versions.find((v) => v.id === aId);
     const b = this.versions.find((v) => v.id === bId);
@@ -344,17 +662,19 @@ export class Store extends EventTarget {
 
   /* ---------- 拖动（临时解 + 提交） ---------- */
 
-  /** 拖动实时预览；pinned {id:{x,y}}, group [ids]。返回 report。 */
   previewDrag(pinned, group) {
-    const rep = solve(this.current.model, { pinned, group });
+    if (this.replaying) return this.headEvent.report;
+    const rep = solve(this.headEvent.model, { pinned, group });
     this.dragPreview = rep;
+    // 渲染需要读 model：临时构造一份带预览坐标的模型
+    this._dragModel = withPreviewPositions(this.headEvent.model, rep);
     this._emit('drag');
     return rep;
   }
   endDrag() {
-    // 用最后一帧的确定结果作为落位，再走一次无拖动求解取不动点并提交历史
     const rep = this.dragPreview;
     this.dragPreview = null;
+    this._dragModel = null;
     if (!rep) return;
     this.commit((m) => {
       for (const r of m.rects) {
@@ -363,9 +683,18 @@ export class Store extends EventTarget {
       }
     }, { label: '拖动' });
   }
-  cancelDrag() { this.dragPreview = null; this._emit('drag'); }
+  cancelDrag() { this.dragPreview = null; this._dragModel = null; this._emit('drag'); }
 
   _emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
+}
+
+function withPreviewPositions(model, rep) {
+  const m = structuredClone(model);
+  for (const r of m.rects) {
+    const p = rep.rects[r.id];
+    if (p) { r.x = p.x; r.y = p.y; r.w = p.w; r.h = p.h; }
+  }
+  return m;
 }
 
 /** 载入时清洗版本列表：结构不完整的一律丢弃，published 归一为布尔。 */

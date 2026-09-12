@@ -86,6 +86,8 @@ export class View {
     const svg = this.svg;
     svg.addEventListener('pointerdown', (ev) => {
       if (ev.button !== 0) return;
+      // 历史回放为只读：不启动任何会改布局的手势（点击选择仍允许）
+      if (this.store.replaying) return;
       const resizeId = this._isResizeHandle(ev);
       const rectId = this._hitRect(ev);
 

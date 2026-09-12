@@ -4,13 +4,16 @@
 仅使用 Python 标准库（http.server / threading），便于极小镜像部署。
 
   GET  /                 -> web/index.html
-  GET  /api/doc          -> 当前文档（含 undo/redo 历史、布局版本、rev）
-  PUT  /api/doc          -> 整体覆盖保存（原子写 + 结构校验 + baseRev 乐观并发检查）
+  GET  /api/doc          -> 当前文档（含审计事件流、分支、布局版本、rev）
+  PUT  /api/doc          -> 保存（原子写 + 结构校验 + baseRev/baseHeads 乐观并发）
   POST /api/reset        -> 删除服务端存档（客户端随后会重建）
 
-乐观并发：文档带单调递增的 rev。客户端保存时必须携带自己基于的 baseRev；
-与服务器当前 rev 不一致说明另一个页面已经保存过，返回 409 并拒绝覆盖，
-由客户端提示“版本冲突，请重新加载”。
+乐观并发：
+- 文档带单调递增 rev，客户端必须携带 baseRev（文档级覆盖保护）；
+- 同时携带 baseHeads = {分支 id: 所依据的 head 事件 id}（“所依据的事件序号”）。
+  同一分支 head 已在另一页面前进 -> 409 {reason:"branch-advanced", headEventId}
+  并拒绝覆盖；若过期提交落在另一个页面新建/编辑的*不同分支*上，则按
+  _merge_docs 合流（审计事件不可变、按 id 并集），两边内容都保留。
 
 数据文件由 DATA_PATH 环境变量决定（默认 /data/doc.json），
 Docker 中挂载为卷；本地裸跑回退到 ./data/doc.json。
@@ -72,22 +75,43 @@ def _save_doc(doc):
 
 
 def _valid_shape(doc):
-    """轻量结构校验，重活在浏览器求解器里。"""
+    """轻量结构校验，重活在浏览器求解器/审计清洗里。"""
     if not isinstance(doc, dict):
         return False
-    entries = doc.get("entries")
-    if not isinstance(entries, list) or not entries:
-        return False
-    idx = doc.get("idx")
-    if not isinstance(idx, int) or not (0 <= idx < len(entries)):
-        return False
-    for e in entries:
-        m = e.get("model")
-        if not isinstance(m, dict) or not isinstance(m.get("rects"), list) or not isinstance(m.get("constraints"), list):
-            return False
     # 乐观并发：客户端必须声明自己基于的服务端版本号
     if not isinstance(doc.get("baseRev"), int) or isinstance(doc.get("baseRev"), bool) or doc["baseRev"] < 0:
         return False
+    events = doc.get("events")
+    branches = doc.get("branches")
+    if isinstance(events, list) and isinstance(branches, list):
+        # 新格式：审计事件流 + 分支
+        if not events or not branches:
+            return False
+        for e in events:
+            if not isinstance(e, dict) or not isinstance(e.get("id"), str):
+                return False
+            m = e.get("model")
+            if not isinstance(m, dict) or not isinstance(m.get("rects"), list) or not isinstance(m.get("constraints"), list):
+                return False
+        for b in branches:
+            if not isinstance(b, dict) or not isinstance(b.get("id"), str) or not isinstance(b.get("name"), str):
+                return False
+            if not isinstance(b.get("headEventId"), str) or not isinstance(b.get("rootEventId"), str):
+                return False
+        if not isinstance(doc.get("currentBranchId"), str):
+            return False
+    else:
+        # 兼容旧格式（迁移由客户端完成）：基础 entries 校验
+        entries = doc.get("entries")
+        if not isinstance(entries, list) or not entries:
+            return False
+        idx = doc.get("idx")
+        if not isinstance(idx, int) or not (0 <= idx < len(entries)):
+            return False
+        for e in entries:
+            m = e.get("model")
+            if not isinstance(m, dict) or not isinstance(m.get("rects"), list) or not isinstance(m.get("constraints"), list):
+                return False
     # 布局版本：只读快照列表（可为空）
     versions = doc.get("versions", [])
     if not isinstance(versions, list):
@@ -101,6 +125,78 @@ def _valid_shape(doc):
         if not isinstance(m, dict) or not isinstance(m.get("rects"), list) or not isinstance(m.get("constraints"), list):
             return False
     return True
+
+
+def _is_legacy(doc):
+    return not (isinstance(doc.get("events"), list) and isinstance(doc.get("branches"), list))
+
+
+def _assess_conflict(cur, doc):
+    """返回 (可合流, 冲突信息 dict)。与 web/js/geom/audit.js assessConflict 同构。"""
+    if not cur or _is_legacy(cur) or _is_legacy(doc):
+        return True, None
+    cur_events = {e["id"]: e for e in cur.get("events", []) if isinstance(e, dict)}
+    cur_branches = {b["id"]: b for b in cur.get("branches", []) if isinstance(b, dict)}
+    cur_id = doc.get("currentBranchId")
+    base_heads = doc.get("baseHeads") or {}
+    sb = cur_branches.get(cur_id)
+    if sb is None:
+        # 客户端新建的分支：其 fork 来源事件必须已在服务端。
+        # fork-root 事件是本次提交新增的，要从【客户端提交体】里找它，
+        # 再检查它 provenance 指向的来源事件是否已存在于服务端。
+        nb = next((b for b in doc.get("branches", []) if isinstance(b, dict) and b.get("id") == cur_id), None)
+        root = next((e for e in doc.get("events", []) if isinstance(e, dict) and e.get("id") == (nb or {}).get("rootEventId")), None)
+        prov = root.get("provenance") if isinstance(root, dict) else None
+        src_id = prov.get("eventId") if isinstance(prov, dict) else None
+        if nb and src_id and src_id in cur_events:
+            return True, None
+        return False, {"reason": "branch-missing", "branchId": cur_id}
+    if base_heads.get(cur_id) != sb.get("headEventId"):
+        head = cur_events.get(sb.get("headEventId"), {})
+        return False, {
+            "reason": "branch-advanced",
+            "branchId": cur_id,
+            "branchName": sb.get("name", cur_id),
+            "headEventId": sb.get("headEventId"),
+            "headSeq": head.get("seq"),
+        }
+    return True, None
+
+
+def _merge_docs(server_doc, client_doc):
+    """跨分支并发合流。与 web/js/geom/audit.js mergeDocs 同构。"""
+    evs = {e["id"]: e for e in server_doc.get("events", []) if isinstance(e, dict)}
+    for e in client_doc.get("events", []):
+        if isinstance(e, dict):
+            evs.setdefault(e["id"], e)
+
+    sb = {b["id"]: b for b in server_doc.get("branches", []) if isinstance(b, dict)}
+    cb = {b["id"]: b for b in client_doc.get("branches", []) if isinstance(b, dict)}
+    cur = client_doc.get("currentBranchId")
+    out_branches = []
+    for bid, b in sb.items():
+        out_branches.append(cb.get(bid) if bid == cur and bid in cb else b)
+    for bid, b in cb.items():
+        if bid not in sb:
+            out_branches.append(b)
+
+    vs = {v["id"]: v for v in server_doc.get("versions", []) if isinstance(v, dict)}
+    for v in client_doc.get("versions", []):
+        if isinstance(v, dict):
+            vs.setdefault(v["id"], v)
+
+    merged = dict(server_doc)
+    merged.update({
+        "events": list(evs.values()),
+        "branches": out_branches,
+        "versions": list(vs.values()),
+        "currentVersionId": server_doc.get("currentVersionId"),
+        "compare": server_doc.get("compare", {"a": None, "b": None}),
+        "branchCompare": server_doc.get("branchCompare", {"a": None, "b": None}),
+        "currentBranchId": cur if cur in sb or cur in cb else server_doc.get("currentBranchId", "main"),
+        "actor": client_doc.get("actor") or server_doc.get("actor", ""),
+    })
+    return merged
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -171,13 +267,40 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(cur_rev, int) or isinstance(cur_rev, bool):
                 cur_rev = 0
             if doc["baseRev"] != cur_rev:
-                # 旧页面提交：服务端已有更新的内容，拒绝覆盖，告知当前版本号
-                self._send_json(409, {"error": "revision-conflict", "rev": cur_rev})
+                # 文档已被其他页面前进：先判断是否可以按分支合流
+                mergeable, info = _assess_conflict(cur, doc)
+                if not mergeable:
+                    self._send_json(409, {
+                        "error": "revision-conflict",
+                        "rev": cur_rev,
+                        **(info or {}),
+                    })
+                    return
+                if isinstance(cur, dict):
+                    merged = _merge_docs(cur, doc)
+                    merged.pop("baseRev", None)
+                    merged.pop("baseHeads", None)
+                    merged["rev"] = cur_rev + 1
+                    _save_doc(merged)
+                    self._send_json(200, {"ok": True, "rev": merged["rev"], "merged": True, "doc": merged})
+                    return
+                # 服务端无文档（比如数据卷被清空）：按首次保存处理
+                doc.pop("baseRev", None)
+                doc.pop("baseHeads", None)
+                doc["rev"] = 1
+                _save_doc(doc)
+                self._send_json(200, {"ok": True, "rev": 1})
+                return
+            # 同 rev 下再做一次分支头序号检查（防御并发到同一 rev 的极端情况）
+            mergeable, info = _assess_conflict(cur, doc)
+            if not mergeable:
+                self._send_json(409, {"error": "revision-conflict", "rev": cur_rev, **(info or {})})
                 return
             doc.pop("baseRev", None)
+            doc.pop("baseHeads", None)
             doc["rev"] = cur_rev + 1
             _save_doc(doc)
-            self._send_json(200, {"ok": True, "rev": doc["rev"], "entries": len(doc["entries"]), "idx": doc["idx"]})
+            self._send_json(200, {"ok": True, "rev": doc["rev"], "entries": len(doc.get("events", [])), "events": len(doc.get("events", []))})
 
     def do_POST(self):
         if self.path.split("?", 1)[0] == "/api/reset":

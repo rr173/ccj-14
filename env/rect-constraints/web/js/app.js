@@ -2,6 +2,7 @@ import { Store } from './geom/store.js';
 import { View } from './geom/view.js';
 import { ConstraintDialog } from './geom/dialog.js';
 import { VersionPanel } from './geom/versionpanel.js';
+import { AuditPanel } from './geom/auditpanel.js';
 import {
   newRect, newSnap, newMinGap, newContain, newLock,
 } from './geom/model.js';
@@ -55,6 +56,7 @@ dialog.factoryFns = { newSnap, newMinGap, newContain, newLock };
 dialog.hooks = { onCycle: (cyc) => view.setCycleHighlight(cyc) };
 
 const versionPanel = new VersionPanel(store, { toast });
+const auditPanel = new AuditPanel(store, { toast });
 
 let activeTab = 'constraints';
 
@@ -110,7 +112,7 @@ window.addEventListener('keydown', (e) => {
 /* ---------- 面板渲染 ---------- */
 
 store.addEventListener('change', (e) => {
-  renderPanels(); updateChips(); updateButtons();
+  renderPanels(); updateChips(); updateButtons(); updateReplayBanner();
   if (e.detail?.conflicts?.length) {
     // 新冲突出现时轻提示，但不抢焦点
     if (activeTab !== 'conflicts') toast(`${e.detail.conflicts.length} 条约束未满足 —— 见「冲突」页`, 'warn');
@@ -126,28 +128,67 @@ store.addEventListener('reject', (e) => {
   }
 });
 
-/* ---------- 布局版本 / 保存状态事件 ---------- */
+/* ---------- 审计 / 分支 / 回放 / 保存状态事件 ---------- */
 
+store.addEventListener('branch', (e) => {
+  renderPanels(); updateChips(); updateReplayBanner();
+  view.clearSelection();
+  view.setCycleHighlight(null);
+  if (e.detail?.type === 'fork') toast('已切换到新分支', '');
+  else if (e.detail?.type === 'switch') toast(`已切换到分支「${store.branch.name}」`);
+});
+store.addEventListener('replay', () => {
+  renderPanels(); updateButtons(); updateReplayBanner();
+  view.clearSelection();
+});
+store.addEventListener('replayexit', () => {
+  renderPanels(); updateButtons(); updateReplayBanner();
+});
+store.addEventListener('replayblocked', () => {
+  toast('回放模式为只读：请「回到当前 head」退出，或把这一刻「另存为新分支」后再编辑', 'warn');
+});
 store.addEventListener('versions', (e) => {
   versionPanel.render();
   updateVersionChip();
   if (e.detail?.type === 'restore') view.clearSelection(); // 旧选择可能指向已不存在的矩形
 });
 store.addEventListener('persist', () => { $('#save-chip').textContent = '保存中…'; });
-store.addEventListener('saved', () => { $('#save-chip').textContent = '已保存'; });
+store.addEventListener('saved', (e) => {
+  $('#save-chip').textContent = e.detail?.merged ? '已保存（分支已合流）' : '已保存';
+});
 store.addEventListener('saveerror', () => { $('#save-chip').textContent = '保存失败（已存本地）'; });
-store.addEventListener('saveconflict', () => {
-  // 旧页面提交被服务器拒绝：必须重新加载，绝不能覆盖另一页已保存的内容
+store.addEventListener('saveconflict', (e) => {
+  // 同一分支已在另一页面前进：携带过期事件序号的提交被明确拒绝，绝不覆盖
   $('#save-chip').textContent = '版本冲突';
+  const d = e.detail || {};
+  if (d.reason === 'branch-advanced') {
+    $('#conflict-text').innerHTML =
+      `⚠ <b>分支已前进</b>：分支「${d.branchName || '当前分支'}」已在另一个页面提交到更新的事件${
+        d.headSeq ? `（当前 #${d.headSeq}）` : ''}。本页修改基于更早的事件，<b>已被拒绝且未覆盖</b>对方内容——请重新加载后再继续。`;
+    toast('分支已前进：另一个页面已提交新事件，当前页面的修改未保存。请重新加载。', 'error');
+  } else {
+    $('#conflict-text').innerHTML =
+      '⚠ <b>版本冲突</b>：文档已被另一个页面更新。为避免覆盖对方数据，当前页面的修改<b>未保存</b>——请重新加载后再继续编辑。';
+    toast('版本冲突：当前页面的修改未保存，请重新加载。', 'error');
+  }
   $('#conflict-banner').classList.remove('hidden');
-  toast('版本冲突：另一个页面已保存了更新的内容，当前页面的修改未保存。请重新加载。', 'error');
 });
 $('#btn-reload').onclick = () => location.reload();
+$('#btn-replay-exit').onclick = () => store.exitReplay();
+$('#btn-replay-fork').onclick = () => {
+  const ev = store.eventsById.get(store.replayEventId);
+  const name = prompt('把这一刻另存为新分支，名称：', `回放 #${ev?.seq ?? ''} 分支`);
+  if (name === null) return;
+  const res = store.forkFromEvent(store.replayEventId, name);
+  if (!res.ok) { toast(res.error, 'error'); return; }
+  toast(`已另存为新分支「${name}」，可继续编辑；原事件与原分支未被改写`);
+};
 // 加载/静默重载（其他页面保存了更新内容，本页无未保存修改时自动跟随）后整体刷新
 store.addEventListener('load', () => {
   renderPanels();
   $('#save-chip').textContent = '已保存';
   $('#conflict-banner').classList.add('hidden');
+  updateChips(); updateButtons(); updateReplayBanner();
 });
 
 function renderPanels() {
@@ -155,6 +196,7 @@ function renderPanels() {
   renderProps();
   renderConflicts();
   versionPanel.render();
+  auditPanel.render();
   updateButtons();
   updateChips();
 }
@@ -355,13 +397,43 @@ function escapeHtml(s) {
 function updateButtons() {
   $('#btn-undo').disabled = !store.canUndo;
   $('#btn-redo').disabled = !store.canRedo;
-  $('#btn-delete').disabled = view.selected.size === 0;
+  $('#btn-delete').disabled = view.selected.size === 0 || store.replaying;
+  $('#btn-add-rect').disabled = store.replaying;
+  $('#btn-snap').disabled = store.replaying;
 }
 function updateChips() {
   const rep = store.report;
   $('#hash-chip').textContent = 'hash ' + rep.hash.slice(0, 8);
   $('#hash-chip').title = `完整指纹 ${rep.hash}\n位置 + 每个约束的成败 + 冲突链`;
   updateVersionChip();
+  updateBranchChip();
+}
+
+function updateBranchChip() {
+  const chip = $('#branch-chip');
+  const b = store.branch;
+  if (!b) return;
+  const head = store.eventsById.get(b.headEventId);
+  const src = b.source ? store.branches.find((x) => x.id === b.source.branchId) : null;
+  chip.textContent = `⎘ ${b.name} #${head?.seq ?? '?'}`;
+  chip.title = src
+    ? `分支「${b.name}」，来自「${src.name}」的历史事件；本分支提交不影响原分支`
+    : `当前编辑分支「${b.name}」，审计事件 #${head?.seq ?? '?'}`;
+}
+
+function updateReplayBanner() {
+  const banner = $('#replay-banner');
+  if (!store.replaying) {
+    banner.classList.add('hidden');
+    $('#canvas-wrap').classList.remove('readonly');
+    return;
+  }
+  const ev = store.eventsById.get(store.replayEventId);
+  banner.classList.remove('hidden');
+  $('#replay-text').innerHTML =
+    `▶ 正在回放 <b>#${ev.seq}「${escapeHtml(ev.label)}」</b> · ${escapeHtml(ev.actor)} · ${
+      new Date(ev.t).toLocaleString()} · 只读（历史事件不可修改）`;
+  $('#canvas-wrap').classList.add('readonly');
 }
 
 function updateVersionChip() {

@@ -1,5 +1,5 @@
 // 端到端冒烟：Store 经真实 HTTP 后端存取，校验撤销/重做、环拒绝、刷新一致性。
-// 用法：先启动 server，再 node test/e2e.mjs
+// 用法：先启动 server（并 POST /api/reset），再 node test/e2e.mjs
 const mem = new Map();
 globalThis.localStorage = {
   getItem: (k) => (mem.has(k) ? mem.get(k) : null),
@@ -55,7 +55,7 @@ const c0 = conf.find((c) => c.label.includes('贴齐'));
 ok(c0 && c0.chain.length >= 1 && c0.blockerIds.length >= 1, '冲突链给出让步方');
 console.log('  示例冲突:', c0?.label, ' <- ', c0?.chain.join(' / '));
 
-const conflictState = { idx: store.idx, hash: store.current.hash };
+const conflictState = { headEventId: store.branch.headEventId, hash: store.current.hash };
 
 // 5) undo 回到种子
 while (store.canUndo) store.undo();
@@ -65,7 +65,7 @@ ok(store.model.rects.length === 4, '撤销恢复矩形数量');
 
 // 6) redo 回到冲突状态
 while (store.canRedo) store.redo();
-ok(store.idx === conflictState.idx && store.current.hash === conflictState.hash,
+ok(store.branch.headEventId === conflictState.headEventId && store.current.hash === conflictState.hash,
   '重做恢复到冲突状态同一 hash');
 ok(store.report.conflicts.length >= 1, '重做恢复冲突结果');
 
@@ -74,13 +74,12 @@ await store.flushed?.();
 const store2 = new Store({ base: BASE });
 await store2.load();
 ok(store2.current.hash === conflictState.hash, `刷新后当前文档 hash 一致（${store2.current.hash}）`);
-ok(store2.idx === store.idx, '刷新后历史指针一致');
+ok(store2.branch.headEventId === store.branch.headEventId, '刷新后分支 head 指针一致');
 ok(store2.report.conflicts.length === store.report.conflicts.length, '刷新后冲突数量一致');
 ok(JSON.stringify(store2.report.conflicts.map((c) => [c.cid, c.blockerIds])) ===
    JSON.stringify(store.report.conflicts.map((c) => [c.cid, c.blockerIds])), '刷新后冲突链逐字节一致');
 
-// 8) 刷新后 undo 仍然可用且结果可重复：s2 撤销一次(→idx1)落盘；
-//    s3 从 idx1 刷新加载后再撤销(→idx0)，必须等于 s2 再撤销一次的结果
+// 8) 刷新后 undo 仍然可用且结果可重复
 store2.undo();
 await store2.flushed();
 const reloaded = new Store({ base: BASE });
@@ -91,7 +90,7 @@ store2.undo();
 ok(reloaded.current.hash === store2.current.hash, '刷新后继续撤销，结果一致');
 
 // 9) 坏文档不应炸服务
-const resBad = await fetch('http://127.0.0.1:8080/api/doc', {
+const resBad = await fetch(BASE + '/api/doc', {
   method: 'PUT', headers: { 'content-type': 'application/json' }, body: '{"hello":1}',
 });
 ok(resBad.status === 422, `非法文档被拒（${resBad.status}）`);
@@ -177,12 +176,13 @@ ok(JSON.stringify(reload1.compareById(sv1.version.id, sv3.version.id)) ===
    JSON.stringify(vs.compareById(sv1.version.id, sv3.version.id)), '刷新后比较结果逐字节一致');
 ok(!reload1.deleteVersion(sv3.version.id).ok, '刷新后已发布版本仍不能删除');
 
-// 13) 并发：两个页面基于同一版本编辑，旧页面保存必须冲突且不覆盖
+// 13) 并发：两个页面基于同一分支 head 编辑，旧页面保存必须冲突且不覆盖
 const page1 = new Store({ base: BASE });
 await page1.load();
 const page2 = new Store({ base: BASE });
 await page2.load();
 ok(page1.rev === page2.rev, '两个页面基于同一服务端版本号');
+ok(page1.branch.headEventId === page2.branch.headEventId, '两个页面基于同一分支 head 事件');
 
 page1.commit((m) => m.rects.push(newRect(50, 550, 90, 60, '页面1的矩形')));
 await page1.flushed();
@@ -190,7 +190,8 @@ ok(!page1.saveConflict, '页面1 保存成功');
 
 page2.commit((m) => m.rects.push(newRect(850, 550, 90, 60, '页面2的矩形')));
 await page2.flushed();
-ok(page2.saveConflict === true, '页面2 的旧版本提交被检测为版本冲突');
+ok(page2.saveConflict?.reason === 'branch-advanced', '页面2 的旧事件序号提交被检测为“分支已前进”');
+ok(!!page2.saveConflict.headSeq, '冲突提示带服务端当前事件序号');
 ok(page2.model.rects.some((r) => r.name === '页面2的矩形'), '页面2 的本地修改仍保留（未丢失）');
 
 const check = new Store({ base: BASE });
@@ -199,9 +200,46 @@ ok(check.model.rects.some((r) => r.name === '页面1的矩形'), '服务器保�
 ok(!check.model.rects.some((r) => r.name === '页面2的矩形'), '页面2的提交没有覆盖服务器');
 ok(check.rev === page1.rev, '服务器版本号只被页面1推进');
 
+// 13b) 审计事件：操作者 / 前后指纹 / 变更 / 冲突结果都已落盘
+const audit = new Store({ base: BASE });
+await audit.load();
+const p1Event = audit.events.find((e) => JSON.stringify(e).includes('页面1的矩形'));
+ok(!!p1Event, '页面1 的提交成为一条审计事件');
+ok(p1Event.hashBefore && p1Event.hashBefore !== p1Event.hash, '事件记录提交前后指纹');
+ok(p1Event.changes?.rects?.added?.length === 1, '事件记录结构化变更');
+ok(Object.isFrozen(p1Event), '审计事件不可修改（冻结）');
+ok(Object.isFrozen(p1Event.model), '事件快照深冻结');
+
+// 13c) 回放 + 从历史事件另存为分支（provenance 保留，原分支不改写）
+const mainHeadBefore = audit.branch.headEventId;
+const target = audit.events.find((e) => e.branch === 'main' && JSON.stringify(e.model).includes('新矩形'));
+ok(!!target, '找到“添加矩形”那条历史事件');
+ok(audit.replay(target.id).ok, '重放到历史事件');
+ok(audit.replaying, '处于只读回放状态');
+ok(!audit.commit((m) => m.rects.push(newRect(1, 1, 10, 10, '非法'))).ok, '回放中提交被拒绝');
+const beforeForkHashes = audit.events.map((e) => e.hash);
+const fk = audit.forkFromEvent(target.id, 'E2E 回放分支');
+ok(fk.ok, '从历史事件另存为新分支');
+ok(fk.event.kind === 'fork-root' && fk.event.hash === target.hash, '分支起点与来源同指纹');
+ok(fk.event.provenance.branchId === 'main' && fk.event.provenance.eventId === target.id, '保留来源关系');
+ok(audit.events.map((e) => e.hash).slice(0, beforeForkHashes.length).join() === beforeForkHashes.join(), '原事件未被改写');
+audit.commit((m) => m.rects.push(newRect(40, 40, 60, 60, '分支专属')));
+await audit.flushed();
+const mainBranch = audit.branches.find((b) => b.id === 'main');
+ok(mainBranch.headEventId === mainHeadBefore, '分支提交不影响主分支 head');
+
+// 13d) 重启后审计顺序、分支关系、回放一致
+const audit2 = new Store({ base: BASE });
+await audit2.load();
+ok(audit2.branches.some((b) => b.name === 'E2E 回放分支' && b.source?.branchId === 'main'), '重启后分支来源关系保持');
+ok(audit2.replay(target.id).ok && audit2.report.hash === target.hash, '重启后回放结果与事件指纹一致');
+const bd = audit2.compareBranches('main', fk.branch.id);
+ok(bd && !bd.identical && bd.rects.added.some((r) => r.name === '分支专属'), '分支比较检出差异');
+
 // 14) 原始 HTTP：过期 baseRev 返回 409，缺少 baseRev 返回 422
 const curDoc = await (await fetch(BASE + '/api/doc')).json();
 ok(Number.isFinite(curDoc.rev), 'GET 返回文档版本号');
+ok(Array.isArray(curDoc.events) && Array.isArray(curDoc.branches), '文档为事件流+分支结构');
 const stale = await fetch(BASE + '/api/doc', {
   method: 'PUT', headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ ...curDoc, baseRev: curDoc.rev - 1 }),
@@ -211,17 +249,18 @@ const staleBody = await stale.json();
 ok(staleBody.rev === curDoc.rev, '409 响应带回当前版本号');
 const noRev = await fetch(BASE + '/api/doc', {
   method: 'PUT', headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ entries: curDoc.entries, idx: curDoc.idx }),
+  body: JSON.stringify({ events: curDoc.events, branches: curDoc.branches }),
 });
 ok(noRev.status === 422, `缺少 baseRev 的提交被拒（${noRev.status}）`);
 const goodPut = await fetch(BASE + '/api/doc', {
   method: 'PUT', headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ ...curDoc, baseRev: curDoc.rev }),
+  body: JSON.stringify({ ...curDoc, baseRev: curDoc.rev, baseHeads: Object.fromEntries(curDoc.branches.map((b) => [b.id, b.headEventId])) }),
 });
-ok(goodPut.status === 200, '正确 baseRev 保存成功');
+ok(goodPut.status === 200, '正确 baseRev/baseHeads 保存成功');
 const afterDoc = await (await fetch(BASE + '/api/doc')).json();
 ok(afterDoc.rev === curDoc.rev + 1, '保存后版本号 +1');
 ok(afterDoc.versions.length === curDoc.versions.length, '版本列表在保存后保持');
+ok(afterDoc.events.length === curDoc.events.length, '审计事件在空保存后不增减');
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

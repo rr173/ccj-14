@@ -19,16 +19,25 @@
       <button id="btn-snap" class="primary">🔗 添加约束…</button>
       <button id="btn-delete" class="danger" disabled>删除所选</button>
       <span class="spacer"></span>
+      <span id="branch-chip" class="chip" title="当前编辑分支（审计事件按分支追加）">⎘ 主分支</span>
       <span id="version-chip" class="chip muted" title="当前编辑内容基于的版本">未保存版本</span>
       <span id="hash-chip" class="chip" title="当前解的确定性指纹（位置+约束成败+冲突）">hash —</span>
       <span id="save-chip" class="chip muted">未保存</span>
     </div>
   </header>
 
-  <!-- 版本冲突横幅：其他页面已保存更新内容，本页修改被阻止，必须重新加载 -->
+  <!-- 分支已前进横幅：同一分支在另一页面已提交，本页修改基于过期事件序号，拒绝覆盖 -->
   <div id="conflict-banner" class="hidden">
-    <span>⚠ <b>版本冲突</b>：另一个页面已保存了更新的内容。为避免覆盖对方数据，当前页面的修改<b>未保存</b>——请重新加载后再继续编辑。</span>
+    <span id="conflict-text">⚠ <b>版本冲突</b>：另一个页面已保存了更新的内容。为避免覆盖对方数据，当前页面的修改<b>未保存</b>——请重新加载后再继续编辑。</span>
     <button id="btn-reload">重新加载</button>
+  </div>
+
+  <!-- 回放横幅：正在浏览历史事件，布局只读，可退出或另存为分支 -->
+  <div id="replay-banner" class="hidden">
+    <span id="replay-text">▶ 正在回放历史事件（只读）</span>
+    <span class="spacer"></span>
+    <button id="btn-replay-fork">⎇ 另存为新分支并编辑</button>
+    <button id="btn-replay-exit" class="primary">回到当前 head</button>
   </div>
 
   <main class="main">
@@ -58,6 +67,7 @@
         <button class="tab" data-tab="props">属性</button>
         <button class="tab" data-tab="conflicts">冲突 <span id="conflict-count" class="badge">0</span></button>
         <button class="tab" data-tab="versions">版本 <span id="version-count" class="badge zero">0</span></button>
+        <button class="tab" data-tab="audit">审计/分支 <span id="audit-count" class="badge zero">0</span></button>
       </div>
 
       <div class="tab-body" data-body="constraints">
@@ -85,6 +95,29 @@
           <select id="cmp-b" title="对比版本"></select>
         </div>
         <div id="compare-result"></div>
+      </div>
+
+      <div class="tab-body hidden" data-body="audit">
+        <div class="audit-bar">
+          <label class="audit-field">分支
+            <select id="audit-branch"></select>
+          </label>
+          <button id="btn-new-branch" class="mini" title="从当前分支 head 另存为新分支">⎇ 从当前另存分支</button>
+        </div>
+        <div class="audit-bar">
+          <label class="audit-field grow">操作者署名
+            <input id="audit-actor" type="text" placeholder="你的名字（记入每条审计事件）" maxlength="40" />
+          </label>
+        </div>
+        <div id="audit-warnings" class="audit-warnings hidden"></div>
+        <div id="audit-timeline" class="list timeline"></div>
+        <h4 class="ver-h">分支比较（当前 head 差异）</h4>
+        <div class="ver-cmp">
+          <select id="bcmp-a" title="基准分支"></select>
+          <span class="cmp-arrow">→</span>
+          <select id="bcmp-b" title="对比分支"></select>
+        </div>
+        <div id="branch-compare-result"></div>
       </div>
     </aside>
   </main>

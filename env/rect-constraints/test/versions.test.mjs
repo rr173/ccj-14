@@ -223,11 +223,11 @@ test('Store：两个页面基于同一版本编辑，旧页面保存检测冲突
 
   p1.commit((m) => m.rects.push(newRect(10, 500, 80, 50, '页面1的矩形')));
   await p1.flushed();
-  assert.equal(p1.saveConflict, false, '页面1 保存成功');
+  assert.equal(p1.saveConflict, null, '页面1 保存成功');
 
   p2.commit((m) => m.rects.push(newRect(900, 500, 80, 50, '页面2的矩形')));
   await p2.flushed();
-  assert.equal(p2.saveConflict, true, '页面2 的旧版本提交被检测为冲突');
+  assert.ok(p2.saveConflict, '页面2 的旧版本提交被检测为冲突');
   assert.ok(p2.model.rects.some((r) => r.name === '页面2的矩形'), '页面2 的本地修改仍保留在内存中');
 
   // 服务器内容未被页面2覆盖
@@ -236,7 +236,7 @@ test('Store：两个页面基于同一版本编辑，旧页面保存检测冲突
   assert.ok(check.model.rects.some((r) => r.name === '页面1的矩形'), '服务器保留页面1的内容');
   assert.ok(!check.model.rects.some((r) => r.name === '页面2的矩形'), '页面2的提交没有覆盖服务器');
   assert.equal(check.rev, p1.rev, '服务器版本号只被页面1推进');
-  assert.equal(check.saveConflict, false, '重新加载后冲突解除');
+  assert.equal(check.saveConflict, null, '重新加载后冲突解除');
   await check.flushed();
 });
 
@@ -255,7 +255,7 @@ test('Store：无本地修改时检测到更新会静默跟随服务器', async 
   p2.persist();
   await p2.flushed();
   await new Promise((r) => setTimeout(r, 30)); // 等静默 reload 完成
-  assert.equal(p2.saveConflict, false, '无本地修改时不误报冲突');
+  assert.equal(p2.saveConflict, null, '无本地修改时不误报冲突');
   assert.ok(p2.model.rects.some((r) => r.name === 'P1'), '静默跟随到页面1的内容');
   await p2.flushed();
 });
