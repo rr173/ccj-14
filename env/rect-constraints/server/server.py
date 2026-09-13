@@ -142,6 +142,21 @@ def _valid_shape(doc):
                 return False
             if vv.get("status") not in (None, "queued", "running", "done", "failed", "cancelled"):
                 return False
+    # 审阅会话（可为空）：只做轻量结构校验，指纹对账在浏览器纯函数里
+    reviews = doc.get("reviewSessions", [])
+    if not isinstance(reviews, list):
+        return False
+    for r in reviews:
+        if not isinstance(r, dict) or not isinstance(r.get("id"), str) or not isinstance(r.get("name"), str):
+            return False
+        rn = r.get("nodes")
+        if not isinstance(rn, list) or not rn:
+            return False
+        for n in rn:
+            if not isinstance(n, dict) or not isinstance(n.get("key"), str):
+                return False
+            if n.get("decision") not in ("pending", "pass", "reject", "review"):
+                return False
     return True
 
 
@@ -273,6 +288,143 @@ def _merge_experiments(server_list, client_list):
     return [by_id[i] for i in order]
 
 
+def _review_node_bad(node, events_by_id, branches_by_id, experiments):
+    """审阅会话节点完整性（与 web/js/geom/reviews.js checkReviewNodeAgainstServer 同构）。"""
+    key = str(node.get("key") or "")
+    if key.startswith("event:"):
+        eid = key[6:]
+        ev = events_by_id.get(eid)
+        if not ev:
+            return "review-node-missing"
+        fp = node.get("fingerprint")
+        if isinstance(fp, str) and fp and isinstance(ev.get("hash"), str) and ev["hash"] != fp:
+            return "review-fingerprint-changed"
+        # root / fork-root 是各分支链顶，恒在链上
+        if not ev.get("parentId"):
+            return None
+        bid = node.get("branchId") or ev.get("branch")
+        b = branches_by_id.get(bid)
+        if b:
+            on_chain = False
+            cur = events_by_id.get(b.get("headEventId"))
+            guard = 0
+            while cur and guard < 100000:
+                guard += 1
+                if cur.get("id") == eid:
+                    on_chain = True
+                    break
+                cur = events_by_id.get(cur.get("parentId")) if cur.get("parentId") else None
+            if not on_chain:
+                return "review-branch-advanced"
+        return None
+    if key.startswith("variant:"):
+        rest = key[8:]
+        sep = rest.find(":")
+        exp_id, vid = rest[:sep], rest[sep + 1:]
+        exp = next((x for x in (experiments or []) if isinstance(x, dict) and x.get("id") == exp_id), None)
+        v = next((vv for vv in (exp.get("variants") if exp else []) or [] if isinstance(vv, dict) and vv.get("id") == vid), None)
+        if not exp or not v or v.get("status") != "done" or not isinstance(v.get("result"), dict):
+            return "review-node-missing"
+        fp = node.get("fingerprint")
+        rh = v["result"].get("hash")
+        if isinstance(fp, str) and fp and isinstance(rh, str) and rh != fp:
+            return "review-fingerprint-changed"
+        return None
+    return None
+
+
+def _effective_review_view(cur, doc):
+    """服务端状态并上本次提交的不可变事件/新分支/实验（同包新事件是合法引用来源）。"""
+    evs = {e["id"]: e for e in (cur or {}).get("events", []) if isinstance(e, dict) and isinstance(e.get("id"), str)}
+    for e in doc.get("events", []) or []:
+        if isinstance(e, dict) and isinstance(e.get("id"), str):
+            evs.setdefault(e["id"], e)
+    branches = {b["id"]: b for b in (cur or {}).get("branches", []) if isinstance(b, dict) and isinstance(b.get("id"), str)}
+    cur_id = doc.get("currentBranchId")
+    for b in doc.get("branches", []) or []:
+        if isinstance(b, dict) and isinstance(b.get("id"), str):
+            if b["id"] == cur_id:
+                branches[b["id"]] = b
+            else:
+                branches.setdefault(b["id"], b)
+    exps = {x["id"]: x for x in (cur or {}).get("experiments", []) if isinstance(x, dict) and isinstance(x.get("id"), str)}
+    for x in doc.get("experiments", []) or []:
+        if isinstance(x, dict) and isinstance(x.get("id"), str):
+            exps.setdefault(x["id"], x)
+    return evs, branches, list(exps.values())
+
+
+def _assess_review_conflict(cur, doc):
+    """
+    审阅会话乐观并发（与 web/js/geom/reviews.js assessServerReviewConflict 同构）。
+    只对本次推进了 rev 的会话核验：另一窗口已前进 / 节点指纹变化 / 节点缺失 /
+    事件所在分支已推进 → 409（后提交者本地决定保留，逐项合并）。
+    """
+    base_revs = doc.get("baseReviewRevs")
+    if not isinstance(base_revs, dict):
+        return None
+    if not isinstance(cur, dict):
+        cur = {}
+    cur_sessions = {s["id"]: s for s in cur.get("reviewSessions", []) if isinstance(s, dict) and isinstance(s.get("id"), str)}
+    # 即将生效的权威视图（并上本次提交的不可变事件 / 新分支 / 实验）
+    events_by_id, branches_by_id, experiments = _effective_review_view(cur, doc)
+    for s in doc.get("reviewSessions", []) or []:
+        if not isinstance(s, dict) or not isinstance(s.get("id"), str):
+            continue
+        sid = s["id"]
+        base = base_revs.get(sid)
+        if not isinstance(base, int) or isinstance(base, bool):
+            continue
+        try:
+            srev = int(s.get("rev"))
+        except (TypeError, ValueError):
+            continue
+        if srev <= base:
+            continue  # 未推进该会话（与审阅无关的保存）：不拦截
+        srv = cur_sessions.get(sid)
+        if srv and srv.get("rev") != base:
+            return {"reason": "review-advanced", "sessionId": sid, "serverRev": srv.get("rev", 1), "session": srv}
+        for n in s.get("nodes", []) or []:
+            if not isinstance(n, dict):
+                continue
+            bad = _review_node_bad(n, events_by_id, branches_by_id, experiments)
+            if bad:
+                return {"reason": bad, "sessionId": sid, "nodeKey": n.get("key"),
+                        "serverRev": (srv or {}).get("rev", base), "session": srv}
+    return None
+
+
+def _merge_review_sessions(server_list, client_list):
+    """审阅会话按 id 并集；同 id 以 rev 更大者整体胜出，冲突记录按 id 并集。"""
+    by_id = {}
+    order = []
+    for s in list(server_list or []):
+        if isinstance(s, dict) and isinstance(s.get("id"), str):
+            by_id[s["id"]] = s
+            order.append(s["id"])
+    for c in list(client_list or []):
+        if not isinstance(c, dict) or not isinstance(c.get("id"), str):
+            continue
+        cid = c["id"]
+        if cid not in by_id:
+            by_id[cid] = c
+            order.append(cid)
+            continue
+        s = by_id[cid]
+        winner = c if int(c.get("rev") or 0) > int(s.get("rev") or 0) else s
+        conflicts = {x.get("id"): x for x in winner.get("conflicts", []) if isinstance(x, dict) and x.get("id")}
+        for x in list(s.get("conflicts", []) or []) + list(c.get("conflicts", []) or []):
+            if not isinstance(x, dict) or not x.get("id"):
+                continue
+            ex = conflicts.get(x["id"])
+            if not ex or (not ex.get("resolved") and x.get("resolved")):
+                conflicts[x["id"]] = x
+        merged = dict(winner)
+        merged["conflicts"] = list(conflicts.values())
+        by_id[cid] = merged
+    return [by_id[i] for i in order]
+
+
 def _merge_docs(server_doc, client_doc):
     """跨分支并发合流。与 web/js/geom/audit.js mergeDocs 同构。"""
     evs = {e["id"]: e for e in server_doc.get("events", []) if isinstance(e, dict)}
@@ -296,6 +448,7 @@ def _merge_docs(server_doc, client_doc):
             vs.setdefault(v["id"], v)
 
     experiments = _merge_experiments(server_doc.get("experiments", []), client_doc.get("experiments", []))
+    review_sessions = _merge_review_sessions(server_doc.get("reviewSessions", []), client_doc.get("reviewSessions", []))
 
     merged = dict(server_doc)
     merged.update({
@@ -303,6 +456,9 @@ def _merge_docs(server_doc, client_doc):
         "branches": out_branches,
         "versions": list(vs.values()),
         "experiments": experiments,
+        "reviewSessions": review_sessions,
+        "activeReviewId": server_doc.get("activeReviewId")
+            or (client_doc.get("activeReviewId") if any(s.get("id") == client_doc.get("activeReviewId") for s in review_sessions) else None),
         "currentVersionId": server_doc.get("currentVersionId"),
         "compare": server_doc.get("compare", {"a": None, "b": None}),
         "branchCompare": server_doc.get("branchCompare", {"a": None, "b": None}),
@@ -381,6 +537,12 @@ class Handler(BaseHTTPRequestHandler):
             cur_rev = cur.get("rev", 0) if isinstance(cur, dict) else 0
             if not isinstance(cur_rev, int) or isinstance(cur_rev, bool):
                 cur_rev = 0
+            # 审阅会话乐观并发：会话 rev 前进 / 节点指纹变化 / 节点缺失 / 分支推进
+            # → 409（即使文档 rev 相同、或该保存本来可以按分支合流，审阅冲突也优先拒绝）
+            review_conflict = _assess_review_conflict(cur, doc)
+            if review_conflict:
+                self._send_json(409, {"error": "review-conflict", "rev": cur_rev, **review_conflict})
+                return
             if doc["baseRev"] != cur_rev:
                 # 文档已被其他页面前进：先判断是否可以按分支合流
                 mergeable, info = _assess_conflict(cur, doc)
@@ -395,6 +557,7 @@ class Handler(BaseHTTPRequestHandler):
                     merged = _merge_docs(cur, doc)
                     merged.pop("baseRev", None)
                     merged.pop("baseHeads", None)
+                    merged.pop("baseReviewRevs", None)
                     merged["rev"] = cur_rev + 1
                     _save_doc(merged)
                     self._send_json(200, {"ok": True, "rev": merged["rev"], "merged": True, "doc": merged})
@@ -402,6 +565,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 服务端无文档（比如数据卷被清空）：按首次保存处理
                 doc.pop("baseRev", None)
                 doc.pop("baseHeads", None)
+                doc.pop("baseReviewRevs", None)
                 doc["rev"] = 1
                 _save_doc(doc)
                 self._send_json(200, {"ok": True, "rev": 1})
@@ -413,6 +577,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             doc.pop("baseRev", None)
             doc.pop("baseHeads", None)
+            doc.pop("baseReviewRevs", None)
             doc["rev"] = cur_rev + 1
             _save_doc(doc)
             self._send_json(200, {"ok": True, "rev": doc["rev"], "entries": len(doc.get("events", [])), "events": len(doc.get("events", []))})

@@ -32,8 +32,14 @@ import {
   diffVariant, variantReplayable, reconcileRunState, variantCounters,
 } from './experiments.js';
 import {
-  buildWorkbench, defaultWorkbench, normalizeWorkbench,
+  buildWorkbench, defaultWorkbench, normalizeWorkbench, filterNodes,
 } from './auditbench.js';
+import {
+  createReviewSession, reconcileSession, recordDecision, mergeReviewItem,
+  rebaseSession, completeReview, reopenReview, sanitizeReviewSessions,
+  mergeReviewSessions, assessServerReviewConflict, findReviewNodeDrift,
+  buildReviewReport, sessionProgress,
+} from './reviews.js';
 
 const LS_KEY = 'rect-constraints-doc-v2';
 const LS_KEY_LEGACY = 'rect-constraints-doc-v1';
@@ -60,6 +66,13 @@ export class Store extends EventTarget {
     this.branchCompare = { a: null, b: null }; // 分支比较选择（持久化）
     this.auditWorkbench = defaultWorkbench(); // 实验审计工作台视图状态（筛选/回放位置/前后面）
     this.auditWarnings = [];
+
+    this.reviewSessions = [];                 // 可恢复审阅会话（快照 + 决定 + 变更记录 + 冲突记录）
+    this.activeReviewId = null;               // 当前打开的审阅会话 id（随文档持久化）
+    this._reviewProposals = new Map();        // sessionId -> [{nodeKey, decision, reason, by, at, rejected}]（409 后本地保留）
+    this._reviewSyncedRevs = {};              // sessionId -> 已与服务端确认的会话 rev（审阅乐观锁）
+    this._reviewAuthoredRevs = new Map();     // sessionId -> Set(rev)：本页自己写入过的 rev（localStorage 自我写入不判冲突）
+    this.reviewConflict = null;               // null | { sessionId, reason, serverRev, session }（该会话写入锁定）
 
     this.experiments = [];
     this.experimentWarnings = [];
@@ -96,7 +109,9 @@ export class Store extends EventTarget {
   }
 
   /** 把一个（可能是旧版、可能损坏的）文档装载为当前状态。 */
-  async _adopt(doc, { seed = false } = {}) {
+  async _adopt(doc, { seed = false, keepReviewConflict = false } = {}) {
+    const savedReviewConflict = keepReviewConflict ? this.reviewConflict : null;
+    const savedProposals = keepReviewConflict ? new Map(this._reviewProposals) : null;
     let seeded = false;
     if (!doc || (!(Array.isArray(doc.events) && doc.events.length) && Array.isArray(doc.entries))) {
       // 旧版文档：entries/idx 迁移为不可变审计事件链
@@ -185,6 +200,22 @@ export class Store extends EventTarget {
       experiments: this.experiments,
       nodeKeys: wb.byKey,
     });
+
+    // 审阅会话：逐条对账（损坏/缺失/分支推进/指纹变化 → 原决定保留、转待复核并记录原因）。
+    // 对账是确定性、幂等的纯函数，刷新 / 重启 / 合流后标注与冲突记录逐字节一致。
+    this.reviewSessions = sanitizeReviewSessions(doc.reviewSessions, wb, { now: Date.now() });
+    this.activeReviewId = this.reviewSessions.some((x) => x.id === doc.activeReviewId) ? doc.activeReviewId : null;
+    this._reviewProposals = new Map();
+    this.reviewConflict = null;
+    this._reviewSyncedRevs = {};
+    this._reviewAuthoredRevs = new Map();
+    for (const s of this.reviewSessions) this._reviewSyncedRevs[s.id] = s.rev;
+    // 合流响应重新装载时，保留本页尚未逐项合并/放弃的内存态审阅冲突与本地决定
+    if (savedReviewConflict && this.reviewSessions.some((x) => x.id === savedReviewConflict.sessionId)) {
+      this.reviewConflict = { ...savedReviewConflict, serverRev: this.reviewSessionById(savedReviewConflict.sessionId)?.rev ?? savedReviewConflict.serverRev };
+      this._reviewProposals = new Map([...savedProposals]);
+      this._reviewSyncedRevs[savedReviewConflict.sessionId] = this.reviewSessionById(savedReviewConflict.sessionId)?.rev ?? this._reviewSyncedRevs[savedReviewConflict.sessionId];
+    }
   }
 
   async _fetchDoc() {
@@ -205,6 +236,8 @@ export class Store extends EventTarget {
       branchCompare: this.branchCompare,
       experiments: this.experiments,
       auditWorkbench: this.auditWorkbench,
+      reviewSessions: this.reviewSessions,
+      activeReviewId: this.activeReviewId,
       actor: this.actor,
     };
   }
@@ -214,7 +247,7 @@ export class Store extends EventTarget {
   _saveVersion = 0;
   persist() {
     if (this._disposed) return; // dispose() 后一切迟到的防抖保存都是 no-op
-    if (this.saveConflict) return; // 冲突未解决：不再写任何存储
+    if (this.saveConflict) return; // 几何编辑冲突未解决：不再写任何存储
     const payload = this._payload();
     let merged = null;
     let prevExperiments = null;
@@ -231,12 +264,31 @@ export class Store extends EventTarget {
         prev = { ...prev, events: [...known.values()] };
         merged = this._checkLocalConflict(prev, payload);
         if (this.saveConflict) return;
+        // 审阅会话的多页签乐观锁：另一页签已推进同一会话 rev（或节点指纹/存在性已变）
+        // → 409 语义，本地决定保留为提案、绝不覆盖
+        const reviewConflict = this._checkLocalReviewConflict(prev, payload);
+        if (reviewConflict) {
+          this._onReviewConflict(reviewConflict);
+          return;
+        }
       }
       // 本地多页签合流：merged 已含本页当前分支最新提交，直接落合并结果
       const finalDoc = merged || { ...payload, rev: this.rev };
       // 实验按 id 合入磁盘（别的页签可能建了实验；完成结果永不被降级覆盖）
       finalDoc.experiments = mergeExperiments(prevExperiments || finalDoc.experiments || [], payload.experiments);
+      // 审阅会话按 id 合入磁盘（rev 更大者胜出；冲突记录并集）
+      finalDoc.reviewSessions = mergeReviewSessions(
+        Array.isArray(prev?.reviewSessions) ? prev.reviewSessions : (finalDoc.reviewSessions || []),
+        payload.reviewSessions || []);
+      finalDoc.activeReviewId = finalDoc.reviewSessions.some((x) => x.id === finalDoc.activeReviewId)
+        ? finalDoc.activeReviewId
+        : (payload.activeReviewId && finalDoc.reviewSessions.some((x) => x.id === payload.activeReviewId) ? payload.activeReviewId : null);
       localStorage.setItem(LS_KEY, JSON.stringify(finalDoc));
+      // 记录本页自己写入过的会话 rev：防抖窗口内重读 localStorage 不把自己的写入误判成外来推进
+      for (const rs of payload.reviewSessions || []) {
+        if (!this._reviewAuthoredRevs.has(rs.id)) this._reviewAuthoredRevs.set(rs.id, new Set());
+        this._reviewAuthoredRevs.get(rs.id).add(rs.rev);
+      }
     } catch {}
     this._emit('persist');
     ++this._saveVersion;
@@ -272,6 +324,7 @@ export class Store extends EventTarget {
       const hasForeignBranches = (stored.branches || []).some((b) => !this.branches.some((x) => x.id === b.id));
       if (!hasForeignEvents && !hasForeignBranches) return null;
       const merged = mergeDocs(stored, { ...payload, baseHeads: this._syncedHeads });
+      merged.reviewSessions = mergeReviewSessions(merged.reviewSessions || [], payload.reviewSessions || []);
       merged.rev = Math.max(Number.isFinite(stored.rev) ? stored.rev : 0, this.rev) + 1;
       this.rev = merged.rev;
       if (merged.events.length > this.events.length) {
@@ -300,6 +353,7 @@ export class Store extends EventTarget {
       return null;
     }
     const merged = mergeDocs(stored, client);
+    merged.reviewSessions = mergeReviewSessions(merged.reviewSessions || [], payload.reviewSessions || []);
     merged.rev = Math.max(Number.isFinite(stored.rev) ? stored.rev : 0, this.rev) + 1;
     this.rev = merged.rev;
     if (merged.events.length > this.events.length) {
@@ -314,6 +368,32 @@ export class Store extends EventTarget {
     return merged;
   }
 
+  /**
+   * localStorage 多页签审阅冲突检测（离线 / 服务端不可用时的协调）。
+   * 本页自己写入的 rev 不算外来推进（与几何侧 selfWrote 同理，防抖窗口内
+   * localStorage 已是本页最新值）；外来会话 rev 落后于磁盘（另一页签已提交决定）、
+   * 或本次推进的节点相对磁盘数据缺失 / 指纹变化 / 分支推进 → review-* 冲突。
+   */
+  _checkLocalReviewConflict(stored, payload) {
+    const storedSessions = new Map((stored.reviewSessions || []).map((x) => [x.id, x]));
+    for (const s of payload.reviewSessions || []) {
+      const authored = this._reviewAuthoredRevs.get(s.id);
+      const srv = storedSessions.get(s.id);
+      if (srv && authored?.has(srv.rev)) continue; // 本页自己写的：跳过 rev 锁
+      const base = this._reviewSyncedRevs[s.id] ?? 0;
+      if (!(s.rev > base)) continue;
+      if (srv && srv.rev !== base) {
+        return { reason: 'review-advanced', sessionId: s.id, serverRev: srv.rev, session: srv };
+      }
+      if (!srv) continue; // 新会话：磁盘上没有（或尚未落盘），允许
+      for (const n of s.nodes || []) {
+        const bad = findReviewNodeDrift(n, stored);
+        if (bad) return { reason: bad, sessionId: s.id, nodeKey: n.key, serverRev: srv.rev, session: srv };
+      }
+    }
+    return null;
+  }
+
   _sendLatest() {
     if (this.saveConflict) return this._saveChain;
     const v = this._saveVersion;
@@ -326,24 +406,56 @@ export class Store extends EventTarget {
         ? (this._syncedHeads[b.id] ?? b.headEventId)
         : b.headEventId;
     }
-    const snapshot = JSON.stringify({ ...this._payload(), baseRev: this.rev, baseHeads });
+    const snapshot = JSON.stringify({
+      ...this._payload(), baseRev: this.rev, baseHeads,
+      baseReviewRevs: this._baseReviewRevs(),
+    });
     this._saveChain = this._saveChain.then(async () => {
       if (v !== this._saveVersion || this.saveConflict) return;
+      // 审阅冲突未解决：该会话决定不再外发（本地决定已保留为提案，等逐项合并 / 放弃）。
+      // 几何保存（其他分支/文档字段）仍照常进行：载荷里剔除冲突会话，服务端按 id
+      // 并集时保留其权威副本，不会被本页过期内容覆盖。
+      let body = snapshot;
+      if (this.reviewConflict) {
+        const cid = this.reviewConflict.sessionId;
+        const parsed = JSON.parse(snapshot);
+        parsed.reviewSessions = (parsed.reviewSessions || []).filter((x) => x.id !== cid);
+        if (parsed.baseReviewRevs) delete parsed.baseReviewRevs[cid];
+        body = JSON.stringify(parsed);
+      }
       try {
         const res = await fetch(this.base + '/api/doc', {
           method: 'PUT', headers: { 'content-type': 'application/json' },
-          body: snapshot,
+          body,
         });
         if (res.status === 409) {
           const data = await res.json().catch(() => ({}));
+          if (typeof data?.sessionId === 'string' && String(data.reason || '').startsWith('review-')) {
+            // 审阅冲突（会话 rev 前进 / 节点指纹变化 / 节点缺失 / 分支推进）：
+            // 不锁定几何编辑，只锁定该会话；本地决定保留为 proposals，等待逐项合并
+            this._onReviewConflict(data);
+            return;
+          }
           this._onSaveConflict(data, Number.isFinite(data?.rev) ? data.rev : null);
           return;
         }
         if (!res.ok) { console.warn('保存失败', res.status); this._emit('saveerror', { status: res.status }); return; }
         const data = await res.json().catch(() => ({}));
         if (data.merged && data.doc) {
+          // 与另一页面的不同分支编辑合流：先确认本页推进的审阅会话 rev 是否被服务端接受
+          const rejectedReview = this._findRejectedReview(data.doc);
+          if (rejectedReview) {
+            // 审阅乐观锁失败（另一窗口推进了同一会话）：按 review 409 处理，本地决定保留
+            this._onReviewConflict(rejectedReview);
+            return;
+          }
           // 与另一页面的不同分支编辑合流：采用合并后的权威文档
-          await this._adopt(data.doc, { seed: false });
+          const myReview = this.reviewSessions;
+          const myActiveReview = this.activeReviewId;
+          const myProposals = this._reviewProposals;
+          await this._adopt(data.doc, { seed: false, keepReviewConflict: true });
+          // 合流文档以服务端为准，但本页刚刚提交且未被服务端纳入的审阅决定要保留为待合并提案
+          this._carryReviewProposals(myReview, myProposals, myActiveReview, data.doc);
           this._dirty = false;
           this._emit('load');
           this._emit('saved', { rev: this.rev, merged: true });
@@ -351,6 +463,13 @@ export class Store extends EventTarget {
         }
         if (Number.isFinite(data?.rev)) this.rev = data.rev;
         this._syncedHeads[this.currentBranchId] = this.branch.headEventId;
+        // 审阅基线只前进到服务端确认接受的 rev：同 rev 直存时服务端文档 == 本页载荷，
+        // 载荷中每个会话都是权威值；合流路径（data.merged）在 _carryReviewProposals 中
+        // 严格按服务端文档重算，绝不在此把本地未确认的 rev 当作已同步基线。
+        for (const s of this.reviewSessions) {
+          this._reviewSyncedRevs[s.id] = s.rev;
+          this._reviewAuthoredRevs.get(s.id)?.add(s.rev);
+        }
         this._emit('saved', { rev: this.rev });
       } catch (e) {
         console.warn('保存失败（已写入 localStorage）:', e.message);
@@ -756,7 +875,292 @@ export class Store extends EventTarget {
     return { ok: true };
   }
 
-  /* ---------- 布局方案实验 ---------- */
+  /* ---------- 可恢复审阅会话 ---------- */
+
+  _baseReviewRevs() {
+    const out = {};
+    for (const s of this.reviewSessions) {
+      out[s.id] = this._reviewSyncedRevs[s.id] ?? 0; // 未知会话（本次新建）基线为 0
+    }
+    return out;
+  }
+
+  get activeReview() {
+    return this.reviewSessions.find((x) => x.id === this.activeReviewId) || null;
+  }
+
+  reviewSessionById(id) { return this.reviewSessions.find((x) => x.id === id) || null; }
+
+  /**
+   * 会话视图：用当前统一时间线对会话做一次确定性对账（不写入、不持久化），
+   * 返回 { session（已对账）, filteredNow, newNodes, baselineChanged, currentHash, driftByKey, byKey, progress }。
+   */
+  reviewView(id = this.activeReviewId) {
+    const session = this.reviewSessions.find((x) => x.id === id);
+    if (!session) return null;
+    const view = reconcileSession(session, this.workbench());
+    view.progress = sessionProgress(view.session);
+    return view;
+  }
+
+  /** 从当前筛选结果创建审阅会话（快照：筛选条件 + 顺序 + 每节点指纹）。 */
+  createReview(name, { setActive = true } = {}) {
+    if (this.saveConflict) return { ok: false, error: '版本冲突未解决，请先重新加载' };
+    const w = this.workbench();
+    const nodes = filterNodes(w.nodes, this.auditWorkbench.filter);
+    if (!nodes.length) return { ok: false, error: '当前筛选结果为空，无法创建审阅会话' };
+    const session = createReviewSession({
+      name, actor: this.actor, filter: this.auditWorkbench.filter, nodes,
+      branches: this.branches, now: Date.now(),
+    });
+    this.reviewSessions = [...this.reviewSessions, session];
+    this._reviewSyncedRevs[session.id] = 0; // HTTP 首次保存：服务端尚无此会话（base=0）
+    if (!this._reviewAuthoredRevs.has(session.id)) this._reviewAuthoredRevs.set(session.id, new Set());
+    this._reviewAuthoredRevs.get(session.id).add(session.rev); // 本地自创会话：自己的 rev1 不是外来推进
+    if (setActive) this.activeReviewId = session.id;
+    this._dirty = true;
+    this.persist();
+    // 首次保存确认后以服务端 rev 为基线（_sendLatest 的 saved 分支统一同步）
+    this._emit('reviews', { type: 'create', id: session.id });
+    return { ok: true, session };
+  }
+
+  selectReview(id) {
+    if (id && !this.reviewSessions.some((x) => x.id === id)) return { ok: false };
+    this.activeReviewId = id || null;
+    this._dirty = true;
+    this.persist();
+    this._emit('reviews', { type: 'select', id });
+    return { ok: true };
+  }
+
+  /**
+   * 记录节点决定（通过 / 驳回 / 待复核 + 理由）。
+   * 节点损坏/缺失/指纹变化/分支推进、或筛选基线已漂移 → 409：
+   * 本地决定保留在 reviewProposals，不写入会话，等待逐项合并 / 刷新基线。
+   * 会话本身被另一窗口推进（乐观锁失败）由服务端异步 409 同样处理。
+   */
+  submitReviewDecision(id, nodeKey, decision, reason) {
+    const session = this.reviewSessions.find((x) => x.id === id);
+    if (!session) return { ok: false, status: 409, error: '会话不存在（可能已被其他页面删除）' };
+    if (this.reviewConflict?.sessionId === id) {
+      const p = this._stashProposal(id, nodeKey, decision, reason);
+      return { ok: false, status: 409, reason: this.reviewConflict.reason, conflict: this.reviewConflict, proposal: p };
+    }
+    const view = this.reviewView(id);
+    const res = recordDecision(session, view, nodeKey, decision, reason, { actor: this.actor });
+    if (res.status !== 200) {
+      const p = this._stashProposal(id, nodeKey, decision, reason);
+      return { ok: false, status: 409, reason: res.reason, codes: res.codes, proposal: p };
+    }
+    this._replaceReview(res.session);
+    this._dirty = true;
+    this.persist();
+    this._emit('reviews', { type: 'decision', id, nodeKey });
+    return { ok: true, session: res.session };
+  }
+
+  _stashProposal(id, nodeKey, decision, reason) {
+    const p = { nodeKey, decision, reason: String(reason || '').slice(0, 2000), by: this.actor || '未署名', at: Date.now(), rejected: true };
+    const list = this._reviewProposals.get(id) || [];
+    list.push(p);
+    this._reviewProposals.set(id, list);
+    this._emit('reviews', { type: 'proposal', id, nodeKey });
+    return p;
+  }
+
+  /** 409 后逐项合并：以本地决定强制落到【最新快照】的该节点上（关闭该节点冲突记录）。 */
+  mergeReviewItem(id, nodeKey, decision, reason) {
+    const session = this.reviewSessions.find((x) => x.id === id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    const res = mergeReviewItem(session, nodeKey, decision, reason, { actor: this.actor, resolution: 'merged-local' });
+    if (res.status !== 200) return { ok: false, error: res.reason };
+    this._replaceReview(res.session);
+    // 该节点的本地保留提案已被采用
+    const list = (this._reviewProposals.get(id) || []).filter((p) => p.nodeKey !== nodeKey);
+    this._reviewProposals.set(id, list);
+    this._clearReviewConflictIfResolved(id);
+    this._dirty = true;
+    this.persist();
+    this._emit('reviews', { type: 'merge-item', id, nodeKey });
+    return { ok: true, session: res.session };
+  }
+
+  /** 放弃本地保留的某条决定（采用服务端最新值）。 */
+  discardReviewProposal(id, nodeKey) {
+    const list = (this._reviewProposals.get(id) || []).filter((p) => p.nodeKey !== nodeKey);
+    this._reviewProposals.set(id, list);
+    this._clearReviewConflictIfResolved(id);
+    this._emit('reviews', { type: 'proposal-discard', id, nodeKey });
+    return { ok: true };
+  }
+
+  reviewProposals(id = this.activeReviewId) {
+    return this._reviewProposals.get(id) || [];
+  }
+
+  /**
+   * 刷新审阅基线到当前筛选结果：保留全部决定与变更历史，新节点成为未处理项，
+   * 缺失节点保留在末尾；关闭基线级 / 指纹级冲突（仍损坏 / 缺失 / 支线的节点保留转待复核标注）。
+   */
+  rebaseReview(id) {
+    const session = this.reviewSessions.find((x) => x.id === id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    if (this.reviewConflict?.sessionId === id && this.reviewConflict.reason === 'review-advanced') {
+      return { ok: false, error: '该会话已在另一窗口前进，请先逐项合并或放弃本地决定后再刷新基线' };
+    }
+    const view = this.reviewView(id);
+    const next = rebaseSession(session, view, { actor: this.actor });
+    this._replaceReview(next);
+    this._clearReviewConflictIfResolved(id, { forceBaseline: true });
+    this._dirty = true;
+    this.persist();
+    this._emit('reviews', { type: 'rebase', id });
+    return { ok: true, session: next, added: view.newNodes.length };
+  }
+
+  completeReview(id) {
+    const session = this.reviewSessions.find((x) => x.id === id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    const view = this.reviewView(id);
+    const res = completeReview(session, view);
+    if (res.status !== 200) return { ok: false, error: `还有 ${res.pending} 个节点未处理（含系统转待复核）` };
+    this._replaceReview(res.session);
+    this._dirty = true;
+    this.persist();
+    this._emit('reviews', { type: 'complete', id });
+    return { ok: true, session: res.session };
+  }
+
+  reopenReview(id) {
+    const session = this.reviewSessions.find((x) => x.id === id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    const res = reopenReview(session);
+    this._replaceReview(res.session);
+    this._dirty = true;
+    this.persist();
+    this._emit('reviews', { type: 'reopen', id });
+    return { ok: true, session: res.session };
+  }
+
+  /** 当前会话完整审阅报告（快照 + 进度 + 每节点决定/理由/变更 + 冲突记录）。 */
+  reviewReport(id = this.activeReviewId, { generatedAt = null } = {}) {
+    const session = this.reviewSessions.find((x) => x.id === id);
+    if (!session) return null;
+    return buildReviewReport(session, this.reviewView(id), { generatedAt });
+  }
+
+  _replaceReview(session) {
+    this.reviewSessions = this.reviewSessions.map((x) => (x.id === session.id ? session : x));
+  }
+
+  _clearReviewConflictIfResolved(id, { forceBaseline = false } = {}) {
+    const c = this.reviewConflict;
+    if (!c || c.sessionId !== id) return;
+    if (forceBaseline || !(this._reviewProposals.get(id) || []).length) {
+      this.reviewConflict = null;
+    }
+  }
+
+  /** 服务端 409（review-*）：不锁定几何编辑，只锁定该会话；本地决定保留为提案。 */
+  _onReviewConflict(info) {
+    const id = info.sessionId;
+    const mine = this.reviewSessions.find((x) => x.id === id);
+    // 409 响应可能附带服务端最新会话（同 rev 冲突路径）；否则立即 GET 权威文档
+    const adoptServerSession = (serverSession) => {
+      if (!serverSession) return;
+      const localDecisions = new Map((mine?.nodes || [])
+        .filter((n) => n.decision !== 'pending')
+        .map((n) => [n.key, n]));
+      const revsed = sanitizeReviewSessions([serverSession], this.workbench())[0];
+      // 保留本地（被拒）决定：服务端节点上仍 pending 或值不同的，进 proposals
+      const kept = [];
+      for (const [key, n] of localDecisions) {
+        const srv = revsed?.nodes.find((x) => x.key === key);
+        if (!srv || srv.decision !== n.decision) {
+          kept.push({ nodeKey: key, decision: n.decision, reason: n.reason, by: n.decidedBy || this.actor, at: Date.now(), rejected: true });
+        }
+      }
+      const existing = this._reviewProposals.get(id) || [];
+      const keys = new Set(existing.map((p) => p.nodeKey + p.decision));
+      for (const p of kept) if (!keys.has(p.nodeKey + p.decision)) existing.push(p);
+      this._reviewProposals.set(id, existing);
+      this.reviewSessions = this.reviewSessions.map((x) => (x.id === id ? revsed : x));
+      // 以服务端最新 rev 为新基线：下一次逐项合并携带正确的 baseReviewRevs
+      this._reviewSyncedRevs[id] = revsed.rev;
+      this._reviewAuthoredRevs.delete(id);
+    };
+    adoptServerSession(info.session || null);
+    this.reviewConflict = {
+      sessionId: id,
+      reason: info.reason,
+      nodeKey: info.nodeKey || null,
+      serverRev: info.serverRev ?? null,
+      at: Date.now(),
+    };
+    if (!info.session) {
+      this._fetchDoc().then((doc) => {
+        if (!doc) return;
+        const srv = (Array.isArray(doc.reviewSessions) ? doc.reviewSessions : []).find((x) => x.id === id);
+        if (srv) {
+          adoptServerSession(srv);
+          this._emit('reviews', { type: 'conflict', id });
+        }
+      }).catch(() => {});
+    }
+    this._emit('reviews', { type: 'conflict', id });
+  }
+
+  /**
+   * 合流响应里是否有本页推进过、但服务端合并结果并未接纳的会话。
+   * 真实 server.py 会在合流前先用 _assess_review_conflict 返回 409；这里是客户端防御，
+   * 兼容“文档级合并但会话按 rev 取服务端值”的响应，以及本地 rev 与服务端 rev 数字
+   * 恰好相同但内容不同（另一窗口也推进到该 rev）的竞态。
+   */
+  _findRejectedReview(serverDoc) {
+    const byId = new Map((serverDoc.reviewSessions || []).map((x) => [x.id, x]));
+    for (const mine of this.reviewSessions) {
+      const base = this._reviewSyncedRevs[mine.id] ?? 0;
+      if (!(mine.rev > base)) continue;
+      const srv = byId.get(mine.id);
+      if (!srv) continue; // 全新会话不可能出现在旧服务端文档
+      const mineByKey = new Map(mine.nodes.map((n) => [n.key, n]));
+      let differs = false;
+      for (const n of srv.nodes || []) {
+        const m = mineByKey.get(n.key);
+        if (m && m.decision !== 'pending' && (m.decision !== n.decision || m.reason !== n.reason)) { differs = true; break; }
+      }
+      if (srv.rev < mine.rev || (srv.rev === mine.rev && differs)) {
+        return { reason: 'review-advanced', sessionId: mine.id, serverRev: srv.rev, session: srv };
+      }
+    }
+    return null;
+  }
+
+  /** 跨分支合流（merged 响应）后，把本页已提交但未纳入合流文档的审阅决定保留为提案。 */
+  _carryReviewProposals(mySessions, myProposals, myActiveId, mergedDoc) {
+    const serverSessions = new Map((mergedDoc.reviewSessions || []).map((s) => [s.id, s]));
+    for (const mine of mySessions) {
+      const srv = serverSessions.get(mine.id);
+      // 基线严格以服务端为准：本页本地 rev 即便数字相同也不代表内容被服务端接受
+      this._reviewSyncedRevs[mine.id] = srv ? srv.rev : (this._reviewSyncedRevs[mine.id] ?? 0);
+      this._reviewAuthoredRevs.delete(mine.id);
+      const kept = [];
+      for (const n of mine.nodes) {
+        if (n.decision === 'pending') continue;
+        const on = srv?.nodes.find((x) => x.key === n.key);
+        if (!on || on.decision !== n.decision || on.reason !== n.reason) {
+          kept.push({ nodeKey: n.key, decision: n.decision, reason: n.reason, by: n.decidedBy || this.actor, at: Date.now(), rejected: true });
+        }
+      }
+      const prev = myProposals.get(mine.id) || [];
+      const all = [...prev, ...kept];
+      if (all.length) this._reviewProposals.set(mine.id, all);
+    }
+    if (myActiveId && this.reviewSessions.some((x) => x.id === myActiveId)) this.activeReviewId = myActiveId;
+  }
+
+
 
   experimentById(id) { return this.experiments.find((x) => x.id === id) || null; }
 

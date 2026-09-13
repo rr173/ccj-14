@@ -159,6 +159,42 @@ ants 多边形标出。`contain → 画布` 不算矩形间边，不会参与成
   顺序与界面一致，键名递归排序保证逐字节确定，并附 FNV 校验和。
 - 工作台视图状态（`auditWorkbench`）随文档经同一套乐观并发保存，跨分支合流时以服务端为准。
 
+## 可恢复的审阅会话（reviewSessions）
+
+「审计台」页可从**当前筛选结果**创建审阅会话，按时间线顺序逐个节点记录
+`通过(pass) / 驳回(reject) / 待复核(review)` 决定与理由（驳回、待复核必须填写理由）。
+
+- **创建即快照**：会话保存创建时的筛选条件、节点顺序（`orderHash`）、整条筛选基线
+  （`timelineHash`：节点 key + 求解后指纹 + 可回放性 + 健康级别）、每个节点的指纹
+  （求解后优先，无结果快照时取求解前）与身份（分支/实验/变体/序号）。审阅顺序始终
+  以快照为准，不受之后筛选改动影响。
+- **进度与未处理**：实时统计 通过 / 驳回 / 待复核 / 未处理；全部处理完可「标记完成」，
+  之后可重开。
+- **决定变更记录**：首次决定只记录决定本身；此后每次修改追加 `{from,to,理由,时间,决定人}`，
+  409 后的逐项合并额外带 `merged` 标记。
+- **多窗口乐观并发（409）**：会话带单调递增 `rev`，保存携带 `baseReviewRevs`。
+  - 另一窗口已前进同一会话 → `review-advanced`；
+  - 提交节点的指纹已变化 → `review-fingerprint-changed`；
+  - 节点（审计事件 / 完成变体结果）已缺失 → `review-node-missing`；
+  - 事件所在分支已推进、该事件属于支线 → `review-branch-advanced`。
+  - 后提交者收到 **409 且本地决定原样保留**（界面顶部“待合并的本地决定”，几何编辑
+    **不被锁定**），可基于最新快照**逐项合并**（采用本地 / 放弃），或「刷新基线」。
+    与审阅无关的几何 / 另一分支保存不被审阅锁拦截。
+- **损坏容忍与对账**（加载时确定性、幂等、不改 rev 地重建）：节点损坏 / 缺失 / 指纹变化 /
+  被分支推进后，**原决定原样保留**，节点的有效状态自动转为「待复核」并附原因
+  （`autoReview`），同时生成确定性 id 的冲突记录（`conflicts`）；恢复后标注与记录关闭。
+  刷新、重启、跨窗口合流后这些标注逐字节一致。
+- **刷新基线（rebase）**：以当前筛选结果重建顺序与基线指纹，决定与变更历史全部保留；
+  新进入筛选结果的节点成为未处理项；已缺失节点附在末尾并保留原决定。
+- **重启一致**：会话、进度、决定顺序、理由、变更记录、冲突记录全部随文档持久化
+  （`reviewSessions` / `activeReviewId`），刷新或重启后恢复。
+- **完整审阅报告**：一键导出当前会话 JSON（快照 + 进度 + 每节点决定/理由/有效状态 +
+  决定变更日志 + 全部冲突记录 + 当前指纹漂移），键名递归排序保证逐字节确定，并附 FNV 校验和。
+
+服务端 `server.py` 对每个被推进的会话做与浏览器同构的 `_assess_review_conflict` 判定，
+冲突优先于文档级 / 分支级合流返回 409；跨分支合流时会话按 id 并集、同 id 以 rev 更大者
+整体胜出、冲突记录按 id 并集。
+
 ## 运行
 
 ### Docker（推荐）
@@ -187,19 +223,22 @@ DATA_PATH=./data/doc.json HOST=127.0.0.1 PORT=8080 python3 server/server.py
 ## 测试
 
 ```bash
-npm test          # 单元测试（求解器 15 + 布局版本 9 + 审计/分支 14 + 布局方案实验 17 + 实验审计工作台 22）
+npm test          # 单元测试（求解器 15 + 布局版本 9 + 审计/分支 14 + 布局方案实验 17
+                  # + 实验审计工作台 21 + 可恢复审阅会话 29）
 # 端到端（需要先启动 server）：
 DATA_PATH=/tmp/rc.json python3 server/server.py &
 npm run test:e2e  # Store ↔ HTTP：提交、环拒绝、冲突链、undo/redo、刷新一致性、
                   # 版本保存/比较/恢复/发布、审计回放/fork、409 分支已前进不覆盖
 npm run test:e2e:experiments   # 实验建立/批量求解/幂等/暂停继续取消/损坏容忍/另存分支（真实 HTTP）
+npm run test:e2e:reviews       # 审阅会话快照/决定持久化/多窗口 409 + 逐项合并/指纹 409/报告导出（真实 HTTP）
 ```
 
 ## 目录
 
 ```
 server/server.py        零依赖 HTTP：静态文件 + /api/doc（原子持久化 + baseRev/baseHeads
-                         乐观并发：同分支 head 前进 -> 409，不同分支 -> 事件/实验并集合流）
+                         乐观并发：同分支 head 前进 -> 409，不同分支 -> 事件/实验并集合流；
+                         审阅会话 baseReviewRevs + 节点指纹/存在性/分支链校验 -> review-* 409）
 web/index.html
 web/css/app.css
 web/js/app.js           装配：工具栏 / 面板 / 审计分支事件 / 实验面板 / 冲突与回放横幅 / 快捷键 / toast
@@ -209,16 +248,18 @@ web/js/geom/audit.js    不可变审计事件 / 分支 / 时间线 / 回放校�
                          （含实验变体 → 编辑分支的 experiment-fork-root）
 web/js/geom/experiments.js 实验纯函数：变体定义/配置指纹/批量求解/失败隔离/差异/清洗损坏/合流
 web/js/geom/auditbench.js 实验审计工作台纯函数：统一节点时间线/健康标注（缺失/重复/指纹/分支推进）/筛选/步进/状态清洗/导出
-web/js/geom/store.js    事件流+分支+实验运行器（排队/暂停/继续/取消）、回放/fork、版本与持久化
+web/js/geom/reviews.js  可恢复审阅会话纯函数：创建快照/决定与变更记录/进度/对账（损坏·缺失·指纹·分支推进转待复核）/
+                         刷新基线/完成重开/清洗/合流/服务端冲突判定/审阅报告（纯函数，无 DOM 依赖）
+web/js/geom/store.js    事件流+分支+实验运行器（排队/暂停/继续/取消）、审阅会话（409 提案/逐项合并）、回放/fork、版本与持久化
 web/js/geom/versions.js 版本快照 + 版本间差异比较（纯函数，无 DOM 依赖）
 web/js/geom/diff.js     差异结果 HTML 渲染（版本比较 / 分支比较 / 实验变体比较共用）
 web/js/geom/versionpanel.js  版本页 UI（保存/恢复/发布/删除/比较）
 web/js/geom/auditpanel.js    审计/分支页 UI（时间线/回放/fork/分支比较/健康警告）
 web/js/geom/experimentpanel.js 实验页 UI（变体编辑器/状态/暂停继续取消/与基准差异/另存分支）
-web/js/geom/workbenchpanel.js 审计台页 UI（跨实验/变体/分支筛选、求解前后切换、顺序回放控制、导出）
+web/js/geom/workbenchpanel.js 审计台页 UI（筛选、求解前后切换、顺序回放、审阅会话决定/409 合并/报告、导出）
 web/js/geom/view.js     SVG 渲染与统一指针手势（拖动/组拖/框选/调尺寸，回放时只读）
 web/js/geom/dialog.js   添加约束对话框（环拒绝时定位）
-test/                   单元测试 + HTTP 端到端冒烟（e2e.mjs / e2e-experiments.mjs）
+test/                   单元测试 + HTTP 端到端冒烟（e2e.mjs / e2e-experiments.mjs / e2e-reviews.mjs）
 ```
 
 ## 操作提示
