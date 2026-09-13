@@ -540,3 +540,20 @@ rect-constraint rect:hover .handle, .rect-g.selected .handle { opacity: 1; }
 .rv-log .rv-ok { color: var(--ok); font-weight: 700; }
 .rv-log .rv-bad { color: var(--danger); font-weight: 700; }
 .rv-log .rv-none { color: var(--muted); list-style: none; margin-left: -18px; }
+
+.rv-create-card { width: 560px; }
+.rv-create-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+.rv-form-row { display: flex; flex-direction: column; gap: 5px; font-size: 12px; font-weight: 700; color: var(--text); }
+.rv-form-row input, .rv-form-row textarea, .rv-form-row select { font-weight: 400; }
+.rv-form-check { font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 7px; }
+.rv-form-grid { display: grid; grid-template-columns: 1fr 1.4fr; gap: 10px; }
+.rv-form-note { font-size: 11px; color: var(--muted); line-height: 1.6; }
+.rv-prop-who { font-size: 10px; padding: 1px 6px; border-radius: 4px; background: #eef1f6; color: #55607a; font-weight: 700; }
+.rv-signatures { margin-top: 5px; border-top: 1px dashed var(--line); padding-top: 4px; }
+.rv-sig-h { font-size: 10px; color: var(--muted); margin-bottom: 3px; }
+.rv-sig-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; max-height: 105px; overflow-y: auto; }
+.rv-sig-list li { font-size: 10px; line-height: 1.5; border-radius: 5px; padding: 2px 6px; background: #f7f9fc; }
+.rv-sig-list li.sig-ok { color: var(--ok); }
+.rv-sig-list li.sig-bad { color: var(--danger); background: var(--danger-soft); }
+.rv-ok { color: var(--ok); font-weight: 700; }
+.rv-bad { color: var(--danger); font-weight: 700; }

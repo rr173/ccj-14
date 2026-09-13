@@ -1,26 +1,15 @@
 /*
  * 可恢复的审阅会话：纯函数模块（无 DOM / 存储依赖）。
  *
- * 用户在实验审计工作台从【当前筛选结果】创建审阅会话，按时间线顺序逐个节点
- * 记录 通过(pass) / 驳回(reject) / 待复核(review) 决定与理由。会话本身是一份
- * 创建时刻的**只读快照**：
- *   - 创建时的筛选条件；
- *   - 节点顺序（orderHash）与整条筛选基线（timelineHash：key+指纹+可回放性+健康级别）；
- *   - 每个节点的指纹（求解后，缺失时取求解前）、身份（分支/实验/变体/序号）；
- *   - 每个节点的决定、理由、决定人/时间与**决定变更记录**（history）。
+ * 会话是创建时刻的只读快照；除单人审阅（legacy）外，还支持可配置的多人签署：
+ * policy = { mode:'signoff', signers, required, completeRule }。审阅人先提交
+ * pass/reject/review，再单独签名确认。同一签署人重复有效签名幂等；改判会保留
+ * 旧签名并标记 superseded。节点达到 required 个有效签名后确认，会话完成还要
+ * 满足 policy.completeRule。
  *
- * 乐观并发：会话带单调递增 rev。多个窗口同时审阅时，提交携带 baseReviewRevs；
- * 服务端发现会话 rev 已前进、节点指纹变化、节点缺失或事件所在分支已推进，
- * 一律 409 拒绝——本地决定保留在调用方（Store 的 reviewProposals），
- * 用户基于最新快照逐项合并（mergeReviewItem：采用本地 / 采用远端 / 改待复核）。
- *
- * 损坏容忍（reconcileSession，确定性、幂等、不增加 rev，可在任意时刻重算）：
- *   节点损坏 / 缺失 / 被分支推进 / 指纹变化后，原决定原样保留，节点有效状态
- *   自动转为「待复核」并附原因（autoReview），同时生成确定性 id 的冲突记录；
- *   刷新、重启、合流后这些标注逐字节一致地重新导出。
- *
- * 刷新基线（rebaseSession）：以当前筛选结果重建基线与顺序，已记录的决定 / 变更
- * 历史全部保留，新出现的节点成为未处理项，基线级冲突记录关闭。
+ * 乐观并发与损坏容忍规则与单人决定一致：会话 rev 前进、节点指纹变化、节点缺失、
+ * 分支推进都会 409；对账时已有签名保留在 signatures[] 中，但立即带 invalid 原因
+ * 失效，必须重新签署。
  */
 
 import { uid } from './model.js';
@@ -30,21 +19,30 @@ import { filterNodes } from './auditbench.js';
 export const REVIEW_FORMAT = 1;
 export const REVIEW_DECISIONS = ['pass', 'reject', 'review'];
 const DECISION_SET = new Set(REVIEW_DECISIONS);
+const DECISION_RANK = { review: 3, reject: 2, pass: 1 };
+const INVALID_REASONS = {
+  'node-missing': '节点已缺失：审计事件 / 变体结果不在当前时间线中，签名已失效',
+  corrupt: '节点已损坏：快照指纹校验失败，无法回放，签名已失效',
+  'fingerprint-changed': '节点指纹已变化：记录指纹与当前快照不一致，签名已失效',
+  'branch-advanced': '分支已推进：该事件属于支线事件，签名已失效',
+  superseded: '同一签署人已重新签名，旧签名被新签名取代',
+  'not-allowed': '签署人不在本节点允许名单中，签名已失效',
+  'duplicate-signer': '同一签署人存在重复有效签名，仅保留最早一条',
+};
 
 export const DECISION_LABEL = {
   pass: '通过', reject: '驳回', review: '待复核', pending: '未处理',
 };
 
 export const DRIFT_TEXT = {
-  'node-missing': '节点已缺失：审计事件 / 变体结果不在当前时间线中（原决定保留，转待复核）',
-  corrupt: '节点已损坏：快照指纹校验失败，无法回放（原决定保留，转待复核）',
-  'fingerprint-changed': '节点指纹已变化：记录指纹与当前快照不一致（原决定保留，转待复核）',
-  'branch-advanced': '分支已推进：该事件不在所属分支当前 head 父链上，属于支线事件（原决定保留，转待复核）',
+  'node-missing': '节点已缺失：审计事件 / 变体结果不在当前时间线中（原决定/签名保留，转待复核）',
+  corrupt: '节点已损坏：快照指纹校验失败，无法回放（原决定/签名保留，转待复核）',
+  'fingerprint-changed': '节点指纹已变化：记录指纹与当前快照不一致（原决定/签名保留，转待复核）',
+  'branch-advanced': '分支已推进：该事件不在所属分支当前 head 父链上，属于支线事件（原决定/签名保留，转待复核）',
 };
 
 /* ---------------- 指纹 / 哈希 ---------------- */
 
-/** 节点指纹：优先求解后指纹；无结果快照（失败/排队变体）时取求解前。 */
 export function nodeFingerprint(node) {
   if (!node) return null;
   return node.hashAfter || node.hashBefore || null;
@@ -66,7 +64,6 @@ export function reviewOrderHash(keys) {
   return hash32(keys.join('|'));
 }
 
-/** 筛选基线指纹：顺序 + 每节点（key、指纹、可回放性、健康级别），任一变化即基线漂移。 */
 export function reviewTimelineHash(nodes) {
   return hash32(nodes.map((n) =>
     `${n.key}:${nodeFingerprint(n) || ''}:${n.replayable ? 1 : 0}:${n.severity}`).join('|'));
@@ -82,11 +79,133 @@ export function normalizeFilter(f = {}) {
   };
 }
 
+export function normalizeActor(actor = '') {
+  return String(actor || '未署名').trim().slice(0, 40) || '未署名';
+}
+
+/* ---------------- 多人签署规则 ---------------- */
+
+export function normalizeReviewPolicy(raw = null, { fallback = null } = {}) {
+  const source = raw && typeof raw === 'object' ? raw : (fallback || {});
+  if (raw && typeof raw === 'object' && raw.mode === 'signoff') {
+    const seen = new Set();
+    const signers = [];
+    for (const value of Array.isArray(raw.signers) ? raw.signers : []) {
+      const name = String(value || '').trim().slice(0, 40);
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      signers.push(name);
+    }
+    let required = Number(raw.required);
+    if (!Number.isInteger(required)) required = signers.length || 1;
+    required = Math.max(1, Math.min(required, signers.length || 1));
+    return {
+      mode: 'signoff',
+      signers,
+      required,
+      completeRule: raw.completeRule === 'no-reject' ? 'no-reject' : 'all-decided',
+    };
+  }
+  return { mode: 'legacy', signers: [], required: 1, completeRule: 'all-decided' };
+}
+
+export function validateReviewPolicy(policy) {
+  const p = normalizeReviewPolicy(policy);
+  if (p.mode !== 'signoff') return { ok: true, policy: p };
+  if (!p.signers.length) return { ok: false, error: '多人签署必须至少设置一名允许的审阅人' };
+  if (!Number.isInteger(p.required) || p.required < 1 || p.required > p.signers.length) {
+    return { ok: false, error: '签署人数必须在 1 到允许审阅人数之间' };
+  }
+  if (!['all-decided', 'no-reject'].includes(p.completeRule)) return { ok: false, error: '完成条件无效' };
+  return { ok: true, policy: p };
+}
+
+export function activeSignatures(node) {
+  return (node?.signatures || []).filter((s) => s && !s.invalid);
+}
+
+export function isAllowedSigner(policy, actor) {
+  const p = normalizeReviewPolicy(policy);
+  const by = normalizeActor(actor);
+  return p.mode !== 'signoff' || p.signers.includes(by);
+}
+
+export function signatureState(node, policy) {
+  const sn = node || {};
+  const p = normalizeReviewPolicy(policy);
+  const active = activeSignatures(sn).slice().sort(compareSignatures);
+  const counts = { pass: 0, reject: 0, review: 0 };
+  for (const s of active) counts[s.decision] += 1;
+  if (p.mode !== 'signoff') {
+    return {
+      mode: 'legacy', active, counts,
+      confirmed: !sn.autoReview && sn.decision !== 'pending',
+      decision: sn.autoReview ? 'review' : sn.decision,
+      reason: sn.reason || '',
+      decidedBy: sn.decidedBy || null,
+      decidedAt: sn.decidedAt ?? null,
+      confirmedAt: sn.confirmedAt ?? null,
+    };
+  }
+  // 平票确定性地偏向更谨慎的结论：待复核 > 驳回 > 通过。
+  let decision = 'pending';
+  if (counts.pass || counts.reject || counts.review) {
+    const max = Math.max(counts.pass, counts.reject, counts.review);
+    const tied = REVIEW_DECISIONS.filter((d) => counts[d] === max);
+    if (tied.includes('review')) decision = 'review';
+    else if (tied.includes('reject') && tied.includes('pass')) decision = 'review';
+    else decision = tied.includes('reject') ? 'reject' : 'pass';
+  }
+  const decisionSigs = active.filter((s) => s.decision === decision).sort(compareSignatures);
+  const latest = decisionSigs[decisionSigs.length - 1] || null;
+  const confirmed = !sn.autoReview && active.length >= p.required;
+  return {
+    mode: 'signoff', active, counts, required: p.required,
+    confirmed,
+    decision: sn.autoReview ? 'review' : (confirmed ? decision : 'pending'),
+    reason: latest?.reason || '',
+    decidedBy: active.length ? active.map((s) => s.by).join('、') : null,
+    decidedAt: active.length ? Math.max(...active.map((s) => s.at)) : null,
+    confirmedAt: sn.confirmedAt ?? null,
+    activeSigners: active.map((s) => s.by),
+    unsignedSigners: p.signers.filter((name) => !active.some((s) => s.by === name)),
+  };
+}
+
+function compareSignatures(a, b) {
+  return (a.seq ?? 0) - (b.seq ?? 0) || (a.at || 0) - (b.at || 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+function refreshNodeSignatures(sn, policy, { now = Date.now() } = {}) {
+  const p = normalizeReviewPolicy(policy);
+  const signatures = (sn.signatures || []).map((s, i) => ({ ...s, seq: Number.isInteger(s.seq) ? s.seq : i }))
+    .sort(compareSignatures);
+  if (p.mode !== 'signoff') return { ...sn, signatures };
+  const st = signatureState({ ...sn, signatures }, p);
+  const out = {
+    ...sn,
+    signatures,
+    signedBy: st.active.map((s) => s.by),
+    decision: st.confirmed ? st.decision : 'pending',
+    reason: st.confirmed ? st.reason : '',
+    decidedBy: st.active.length ? st.decidedBy : null,
+    decidedAt: st.active.length ? st.decidedAt : null,
+    confirmedAt: st.confirmed ? (sn.confirmedAt || now) : null,
+  };
+  if (!st.confirmed) out.confirmedAt = null;
+  return out;
+}
+
 /* ---------------- 创建会话快照 ---------------- */
 
-export function createReviewSession({ name = '', actor = '', filter = {}, nodes = [], branches = [], now = Date.now() } = {}) {
+export function createReviewSession({
+  name = '', actor = '', filter = {}, nodes = [], branches = [], now = Date.now(), policy = null,
+} = {}) {
   if (!Array.isArray(nodes) || !nodes.length) throw new Error('当前筛选结果为空，无法创建审阅会话');
+  const policyCheck = validateReviewPolicy(policy);
+  if (!policyCheck.ok) throw new Error(policyCheck.error);
   const f = normalizeFilter(filter);
+  const p = policyCheck.policy;
   const snodes = nodes.map((n, i) => ({
     key: n.key,
     order: i,
@@ -106,9 +225,12 @@ export function createReviewSession({ name = '', actor = '', filter = {}, nodes 
     reason: '',
     decidedBy: null,
     decidedAt: null,
-    autoReview: null,   // {code,codes,reason,at,fingerprintBefore,fingerprintAfter}
-    absent: false,      // 已从当前时间线缺失（决定保留）
-    history: [],        // {at,by,from,to,reason}
+    confirmedAt: null,
+    signedBy: [],
+    signatures: [],
+    autoReview: null,
+    absent: false,
+    history: [],
   }));
   const branchHeads = {};
   for (const b of branches || []) if (b && typeof b.id === 'string') branchHeads[b.id] = b.headEventId;
@@ -117,12 +239,13 @@ export function createReviewSession({ name = '', actor = '', filter = {}, nodes 
     id: uid('rv'),
     formatVersion: REVIEW_FORMAT,
     name: trimmed || `审阅会话 ${new Date(now).toLocaleString()}`,
-    createdBy: String(actor || '未署名').slice(0, 40),
+    createdBy: normalizeActor(actor),
     createdAt: now,
     updatedAt: now,
     completedAt: null,
-    status: 'active', // active | completed
+    status: 'active',
     filter: f,
+    policy: p,
     baseline: {
       filterHash: reviewFilterHash(f),
       orderHash: reviewOrderHash(snodes.map((n) => n.key)),
@@ -134,7 +257,7 @@ export function createReviewSession({ name = '', actor = '', filter = {}, nodes 
       branchHeads,
     },
     nodes: snodes,
-    conflicts: [], // {id, derived, code, nodeKey, text, at, resolved, resolvedAt, resolution}
+    conflicts: [],
     rev: 1,
   };
 }
@@ -158,10 +281,35 @@ function driftCodesOf(sn, live) {
   return codes;
 }
 
-/**
- * 用当前统一时间线对账会话：纯函数、幂等、不改 rev。
- * @returns {{session, filteredNow, newNodes, baselineChanged, currentHash, driftByKey:Map}}
- */
+function invalidationFor(codes, live, previous = null, at = Date.now()) {
+  const text = codes.map((c) => INVALID_REASONS[c] || c).join('；');
+  return {
+    code: codes[0],
+    codes,
+    reason: text,
+    at: previous?.at || at,
+    fingerprintBefore: previous?.fingerprintBefore || null,
+    fingerprintAfter: live ? nodeFingerprint(live) : null,
+  };
+}
+
+function invalidateSignatures(signatures, codes, live, at) {
+  let changed = false;
+  const out = signatures.map((s) => {
+    if (s.invalid) {
+      // 已经失效的记录永久保留；若当前漂移原因变化，更新展示原因但保留首次失效时间。
+      const prevCodes = Array.isArray(s.invalid.codes) ? s.invalid.codes : [s.invalid.code || 'invalidated'];
+      const same = prevCodes.length === codes.length && prevCodes.every((c, i) => c === codes[i]);
+      if (same) return s;
+      changed = true;
+      return { ...s, invalid: invalidationFor(codes, live, s.invalid, at) };
+    }
+    changed = true;
+    return { ...s, invalid: invalidationFor(codes, live, null, at) };
+  });
+  return { out, changed };
+}
+
 export function reconcileSession(session, wb, { now = Date.now() } = {}) {
   const filteredNow = filterNodes(wb.nodes || [], session.filter || {});
   const byKey = wb.byKey || new Map();
@@ -186,11 +334,14 @@ export function reconcileSession(session, wb, { now = Date.now() } = {}) {
   };
 
   const driftByKey = new Map();
-  const nodes = session.nodes.map((sn) => {
-    const live = byKey.get(sn.key);
-    const codes = driftCodesOf(sn, live);
+  const nodes = session.nodes.map((sn0) => {
+    const live = byKey.get(sn0.key);
+    const codes = driftCodesOf(sn0, live);
+    let sn = { ...sn0, signatures: Array.isArray(sn0.signatures) ? sn0.signatures : [] };
     if (codes.length) {
       driftByKey.set(sn.key, codes);
+      const { out } = invalidateSignatures(sn.signatures, codes, live, now);
+      sn.signatures = out;
       const auto = {
         code: codes[0],
         codes,
@@ -200,17 +351,14 @@ export function reconcileSession(session, wb, { now = Date.now() } = {}) {
         fingerprintAfter: live ? nodeFingerprint(live) : null,
       };
       for (const code of codes) ensureDerived(sn.key, code);
-      return { ...sn, absent: !live, autoReview: auto };
+      sn = { ...sn, absent: !live, autoReview: auto };
+    } else {
+      if (sn.autoReview) resolveDerived(sn.key, 'recovered', now);
+      sn = { ...sn, autoReview: null, absent: false };
     }
-    if (sn.autoReview) {
-      // 恢复（例如刷新基线后支线状态被新基线接纳）：清除标注，关闭该节点派生冲突
-      resolveDerived(sn.key, 'recovered', now);
-      return { ...sn, autoReview: null, absent: false };
-    }
-    return { ...sn, absent: false };
+    return refreshNodeSignatures(sn, session.policy, { now });
   });
 
-  // 基线级漂移：当前筛选结果与创建/上次刷新时的快照基线不一致
   const currentHash = reviewTimelineHash(filteredNow);
   const baselineChanged = currentHash !== session.baseline?.timelineHash;
   const baseId = derivedConflictId(session.id, null, 'baseline-changed');
@@ -229,144 +377,248 @@ export function reconcileSession(session, wb, { now = Date.now() } = {}) {
   };
 }
 
-/** 节点的有效决定：被对账标记者一律展示为待复核（原决定仍保留在 decision 字段）。 */
-export function effectiveDecision(sn) {
-  return sn.autoReview ? 'review' : sn.decision;
+export function effectiveDecision(sn, policy = null) {
+  const st = signatureState(sn, sn.policy || policy);
+  return sn.autoReview ? 'review' : st.decision;
 }
 
-export function sessionProgress(viewOrSession) {
+export function nodeConfirmed(sn, policy) {
+  return signatureState(sn, policy).confirmed;
+}
+
+export function sessionProgress(viewOrSession, policy = null) {
   const nodes = viewOrSession?.nodes || [];
-  const c = { total: nodes.length, pass: 0, reject: 0, review: 0, pending: 0, decided: 0, needsWork: 0 };
+  const c = { total: nodes.length, pass: 0, reject: 0, review: 0, pending: 0, decided: 0, needsWork: 0, confirmed: 0 };
   for (const sn of nodes) {
-    const eff = effectiveDecision(sn);
+    const st = signatureState(sn, sn.policy || policy || (viewOrSession?.policy));
+    const eff = sn.autoReview ? 'review' : st.decision;
     if (eff === 'pending') c.pending += 1;
     else c[eff] += 1;
-    if (sn.decision !== 'pending') c.decided += 1;
-    if (eff === 'pending' || sn.autoReview) c.needsWork += 1;
+    if (sn.autoReview || activeSignatures(sn).length || sn.decision !== 'pending') c.decided += 1;
+    if (st.confirmed) c.confirmed += 1;
+    if (!st.confirmed || sn.autoReview) c.needsWork += 1;
   }
-  c.done = c.total - c.needsWork;
-  c.percent = c.total ? Math.round((c.decided / c.total) * 100) : 0;
+  c.done = c.confirmed;
+  c.percent = c.total ? Math.round((c.confirmed / c.total) * 100) : 0;
   c.complete = c.total > 0 && c.needsWork === 0;
   return c;
 }
 
-/* ---------------- 决定记录（含提交时 409 判定） ---------------- */
+export function finalReviewVerdict(session, viewOrProgress = null) {
+  const progress = viewOrProgress?.total !== undefined ? viewOrProgress : sessionProgress(viewOrProgress?.session || session);
+  if (!progress.complete) return 'incomplete';
+  const p = normalizeReviewPolicy(session.policy);
+  if (progress.reject > 0) return p.completeRule === 'no-reject' ? 'rejected' : 'decided-with-reject';
+  if (progress.review > 0) return 'approved-with-review';
+  return 'approved';
+}
+
+/* ---------------- 决定 / 签名记录 ---------------- */
 
 function reasonRequired(decision) { return decision === 'reject' || decision === 'review'; }
 
-/**
- * 记录一个节点的决定。
- * @returns {{status:200|409, reason?:string, session?:object}}
- *   节点损坏/缺失/指纹变化/分支推进、或筛选基线已漂移 → 409（调用方保留本地决定）。
- */
-export function recordDecision(session, view, key, decision, reason, { actor = '', now = Date.now() } = {}) {
+function validateDecisionInput(decision, reason) {
   if (!DECISION_SET.has(decision)) return { status: 400, reason: '非法决定' };
   const r = String(reason || '').trim().slice(0, 2000);
   if (reasonRequired(decision) && !r) return { status: 400, reason: '驳回 / 待复核必须填写理由' };
+  return { reason: r };
+}
+
+export function recordDecision(session, view, key, decision, reason, { actor = '', now = Date.now() } = {}) {
+  const v = validateDecisionInput(decision, reason);
+  if (v.status) return v;
+  if (normalizeReviewPolicy(session.policy).mode === 'signoff') return { status: 400, reason: 'multi-signoff-required' };
   const sn = session.nodes.find((x) => x.key === key);
   if (!sn) return { status: 409, reason: 'node-missing' };
   const codes = view.driftByKey?.get(key);
   if (codes?.length) return { status: 409, reason: codes[0], codes };
   if (view.baselineChanged) return { status: 409, reason: 'baseline-changed' };
 
-  const by = String(actor || '未署名').slice(0, 40);
+  const by = normalizeActor(actor);
   const nodes = session.nodes.map((x) => {
     if (x.key !== key) return x;
     const history = [...x.history];
-    // 首次决定（pending → 决定）只记录决定本身，不进入变更记录；此后的修改才追加
-    if (x.decision !== 'pending' && (x.decision !== decision || x.reason !== r)) {
-      history.push({ at: now, by, from: x.decision, to: decision, reason: r });
+    if (x.decision !== 'pending' && (x.decision !== decision || x.reason !== v.reason)) {
+      history.push({ at: now, by, from: x.decision, to: decision, reason: v.reason });
     }
-    return { ...x, decision, reason: r, decidedBy: by, decidedAt: now, autoReview: null, history };
+    return {
+      ...x, decision, reason: v.reason, decidedBy: by, decidedAt: now,
+      confirmedAt: now, autoReview: null, history,
+    };
+  });
+  return { status: 200, session: { ...session, nodes, updatedAt: now, rev: session.rev + 1 } };
+}
+
+export function makeSignatureProposal(nodeKey, decision, reason, { actor = '', now = Date.now() } = {}) {
+  const by = normalizeActor(actor);
+  const r = String(reason || '').trim().slice(0, 2000);
+  return {
+    type: 'signature',
+    nodeKey,
+    decision,
+    reason: r,
+    by,
+    at: now,
+    rejected: true,
+    sig: { id: uid('sg'), seq: Number.MAX_SAFE_INTEGER, at: now, by, decision, reason: r, invalid: null },
+  };
+}
+
+/**
+ * 多人节点签名。重复（同签署人、同决定、同理由）签名幂等，不增加 rev；
+ * 同签署人改判会把旧签名保留为 invalid(superseded)。
+ */
+export function signReviewNode(session, view, key, decision, reason, { actor = '', now = Date.now() } = {}) {
+  const p = normalizeReviewPolicy(session.policy);
+  if (p.mode !== 'signoff') return { status: 400, reason: 'legacy-decision-required' };
+  const checked = validateDecisionInput(decision, reason);
+  if (checked.status) return checked;
+  const by = normalizeActor(actor);
+  if (!p.signers.includes(by)) return { status: 403, reason: 'signer-not-allowed', signer: by, allowed: p.signers };
+  const sn = session.nodes.find((x) => x.key === key);
+  if (!sn) return { status: 409, reason: 'node-missing' };
+  if (session.status === 'completed') return { status: 409, reason: 'session-completed' };
+  const codes = view.driftByKey?.get(key);
+  if (codes?.length) return { status: 409, reason: codes[0], codes };
+  if (view.baselineChanged) return { status: 409, reason: 'baseline-changed' };
+
+  const active = activeSignatures(sn);
+  const mine = active.find((s) => s.by === by);
+  if (mine && mine.decision === decision && (mine.reason || '') === checked.reason) {
+    return { status: 200, idempotent: true, signature: mine, session };
+  }
+
+  const nextSeq = sn.signatures.reduce((m, s) => Math.max(m, Number.isInteger(s.seq) ? s.seq : -1), -1) + 1;
+  const signature = {
+    id: uid('sg'), seq: nextSeq, at: now, by, decision, reason: checked.reason, invalid: null,
+  };
+  const before = signatureState(sn, p);
+  const signatures = sn.signatures.map((s) => {
+    if (s.invalid || s.by !== by) return s;
+    return { ...s, invalid: invalidationFor(['superseded'], null, null, now) };
+  });
+  signatures.push(signature);
+  const nodes = session.nodes.map((x) => {
+    if (x.key !== key) return x;
+    const replaced = { ...x, signatures, autoReview: null };
+    const refreshed = refreshNodeSignatures(replaced, p, { now });
+    const after = signatureState(refreshed, p);
+    const history = [...x.history];
+    if (before.decision !== 'pending' && before.decision !== after.decision) {
+      history.push({ at: now, by, from: before.decision, to: after.decision, reason: checked.reason, signatureId: signature.id });
+    }
+    return { ...refreshed, history };
   });
   return {
     status: 200,
+    signature,
     session: { ...session, nodes, updatedAt: now, rev: session.rev + 1 },
   };
 }
 
 /**
- * 基于【最新快照】逐项合并：强制接受该节点的决定（用户在 409 后显式选择），
- * 关闭该节点的全部未决派生冲突；缺失节点保留 absent 标记。会话 rev +1。
+ * 409 后基于最新快照逐项合入本地保留的签名。普通 review-advanced 下等价于重放
+ * 签名；节点仍漂移时仍然 409，避免把针对旧快照的签名直接当作当前有效签名。
  */
-export function mergeReviewItem(session, key, decision, reason, { actor = '', now = Date.now(), resolution = 'merged-local' } = {}) {
-  if (!DECISION_SET.has(decision)) return { status: 400, reason: '非法决定' };
-  const r = String(reason || '').trim().slice(0, 2000);
-  if (reasonRequired(decision) && !r) return { status: 400, reason: '驳回 / 待复核必须填写理由' };
-  const sn = session.nodes.find((x) => x.key === key);
-  if (!sn) return { status: 409, reason: 'node-missing' };
-  const by = String(actor || '未署名').slice(0, 40);
-  const nodes = session.nodes.map((x) => {
-    if (x.key !== key) return x;
-    // 逐项合并是显式的冲突解决动作：无论节点之前是否 pending 都追加一条带 merged 标记的记录
-    const history = [...x.history, { at: now, by, from: effectiveDecision(x), to: decision, reason: r, merged: true }];
-    return { ...x, decision, reason: r, decidedBy: by, decidedAt: now, autoReview: null, history };
-  });
-  const conflicts = session.conflicts.map((c) => {
-    if (c.nodeKey === key && !c.resolved) {
-      return { ...c, resolved: true, resolvedAt: now, resolution };
-    }
+export function mergeReviewSignature(session, view, key, decision, reason, { actor = '', now = Date.now() } = {}) {
+  const p = normalizeReviewPolicy(session.policy);
+  if (p.mode !== 'signoff') return { status: 400, reason: 'legacy-decision-required' };
+  if (view.driftByKey?.get(key)?.length) return { status: 409, reason: view.driftByKey.get(key)[0] };
+  if (view.baselineChanged) {
+    // 并发的是同一会话快照而非筛选基线变化；若该节点本身未漂移，允许显式合并。
+  }
+  const res = signReviewNode({ ...session, status: 'active' }, view, key, decision, reason, { actor, now });
+  if (res.status !== 200) return res;
+  if (res.idempotent) return { ...res, merged: true };
+  const conflicts = res.session.conflicts.map((c) => {
+    if (c.nodeKey === key && !c.resolved) return { ...c, resolved: true, resolvedAt: now, resolution: 'merged-local-signature' };
     return c;
   });
-  return {
-    status: 200,
-    session: { ...session, nodes, conflicts, updatedAt: now, rev: session.rev + 1 },
-  };
+  return { ...res, merged: true, session: { ...res.session, conflicts } };
+}
+
+export function mergeReviewItem(session, key, decision, reason, { actor = '', now = Date.now(), resolution = 'merged-local' } = {}) {
+  if (normalizeReviewPolicy(session.policy).mode === 'signoff') {
+    return { status: 400, reason: 'multi-signoff-required' };
+  }
+  const checked = validateDecisionInput(decision, reason);
+  if (checked.status) return checked;
+  const sn = session.nodes.find((x) => x.key === key);
+  if (!sn) return { status: 409, reason: 'node-missing' };
+  const by = normalizeActor(actor);
+  const nodes = session.nodes.map((x) => {
+    if (x.key !== key) return x;
+    const history = [...x.history, { at: now, by, from: effectiveDecision(x, session.policy), to: decision, reason: checked.reason, merged: true }];
+    return {
+      ...x, decision, reason: checked.reason, decidedBy: by, decidedAt: now,
+      confirmedAt: now, autoReview: null, history,
+    };
+  });
+  const conflicts = session.conflicts.map((c) => {
+    if (c.nodeKey === key && !c.resolved) return { ...c, resolved: true, resolvedAt: now, resolution };
+    return c;
+  });
+  return { status: 200, session: { ...session, nodes, conflicts, updatedAt: now, rev: session.rev + 1 } };
 }
 
 /* ---------------- 刷新基线 / 完成 / 重开 ---------------- */
 
-/**
- * 以当前筛选结果重建基线：当前节点按最新时间线排序，决定与变更历史全部保留；
- * 新出现节点成为未处理项；已缺失节点附在末尾并保留 absent 标记；
- * 基线级冲突关闭，节点级标注（仍损坏/缺失/支线）继续保留。rev +1。
- */
+function makeRebasedNode(sn, live, now) {
+  return {
+    key: live.key,
+    order: 0,
+    kind: live.kind,
+    title: live.title,
+    branchId: live.branch?.id || null,
+    experimentId: live.experiment?.id || null,
+    variantId: live.variant?.id || null,
+    seqLabel: live.seqLabel || null,
+    t: Number.isFinite(live.t) ? live.t : 0,
+    actor: live.actor || '',
+    fingerprint: nodeFingerprint(live),
+    fingerprintBefore: live.hashBefore || null,
+    replayable: !!live.replayable,
+    severity: live.severity,
+    decision: 'pending',
+    reason: '',
+    decidedBy: null,
+    decidedAt: null,
+    confirmedAt: null,
+    signedBy: [],
+    signatures: [],
+    autoReview: null,
+    absent: false,
+    history: [],
+    addedAtRebase: now,
+  };
+}
+
 export function rebaseSession(session, view, { actor = '', now = Date.now() } = {}) {
   const byKey = new Map(session.nodes.map((n) => [n.key, n]));
   const ordered = [];
   for (const live of view.filteredNow) {
     const sn = byKey.get(live.key);
-    if (sn) {
-      ordered.push(sn);
-    } else {
-      // 基线刷新后新进入筛选结果的节点：纳入为未处理项，记录创建时快照指纹
-      ordered.push({
-        key: live.key,
-        order: 0,
-        kind: live.kind,
-        title: live.title,
-        branchId: live.branch?.id || null,
-        experimentId: live.experiment?.id || null,
-        variantId: live.variant?.id || null,
-        seqLabel: live.seqLabel || null,
-        t: Number.isFinite(live.t) ? live.t : 0,
-        actor: live.actor || '',
-        fingerprint: nodeFingerprint(live),
-        fingerprintBefore: live.hashBefore || null,
-        replayable: !!live.replayable,
-        severity: live.severity,
-        decision: 'pending',
-        reason: '',
-        decidedBy: null,
-        decidedAt: null,
-        autoReview: null,
-        absent: false,
-        history: [],
-        addedAtRebase: now,
-      });
-    }
+    ordered.push(sn || makeRebasedNode(null, live, now));
   }
   const absent = session.nodes.filter((sn) => !view.filteredNow.some((n) => n.key === sn.key))
     .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
   const merged = [...ordered, ...absent];
 
-  const nodes = merged.map((sn, i) => ({ ...sn, order: i, absent: !view.byKey.has(sn.key) }));
+  const nodes = merged.map((sn0, i) => {
+    const live = view.byKey.get(sn0.key);
+    let sn = { ...sn0, order: i, absent: !live };
+    if (!live && sn.signatures?.length) {
+      const { out } = invalidateSignatures(sn.signatures, ['node-missing'], live, now);
+      sn = { ...sn, signatures: out };
+    }
+    return refreshNodeSignatures(sn, session.policy, { now });
+  });
   const conflicts = session.conflicts.map((c) => {
     if (!c.derived || c.resolved) return c;
     if (c.code === 'baseline-changed' || c.code === 'fingerprint-changed') {
       return { ...c, resolved: true, resolvedAt: now, resolution: 'rebase' };
     }
-    return c; // corrupt / node-missing / branch-advanced：仍存在，保持未决
+    return c;
   });
   return {
     ...session,
@@ -385,33 +637,124 @@ export function rebaseSession(session, view, { actor = '', now = Date.now() } = 
     updatedAt: now,
     rev: session.rev + 1,
     rebasedAt: now,
-    rebasedBy: String(actor || '未署名').slice(0, 40),
+    rebasedBy: normalizeActor(actor),
   };
 }
 
 export function completeReview(session, view, { now = Date.now() } = {}) {
-  const p = sessionProgress(view.session || session);
+  const v = view?.session ? view.session : session;
+  const p = sessionProgress(v);
   if (p.needsWork > 0) return { status: 409, reason: 'has-pending', pending: p.needsWork };
+  const policy = normalizeReviewPolicy(session.policy);
+  if (policy.completeRule === 'no-reject' && p.reject > 0) {
+    return { status: 409, reason: 'has-reject', pending: p.reject };
+  }
   return {
     status: 200,
+    verdict: finalReviewVerdict(session, p),
     session: { ...session, status: 'completed', completedAt: now, updatedAt: now, rev: session.rev + 1 },
   };
 }
 
 export function reopenReview(session, { now = Date.now() } = {}) {
   if (session.status === 'active') return { status: 200, session };
-  return {
-    status: 200,
-    session: { ...session, status: 'active', completedAt: null, updatedAt: now, rev: session.rev + 1 },
-  };
+  return { status: 200, session: { ...session, status: 'active', completedAt: null, updatedAt: now, rev: session.rev + 1 } };
 }
 
 /* ---------------- 加载清洗 ---------------- */
 
-/**
- * 清洗持久化的会话列表：结构容错、去重、字段归一；随后逐个对账，
- * 损坏/缺失/支线/基线漂移标注与冲突记录确定性地重建（不增加 rev）。
- */
+function sanitizeSignature(s0, i, policy, now) {
+  if (!s0 || typeof s0 !== 'object' || typeof s0.id !== 'string') return null;
+  if (!DECISION_SET.has(s0.decision)) return null;
+  const by = normalizeActor(s0.by);
+  let invalid = null;
+  if (s0.invalid && typeof s0.invalid === 'object') {
+    const code = typeof s0.invalid.code === 'string' ? s0.invalid.code : 'invalidated';
+    const codes = Array.isArray(s0.invalid.codes) ? s0.invalid.codes.filter((x) => typeof x === 'string') : [code];
+    invalid = {
+      code: codes[0] || code,
+      codes: codes.length ? codes : [code],
+      reason: typeof s0.invalid.reason === 'string' ? s0.invalid.reason : (INVALID_REASONS[code] || code),
+      at: Number.isFinite(s0.invalid.at) ? s0.invalid.at : now,
+      fingerprintBefore: typeof s0.invalid.fingerprintBefore === 'string' ? s0.invalid.fingerprintBefore : null,
+      fingerprintAfter: typeof s0.invalid.fingerprintAfter === 'string' ? s0.invalid.fingerprintAfter : null,
+    };
+  }
+  if (policy.mode === 'signoff' && !invalid && !policy.signers.includes(by)) {
+    invalid = invalidationFor(['not-allowed'], null, null, now);
+  }
+  return {
+    id: s0.id,
+    seq: Number.isInteger(s0.seq) ? s0.seq : i,
+    at: Number.isFinite(s0.at) ? s0.at : now,
+    by,
+    decision: s0.decision,
+    reason: typeof s0.reason === 'string' ? s0.reason.slice(0, 2000) : '',
+    invalid,
+  };
+}
+
+function sanitizeNode(n0, i, policy, now) {
+  if (!n0 || typeof n0 !== 'object' || typeof n0.key !== 'string') return null;
+  const decision = DECISION_SET.has(n0.decision) ? n0.decision : 'pending';
+  const history = Array.isArray(n0.history) ? n0.history.filter((h) =>
+    h && typeof h === 'object' && DECISION_SET.has(h.to)).map((h) => ({
+      at: Number.isFinite(h.at) ? h.at : 0,
+      by: normalizeActor(h.by),
+      from: DECISION_SET.has(h.from) ? h.from : 'pending',
+      to: h.to,
+      reason: typeof h.reason === 'string' ? h.reason.slice(0, 2000) : '',
+      ...(h.merged ? { merged: true } : {}),
+      ...(typeof h.signatureId === 'string' ? { signatureId: h.signatureId } : {}),
+    })) : [];
+
+  let node = {
+    key: n0.key,
+    order: Number.isFinite(n0.order) ? n0.order : i,
+    kind: typeof n0.kind === 'string' ? n0.kind : null,
+    title: typeof n0.title === 'string' ? n0.title : n0.key,
+    branchId: typeof n0.branchId === 'string' ? n0.branchId : null,
+    experimentId: typeof n0.experimentId === 'string' ? n0.experimentId : null,
+    variantId: typeof n0.variantId === 'string' ? n0.variantId : null,
+    seqLabel: typeof n0.seqLabel === 'string' ? n0.seqLabel : null,
+    t: Number.isFinite(n0.t) ? n0.t : 0,
+    actor: typeof n0.actor === 'string' ? n0.actor : '',
+    fingerprint: typeof n0.fingerprint === 'string' ? n0.fingerprint : null,
+    fingerprintBefore: typeof n0.fingerprintBefore === 'string' ? n0.fingerprintBefore : null,
+    replayable: n0.replayable !== false,
+    severity: ['ok', 'warn', 'bad'].includes(n0.severity) ? n0.severity : 'ok',
+    decision,
+    reason: n0.reason !== null && n0.reason !== undefined ? String(n0.reason).slice(0, 2000) : '',
+    decidedBy: typeof n0.decidedBy === 'string' ? n0.decidedBy : null,
+    decidedAt: Number.isFinite(n0.decidedAt) ? n0.decidedAt : null,
+    confirmedAt: Number.isFinite(n0.confirmedAt) ? n0.confirmedAt : null,
+    signedBy: Array.isArray(n0.signedBy) ? n0.signedBy.filter((x) => typeof x === 'string') : [],
+    signatures: [],
+    autoReview: null,
+    absent: false,
+    history,
+  };
+
+  if (policy.mode === 'signoff') {
+    const seenSig = new Set();
+    const seenActiveSigner = new Set();
+    const sigs = [];
+    (Array.isArray(n0.signatures) ? n0.signatures : []).forEach((raw, si) => {
+      const s = sanitizeSignature(raw, si, policy, now);
+      if (!s || seenSig.has(s.id)) return;
+      seenSig.add(s.id);
+      if (!s.invalid) {
+        if (seenActiveSigner.has(s.by)) s.invalid = invalidationFor(['duplicate-signer'], null, null, now);
+        else seenActiveSigner.add(s.by);
+      }
+      sigs.push(s);
+    });
+    node.signatures = sigs.sort(compareSignatures);
+    node = refreshNodeSignatures(node, policy, { now });
+  }
+  return node;
+}
+
 export function sanitizeReviewSessions(raw, wb, { now = Date.now() } = {}) {
   const out = [];
   if (!Array.isArray(raw)) return out;
@@ -420,45 +763,15 @@ export function sanitizeReviewSessions(raw, wb, { now = Date.now() } = {}) {
     if (!s0 || typeof s0 !== 'object' || typeof s0.id !== 'string') continue;
     if (seen.has(s0.id)) continue;
     seen.add(s0.id);
+    const policy = normalizeReviewPolicy(s0.policy);
     const rawNodes = Array.isArray(s0.nodes) ? s0.nodes : [];
     const nodes = [];
     const seenKeys = new Set();
     rawNodes.forEach((n0, i) => {
-      if (!n0 || typeof n0 !== 'object' || typeof n0.key !== 'string' || seenKeys.has(n0.key)) return;
-      seenKeys.add(n0.key);
-      const decision = DECISION_SET.has(n0.decision) ? n0.decision : 'pending';
-      const history = Array.isArray(n0.history) ? n0.history.filter((h) =>
-        h && typeof h === 'object' && DECISION_SET.has(h.to)).map((h) => ({
-        at: Number.isFinite(h.at) ? h.at : 0,
-        by: String(h.by || '未署名').slice(0, 40),
-        from: DECISION_SET.has(h.from) ? h.from : 'pending',
-        to: h.to,
-        reason: typeof h.reason === 'string' ? h.reason.slice(0, 2000) : '',
-        ...(h.merged ? { merged: true } : {}),
-      })) : [];
-      nodes.push({
-        key: n0.key,
-        order: Number.isFinite(n0.order) ? n0.order : i,
-        kind: typeof n0.kind === 'string' ? n0.kind : null,
-        title: typeof n0.title === 'string' ? n0.title : n0.key,
-        branchId: typeof n0.branchId === 'string' ? n0.branchId : null,
-        experimentId: typeof n0.experimentId === 'string' ? n0.experimentId : null,
-        variantId: typeof n0.variantId === 'string' ? n0.variantId : null,
-        seqLabel: typeof n0.seqLabel === 'string' ? n0.seqLabel : null,
-        t: Number.isFinite(n0.t) ? n0.t : 0,
-        actor: typeof n0.actor === 'string' ? n0.actor : '',
-        fingerprint: typeof n0.fingerprint === 'string' ? n0.fingerprint : null,
-        fingerprintBefore: typeof n0.fingerprintBefore === 'string' ? n0.fingerprintBefore : null,
-        replayable: n0.replayable !== false,
-        severity: ['ok', 'warn', 'bad'].includes(n0.severity) ? n0.severity : 'ok',
-        decision,
-        reason: n0.reason !== null && n0.reason !== undefined ? String(n0.reason).slice(0, 2000) : '',
-        decidedBy: typeof n0.decidedBy === 'string' ? n0.decidedBy : null,
-        decidedAt: Number.isFinite(n0.decidedAt) ? n0.decidedAt : null,
-        autoReview: null,
-        absent: false,
-        history,
-      });
+      const n = sanitizeNode(n0, i, policy, now);
+      if (!n || seenKeys.has(n.key)) return;
+      seenKeys.add(n.key);
+      nodes.push(n);
     });
     if (!nodes.length) continue;
     const seenC = new Set();
@@ -479,12 +792,13 @@ export function sanitizeReviewSessions(raw, wb, { now = Date.now() } = {}) {
       id: s0.id,
       formatVersion: REVIEW_FORMAT,
       name: String(s0.name || '审阅会话').slice(0, 60),
-      createdBy: String(s0.createdBy || '未署名').slice(0, 40),
+      createdBy: normalizeActor(s0.createdBy),
       createdAt: Number.isFinite(s0.createdAt) ? s0.createdAt : now,
       updatedAt: Number.isFinite(s0.updatedAt) ? s0.updatedAt : now,
       completedAt: Number.isFinite(s0.completedAt) ? s0.completedAt : null,
       status: s0.status === 'completed' ? 'completed' : 'active',
       filter: normalizeFilter(s0.filter),
+      policy,
       baseline: s0.baseline && typeof s0.baseline === 'object' ? {
         filterHash: typeof s0.baseline.filterHash === 'string' ? s0.baseline.filterHash : '',
         orderHash: typeof s0.baseline.orderHash === 'string' ? s0.baseline.orderHash : '',
@@ -499,7 +813,6 @@ export function sanitizeReviewSessions(raw, wb, { now = Date.now() } = {}) {
       conflicts,
       rev: Number.isFinite(s0.rev) && s0.rev >= 1 ? Math.floor(s0.rev) : 1,
     };
-    // 对账：重建确定性标注（损坏/缺失/支线/基线漂移），幂等且不增加 rev
     const reconciled = wb ? reconcileSession(session, wb, { now }).session : session;
     out.push(reconciled);
   }
@@ -507,12 +820,8 @@ export function sanitizeReviewSessions(raw, wb, { now = Date.now() } = {}) {
   return out;
 }
 
-/* ---------------- 跨窗口合流 ---------------- */
+/* ---------------- 跨窗口合流 / 服务端检查 ---------------- */
 
-/**
- * 会话按 id 并集；同 id 以 rev 更大者整体胜出（409 流程保证合流时严格大于），
- * 冲突记录按 id 并集（确定性派生记录在两侧同 id）。rev 相同以服务端为准。
- */
 export function mergeReviewSessions(serverList, clientList) {
   const byId = new Map();
   const order = [];
@@ -543,24 +852,10 @@ export function mergeReviewSessions(serverList, clientList) {
   return order.map((id) => byId.get(id));
 }
 
-/**
- * 服务端视角的审阅冲突判定（与 server.py _assess_review_conflict 同构，
- * 也用于 localStorage 多页签检测与单元测试）。
- *
- * 只对本次【推进了 rev】的会话核验——与审阅无关的保存（矩形/约束提交、另一分支编辑）
- * 不因此被 409，它们在合流时按 rev 最大值保留会话：
- *   - 所依据的 baseRev 与服务端会话 rev 不一致（另一窗口已提交决定）→ review-advanced；
- *   - 节点指纹变化 / 节点缺失 / 事件已不在分支当前链上 → 对应 review-node-*。
- *
- * @returns null 或 {reason:'review-advanced'|'review-node-missing'|'review-fingerprint-changed'|'review-branch-advanced', sessionId, nodeKey?, serverRev}
- */
 export function assessServerReviewConflict(serverDoc, clientDoc) {
   const baseRevs = clientDoc?.baseReviewRevs;
   if (!baseRevs || typeof baseRevs !== 'object') return null;
   const curSessions = new Map((serverDoc?.reviewSessions || []).map((s) => [s.id, s]));
-
-  // 审计事件不可变：同包提交的新事件（几何编辑 + 审阅决定一起发出）是合法引用来源，
-  // 按 id 并集构造“即将生效”的权威视图；当前分支取客户端 head（baseHeads 已做几何乐观锁）。
   const eff = effectiveDoc(serverDoc, clientDoc);
 
   for (const s of clientDoc?.reviewSessions || []) {
@@ -571,6 +866,8 @@ export function assessServerReviewConflict(serverDoc, clientDoc) {
     if (srv && srv.rev !== base) {
       return { reason: 'review-advanced', sessionId: s.id, serverRev: srv.rev || 1 };
     }
+    const badSig = checkSessionSignatures(s, srv, base);
+    if (badSig) return { ...badSig, sessionId: s.id, serverRev: srv?.rev || base };
     for (const n of s.nodes || []) {
       const bad = checkReviewNodeAgainstServer(n, eff.byId, eff.branches, eff.experiments);
       if (bad) return { reason: bad, sessionId: s.id, nodeKey: n.key, serverRev: srv?.rev || base };
@@ -579,7 +876,47 @@ export function assessServerReviewConflict(serverDoc, clientDoc) {
   return null;
 }
 
-/** 服务端状态并上本次提交的不可变事件 / 新分支 / 实验，得到即将生效的权威视图。 */
+function checkSessionSignatures(clientSession, serverSession) {
+  const policy = normalizeReviewPolicy(clientSession?.policy);
+  if (policy.mode !== 'signoff') return null;
+  if (!policy.signers.length || policy.required < 1 || policy.required > policy.signers.length) {
+    return { reason: 'review-policy-invalid' };
+  }
+  const serverById = new Map((serverSession?.nodes || []).map((n) => [n.key, n]));
+  for (const n of clientSession?.nodes || []) {
+    const old = serverById.get(n.key);
+    const oldSigs = new Map((old?.signatures || []).map((s) => [s.id, s]));
+    const seen = new Set((old?.signatures || []).filter((s) => s && !s.invalid).map((s) => s.by));
+    for (const sg of n.signatures || []) {
+      const oldSig = oldSigs.get(sg.id);
+      if (oldSig) {
+        // 已存在的有效签名是不可变审计记录；只允许在漂移对账时被标记 invalid。
+        const invalidChanged = !!oldSig.invalid !== !!sg.invalid;
+        const fieldsChanged = !oldSig.invalid && !sg.invalid
+          && (oldSig.by !== sg.by || oldSig.decision !== sg.decision || (oldSig.reason || '') !== (sg.reason || ''));
+        if (invalidChanged || fieldsChanged) {
+          return { reason: 'review-signature-history-changed', nodeKey: n.key };
+        }
+        continue;
+      }
+      if (!sg || sg.invalid) continue;
+      if (!policy.signers.includes(sg.by)) return { reason: 'review-signer-not-allowed', nodeKey: n.key };
+      if (seen.has(sg.by)) return { reason: 'review-duplicate-signer', nodeKey: n.key };
+      seen.add(sg.by);
+    }
+  }
+  if (clientSession.status === 'completed') {
+    for (const n of clientSession.nodes || []) {
+      const active = activeSignatures(n);
+      if (active.length < policy.required) return { reason: 'review-signature-shortfall', nodeKey: n.key };
+      if (policy.completeRule === 'no-reject' && active.some((s) => s.decision === 'reject')) {
+        return { reason: 'review-completion-has-reject', nodeKey: n.key };
+      }
+    }
+  }
+  return null;
+}
+
 function effectiveDoc(serverDoc, clientDoc) {
   const byId = new Map((serverDoc?.events || []).map((e) => [e.id, e]));
   for (const e of clientDoc?.events || []) if (e && e.id && !byId.has(e.id)) byId.set(e.id, e);
@@ -594,7 +931,6 @@ function effectiveDoc(serverDoc, clientDoc) {
   return { byId, branches, experiments: [...byExpId.values()] };
 }
 
-/** 单节点相对权威文档的漂移（'review-node-missing' | 'review-fingerprint-changed' | 'review-branch-advanced' | null）。 */
 export function findReviewNodeDrift(n, serverDoc) {
   const byId = new Map((serverDoc?.events || []).map((e) => [e.id, e]));
   const branches = new Map((serverDoc?.branches || []).map((b) => [b.id, b]));
@@ -607,10 +943,7 @@ function checkReviewNodeAgainstServer(n, byId, branches, experiments) {
     const eid = key.slice(6);
     const ev = byId.get(eid);
     if (!ev) return 'review-node-missing';
-    if (n.fingerprint && typeof ev.hash === 'string' && ev.hash !== n.fingerprint) {
-      return 'review-fingerprint-changed';
-    }
-    // 分支已推进：事件不在其所属分支当前 head 父链上（root / fork-root 是各分支链顶，恒在链上）
+    if (n.fingerprint && typeof ev.hash === 'string' && ev.hash !== n.fingerprint) return 'review-fingerprint-changed';
     if (!ev.parentId) return null;
     const bid = n.branchId || ev.branch;
     const b = branches.get(bid);
@@ -633,9 +966,7 @@ function checkReviewNodeAgainstServer(n, byId, branches, experiments) {
     const exp = (experiments || []).find((x) => x.id === expId);
     const v = exp?.variants?.find((x) => x.id === vid);
     if (!exp || !v || v.status !== 'done' || !v.result) return 'review-node-missing';
-    if (n.fingerprint && typeof v.result.hash === 'string' && v.result.hash !== n.fingerprint) {
-      return 'review-fingerprint-changed';
-    }
+    if (n.fingerprint && typeof v.result.hash === 'string' && v.result.hash !== n.fingerprint) return 'review-fingerprint-changed';
     return null;
   }
   return null;
@@ -643,18 +974,45 @@ function checkReviewNodeAgainstServer(n, byId, branches, experiments) {
 
 /* ---------------- 导出审阅报告 ---------------- */
 
-/**
- * 构造完整审阅报告：会话快照（筛选/基线/节点指纹/身份）、当前进度、
- * 每节点决定与理由、决定变更记录、系统转待复核标注、全部冲突记录与当前漂移。
- */
+function nodeSigningReport(sn, policy, view) {
+  const p = normalizeReviewPolicy(policy);
+  const state = signatureState(sn, p);
+  const activeIds = new Set(state.active.map((s) => s.id));
+  const live = view?.byKey?.get(sn.key);
+  const signatures = (sn.signatures || []).slice().sort(compareSignatures).map((s) => ({
+    id: s.id,
+    seq: s.seq,
+    at: s.at,
+    by: s.by,
+    decision: s.decision,
+    reason: s.reason || '',
+    valid: !s.invalid,
+    invalid: s.invalid || null,
+  }));
+  const activeNames = state.active.map((s) => s.by);;
+  const unsigned = p.mode === 'signoff' ? p.signers.filter((name) => !activeNames.includes(name)) : [];
+  return {
+    mode: p.mode,
+    allowedSigners: p.mode === 'signoff' ? p.signers : [],
+    required: p.required,
+    confirmed: state.confirmed,
+    confirmedAt: state.confirmedAt,
+    activeCount: state.active.length,
+    activeSigners: activeNames,
+    unsignedSigners: unsigned,
+    counts: state.counts,
+    currentFingerprint: live ? nodeFingerprint(live) : null,
+    signatures,
+  };
+}
+
 export function buildReviewReport(session, view, { generatedAt = null } = {}) {
   const v = view?.session ? view.session : session;
   const progress = sessionProgress(v);
   const changeLog = [];
   const nodes = v.nodes.map((sn) => {
-    // 报告的决定日志是完整审计轨迹：首次决定（pending → 决定）也收录并标 initial，
-    // 之后的修改取自 history（变更记录）
-    if (sn.decision !== 'pending' && sn.decidedAt != null) {
+    const policy = sn.policy || v.policy;
+    if (policy?.mode !== 'signoff' && sn.decision !== 'pending' && sn.decidedAt != null) {
       const hasInitial = sn.history.some((h) => h.from === 'pending');
       if (!hasInitial) {
         changeLog.push({
@@ -664,6 +1022,7 @@ export function buildReviewReport(session, view, { generatedAt = null } = {}) {
       }
     }
     for (const h of sn.history) changeLog.push({ nodeKey: sn.key, title: sn.title, ...h });
+    const st = signatureState(sn, policy);
     return {
       order: sn.order,
       key: sn.key,
@@ -682,16 +1041,19 @@ export function buildReviewReport(session, view, { generatedAt = null } = {}) {
       severity: sn.severity,
       absent: !!sn.absent,
       decision: sn.decision,
-      effectiveDecision: effectiveDecision(sn),
-      reason: sn.reason,
-      decidedBy: sn.decidedBy,
-      decidedAt: sn.decidedAt,
+      effectiveDecision: sn.autoReview ? 'review' : st.decision,
+      confirmed: st.confirmed,
+      signing: nodeSigningReport(sn, policy, view),
+      reason: st.reason || sn.reason || '',
+      decidedBy: st.decidedBy || sn.decidedBy,
+      decidedAt: st.decidedAt || sn.decidedAt,
       autoReview: sn.autoReview,
       history: sn.history,
     };
   });
   changeLog.sort((a, b) => (a.at - b.at) || (a.nodeKey < b.nodeKey ? -1 : 1));
   const openConflicts = (v.conflicts || []).filter((c) => !c.resolved);
+  const policy = normalizeReviewPolicy(v.policy);
   return {
     format: 'rect-constraints/review-report',
     formatVersion: 1,
@@ -700,8 +1062,11 @@ export function buildReviewReport(session, view, { generatedAt = null } = {}) {
       id: v.id, name: v.name, createdBy: v.createdBy,
       createdAt: v.createdAt, updatedAt: v.updatedAt,
       status: v.status, completedAt: v.completedAt, rev: v.rev,
+      policy,
+      finalVerdict: finalReviewVerdict(v, progress),
     },
     filter: v.filter,
+    policy,
     baseline: v.baseline,
     baselineChanged: !!view?.baselineChanged,
     newNodeKeys: (view?.newNodes || []).map((n) => n.key),

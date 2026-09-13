@@ -35,10 +35,11 @@ import {
   buildWorkbench, defaultWorkbench, normalizeWorkbench, filterNodes,
 } from './auditbench.js';
 import {
-  createReviewSession, reconcileSession, recordDecision, mergeReviewItem,
+  createReviewSession, reconcileSession, recordDecision, signReviewNode, mergeReviewSignature,
+  mergeReviewItem, makeSignatureProposal, normalizeReviewPolicy, validateReviewPolicy,
   rebaseSession, completeReview, reopenReview, sanitizeReviewSessions,
   mergeReviewSessions, assessServerReviewConflict, findReviewNodeDrift,
-  buildReviewReport, sessionProgress,
+  buildReviewReport, sessionProgress, activeSignatures, isAllowedSigner,
 } from './reviews.js';
 
 const LS_KEY = 'rect-constraints-doc-v2';
@@ -382,6 +383,10 @@ export class Store extends EventTarget {
       if (srv && authored?.has(srv.rev)) continue; // 本页自己写的：跳过 rev 锁
       const base = this._reviewSyncedRevs[s.id] ?? 0;
       if (!(s.rev > base)) continue;
+      const sigConflict = assessServerReviewConflict(stored, payload);
+      if (sigConflict && String(sigConflict.reason).startsWith('review-')) {
+        return sigConflict;
+      }
       if (srv && srv.rev !== base) {
         return { reason: 'review-advanced', sessionId: s.id, serverRev: srv.rev, session: srv };
       }
@@ -397,31 +402,30 @@ export class Store extends EventTarget {
   _sendLatest() {
     if (this.saveConflict) return this._saveChain;
     const v = this._saveVersion;
-    // baseHeads：每个分支“所依据的服务端事件序号”。当前分支取已确认的 synced
-    // （不含本地未确认推进，否则会误判自己已合入）；其余分支取本地 head
-    // （它们未被本页编辑，与服务端一致或更新——更新的情况说明来自加载到的最新文档）。
-    const baseHeads = {};
-    for (const b of this.branches) {
-      baseHeads[b.id] = b.id === this.currentBranchId
-        ? (this._syncedHeads[b.id] ?? b.headEventId)
-        : b.headEventId;
-    }
-    const snapshot = JSON.stringify({
-      ...this._payload(), baseRev: this.rev, baseHeads,
-      baseReviewRevs: this._baseReviewRevs(),
-    });
+    this._flushedVersion = v;
     this._saveChain = this._saveChain.then(async () => {
       if (v !== this._saveVersion || this.saveConflict) return;
+      // 在保存链真正轮到本次请求时再快照：前一次 409 响应可能已在此 await 期间
+      // 把会话基线更新到服务端 rev，不能复用入队时序列化出的过期请求。
+      const baseHeads = {};
+      for (const b of this.branches) {
+        baseHeads[b.id] = b.id === this.currentBranchId
+          ? (this._syncedHeads[b.id] ?? b.headEventId)
+          : b.headEventId;
+      }
+      const payload = {
+        ...this._payload(), baseRev: this.rev, baseHeads,
+        baseReviewRevs: this._baseReviewRevs(),
+      };
+      let body = JSON.stringify(payload);
       // 审阅冲突未解决：该会话决定不再外发（本地决定已保留为提案，等逐项合并 / 放弃）。
       // 几何保存（其他分支/文档字段）仍照常进行：载荷里剔除冲突会话，服务端按 id
       // 并集时保留其权威副本，不会被本页过期内容覆盖。
-      let body = snapshot;
       if (this.reviewConflict) {
         const cid = this.reviewConflict.sessionId;
-        const parsed = JSON.parse(snapshot);
-        parsed.reviewSessions = (parsed.reviewSessions || []).filter((x) => x.id !== cid);
-        if (parsed.baseReviewRevs) delete parsed.baseReviewRevs[cid];
-        body = JSON.stringify(parsed);
+        payload.reviewSessions = (payload.reviewSessions || []).filter((x) => x.id !== cid);
+        delete payload.baseReviewRevs[cid];
+        body = JSON.stringify(payload);
       }
       try {
         const res = await fetch(this.base + '/api/doc', {
@@ -502,8 +506,14 @@ export class Store extends EventTarget {
 
   /** 测试/卸载时立即落盘并等待服务端确认 */
   async flushed() {
-    clearTimeout(this._saveTimer);
-    await this._sendLatest();
+    let guard = 0;
+    for (;;) {
+      clearTimeout(this._saveTimer);
+      const v = this._saveVersion;
+      await this._sendLatest();
+      if (this._saveVersion === v) break;
+      if (++guard > 20) break;
+    }
   }
 
   /* ---------- 分支 / 当前状态 ---------- */
@@ -904,14 +914,16 @@ export class Store extends EventTarget {
   }
 
   /** 从当前筛选结果创建审阅会话（快照：筛选条件 + 顺序 + 每节点指纹）。 */
-  createReview(name, { setActive = true } = {}) {
+  createReview(name, { setActive = true, policy = null } = {}) {
     if (this.saveConflict) return { ok: false, error: '版本冲突未解决，请先重新加载' };
     const w = this.workbench();
     const nodes = filterNodes(w.nodes, this.auditWorkbench.filter);
     if (!nodes.length) return { ok: false, error: '当前筛选结果为空，无法创建审阅会话' };
+    const policyCheck = validateReviewPolicy(policy);
+    if (!policyCheck.ok) return { ok: false, error: policyCheck.error };
     const session = createReviewSession({
       name, actor: this.actor, filter: this.auditWorkbench.filter, nodes,
-      branches: this.branches, now: Date.now(),
+      branches: this.branches, now: Date.now(), policy: policyCheck.policy,
     });
     this.reviewSessions = [...this.reviewSessions, session];
     this._reviewSyncedRevs[session.id] = 0; // HTTP 首次保存：服务端尚无此会话（base=0）
@@ -960,6 +972,49 @@ export class Store extends EventTarget {
     return { ok: true, session: res.session };
   }
 
+  /**
+   * 多人签署：先校验允许名单与当前节点快照，再把“决定 + 签名”作为一条不可拆分记录保存。
+   * 重复签名幂等；409 时本地签名完整保留（含签名 id/理由/签署人），可逐项合并。
+   */
+  submitReviewSignature(id, nodeKey, decision, reason) {
+    const session0 = this.reviewSessions.find((x) => x.id === id);
+    if (!session0) return { ok: false, status: 409, error: '会话不存在（可能已被其他页面删除）' };
+    const policy = normalizeReviewPolicy(session0.policy);
+    if (policy.mode !== 'signoff') return { ok: false, status: 400, reason: 'legacy-decision-required' };
+    const proposal = makeSignatureProposal(nodeKey, decision, reason, { actor: this.actor });
+    if (!isAllowedSigner(policy, this.actor)) {
+      return { ok: false, status: 403, reason: 'signer-not-allowed', allowed: policy.signers, proposal: null };
+    }
+    if (this.reviewConflict?.sessionId === id) {
+      const p = this._stashSignatureProposal(id, proposal);
+      return { ok: false, status: 409, reason: this.reviewConflict.reason, conflict: this.reviewConflict, proposal: p };
+    }
+    const view = this.reviewView(id);
+    const res = signReviewNode(session0, view, nodeKey, decision, reason, { actor: this.actor });
+    if (res.status === 403) return { ok: false, ...res };
+    if (res.status !== 200) {
+      const p = this._stashSignatureProposal(id, proposal);
+      return { ok: false, status: res.status, reason: res.reason, codes: res.codes, proposal: p };
+    }
+    if (!res.idempotent) this._replaceReview(res.session);
+    this._dirty = true;
+    this.persist();
+    this._emit('reviews', { type: 'signature', id, nodeKey, idempotent: !!res.idempotent, signature: res.signature });
+    return { ok: true, idempotent: !!res.idempotent, session: res.session, signature: res.signature };
+  }
+
+  _stashSignatureProposal(id, proposal) {
+    const list = this._reviewProposals.get(id) || [];
+    // 同一签署人/决定/理由的重复 409 不制造多条本地提案；不同人或不同决定逐项保留。
+    const dup = list.some((p) => p.type === 'signature' && p.sig?.id === proposal.sig.id)
+      || list.some((p) => p.type === 'signature' && p.nodeKey === proposal.nodeKey
+        && p.by === proposal.by && p.decision === proposal.decision && p.reason === proposal.reason);
+    if (!dup) list.push(proposal);
+    this._reviewProposals.set(id, list);
+    this._emit('reviews', { type: 'proposal', id, nodeKey: proposal.nodeKey });
+    return proposal;
+  }
+
   _stashProposal(id, nodeKey, decision, reason) {
     const p = { nodeKey, decision, reason: String(reason || '').slice(0, 2000), by: this.actor || '未署名', at: Date.now(), rejected: true };
     const list = this._reviewProposals.get(id) || [];
@@ -969,10 +1024,15 @@ export class Store extends EventTarget {
     return p;
   }
 
-  /** 409 后逐项合并：以本地决定强制落到【最新快照】的该节点上（关闭该节点冲突记录）。 */
-  mergeReviewItem(id, nodeKey, decision, reason) {
+  /** 409 后逐项合并：多人会话合入本地签名；单人会话强制落到最新快照的决定。 */
+  mergeReviewItem(id, nodeKey, decision, reason, options = {}) {
     const session = this.reviewSessions.find((x) => x.id === id);
     if (!session) return { ok: false, error: '会话不存在' };
+    if (normalizeReviewPolicy(session.policy).mode === 'signoff') {
+      return this.mergeReviewSignature(id, options.proposal?.sig || null, nodeKey, decision, reason, {
+        by: options.by || options.proposal?.by || this.actor,
+      });
+    }
     const res = mergeReviewItem(session, nodeKey, decision, reason, { actor: this.actor, resolution: 'merged-local' });
     if (res.status !== 200) return { ok: false, error: res.reason };
     this._replaceReview(res.session);
@@ -986,9 +1046,41 @@ export class Store extends EventTarget {
     return { ok: true, session: res.session };
   }
 
-  /** 放弃本地保留的某条决定（采用服务端最新值）。 */
-  discardReviewProposal(id, nodeKey) {
-    const list = (this._reviewProposals.get(id) || []).filter((p) => p.nodeKey !== nodeKey);
+  mergeReviewSignature(id, sig, nodeKey, decision, reason, { by = this.actor } = {}) {
+    const session = this.reviewSessions.find((x) => x.id === id);
+    if (!session) return { ok: false, error: '会话不存在' };
+    const view = this.reviewView(id);
+    const actor = by || this.actor;
+    const res = mergeReviewSignature(session, view, nodeKey, decision, reason, { actor });
+    if (res.status === 403) return { ok: false, status: 403, reason: res.reason, allowed: res.allowed };
+    if (res.status !== 200) {
+      const p = this._stashSignatureProposal(id, sig || makeSignatureProposal(nodeKey, decision, reason, { actor }));
+      return { ok: false, status: res.status, reason: res.reason, codes: res.codes, proposal: p };
+    }
+    if (!res.idempotent) this._replaceReview(res.session);
+    const sigId = res.signature?.id || sig?.id;
+    const list = (this._reviewProposals.get(id) || []).filter((p) => {
+      if (p.type !== 'signature' || p.nodeKey !== nodeKey) return true;
+      if (sigId && p.sig?.id === sigId) return false;
+      // 合并时签名 id 可能由纯函数重新生成；同一签署人/决定/理由的提案视为已采用。
+      if (p.by === actor && p.decision === decision && p.reason === res.signature?.reason) return false;
+      return true;
+    });
+    this._reviewProposals.set(id, list);
+    this._clearReviewConflictIfResolved(id);
+    this._dirty = true;
+    this.persist();
+    this._emit('reviews', { type: 'merge-signature', id, nodeKey });
+    return { ok: true, idempotent: !!res.idempotent, session: res.session, signature: res.signature };
+  }
+
+  /** 放弃本地保留的某条决定/签名（采用服务端最新值）。 */
+  discardReviewProposal(id, nodeKey, { signatureId = null } = {}) {
+    const list = (this._reviewProposals.get(id) || []).filter((p) => {
+      if (p.nodeKey !== nodeKey) return true;
+      if (signatureId) return !(p.type === 'signature' && p.sig?.id === signatureId);
+      return false;
+    });
     this._reviewProposals.set(id, list);
     this._clearReviewConflictIfResolved(id);
     this._emit('reviews', { type: 'proposal-discard', id, nodeKey });
@@ -1024,7 +1116,11 @@ export class Store extends EventTarget {
     if (!session) return { ok: false, error: '会话不存在' };
     const view = this.reviewView(id);
     const res = completeReview(session, view);
-    if (res.status !== 200) return { ok: false, error: `还有 ${res.pending} 个节点未处理（含系统转待复核）` };
+    if (res.status !== 200) {
+      return { ok: false, error: res.reason === 'has-reject'
+        ? `完成条件不允许存在驳回（${res.pending} 个节点驳回）`
+        : `还有 ${res.pending} 个节点未完成签署（含系统转待复核）` };
+    }
     this._replaceReview(res.session);
     this._dirty = true;
     this.persist();
@@ -1073,17 +1169,31 @@ export class Store extends EventTarget {
         .filter((n) => n.decision !== 'pending')
         .map((n) => [n.key, n]));
       const revsed = sanitizeReviewSessions([serverSession], this.workbench())[0];
-      // 保留本地（被拒）决定：服务端节点上仍 pending 或值不同的，进 proposals
+      // 保留本地（被拒）决定/签名：单人节点按决定保留；多人节点按本地有效签名逐条保留。
       const kept = [];
       for (const [key, n] of localDecisions) {
         const srv = revsed?.nodes.find((x) => x.key === key);
+        if (normalizeReviewPolicy(mine.policy).mode === 'signoff') continue;
         if (!srv || srv.decision !== n.decision) {
           kept.push({ nodeKey: key, decision: n.decision, reason: n.reason, by: n.decidedBy || this.actor, at: Date.now(), rejected: true });
         }
       }
+      for (const n of mine?.nodes || []) {
+        if (normalizeReviewPolicy(mine.policy).mode !== 'signoff') continue;
+        const srv = revsed?.nodes.find((x) => x.key === n.key);
+        const remoteIds = new Set((srv?.signatures || []).map((s) => s.id));
+        for (const sg of activeSignatures(n)) {
+          if (remoteIds.has(sg.id)) continue;
+          kept.push({
+            type: 'signature', nodeKey: n.key, decision: sg.decision, reason: sg.reason || '',
+            by: sg.by, at: Date.now(), rejected: true, sig: { ...sg },
+          });
+        }
+      }
       const existing = this._reviewProposals.get(id) || [];
-      const keys = new Set(existing.map((p) => p.nodeKey + p.decision));
-      for (const p of kept) if (!keys.has(p.nodeKey + p.decision)) existing.push(p);
+      const keyOf = (p) => `${p.type || 'decision'}|${p.nodeKey}|${p.by || ''}|${p.decision}|${p.reason || ''}|${p.sig?.id || ''}`;
+      const keys = new Set(existing.map(keyOf));
+      for (const p of kept) if (!keys.has(keyOf(p))) existing.push(p);
       this._reviewProposals.set(id, existing);
       this.reviewSessions = this.reviewSessions.map((x) => (x.id === id ? revsed : x));
       // 以服务端最新 rev 为新基线：下一次逐项合并携带正确的 baseReviewRevs
@@ -1128,7 +1238,11 @@ export class Store extends EventTarget {
       let differs = false;
       for (const n of srv.nodes || []) {
         const m = mineByKey.get(n.key);
-        if (m && m.decision !== 'pending' && (m.decision !== n.decision || m.reason !== n.reason)) { differs = true; break; }
+        if (!m) continue;
+        if (normalizeReviewPolicy(mine.policy).mode === 'signoff') {
+          const remoteSig = new Set(activeSignatures(n).map((s) => `${s.by}|${s.decision}|${s.reason || ''}`));
+          if (activeSignatures(m).some((s) => !remoteSig.has(`${s.by}|${s.decision}|${s.reason || ''}`))) { differs = true; break; }
+        } else if (m.decision !== 'pending' && (m.decision !== n.decision || m.reason !== n.reason)) { differs = true; break; }
       }
       if (srv.rev < mine.rev || (srv.rev === mine.rev && differs)) {
         return { reason: 'review-advanced', sessionId: mine.id, serverRev: srv.rev, session: srv };
@@ -1146,15 +1260,35 @@ export class Store extends EventTarget {
       this._reviewSyncedRevs[mine.id] = srv ? srv.rev : (this._reviewSyncedRevs[mine.id] ?? 0);
       this._reviewAuthoredRevs.delete(mine.id);
       const kept = [];
-      for (const n of mine.nodes) {
-        if (n.decision === 'pending') continue;
-        const on = srv?.nodes.find((x) => x.key === n.key);
-        if (!on || on.decision !== n.decision || on.reason !== n.reason) {
-          kept.push({ nodeKey: n.key, decision: n.decision, reason: n.reason, by: n.decidedBy || this.actor, at: Date.now(), rejected: true });
+      if (normalizeReviewPolicy(mine.policy).mode === 'signoff') {
+        for (const n of mine.nodes) {
+          const on = srv?.nodes.find((x) => x.key === n.key);
+          const remoteSig = new Set(activeSignatures(on || {}).map((s) => `${s.by}|${s.decision}|${s.reason || ''}`));
+          for (const sg of activeSignatures(n)) {
+            if (remoteSig.has(`${sg.by}|${sg.decision}|${sg.reason || ''}`)) continue;
+            kept.push({
+              type: 'signature', nodeKey: n.key, decision: sg.decision, reason: sg.reason || '',
+              by: sg.by, at: Date.now(), rejected: true, sig: { ...sg },
+            });
+          }
+        }
+      } else {
+        for (const n of mine.nodes) {
+          if (n.decision === 'pending') continue;
+          const on = srv?.nodes.find((x) => x.key === n.key);
+          if (!on || on.decision !== n.decision || on.reason !== n.reason) {
+            kept.push({ nodeKey: n.key, decision: n.decision, reason: n.reason, by: n.decidedBy || this.actor, at: Date.now(), rejected: true });
+          }
         }
       }
       const prev = myProposals.get(mine.id) || [];
-      const all = [...prev, ...kept];
+      const keyOf = (p) => `${p.type || 'decision'}|${p.nodeKey}|${p.by || ''}|${p.decision}|${p.reason || ''}|${p.sig?.id || ''}`;
+      const seen = new Set(prev.map(keyOf));
+      const all = [...prev];
+      for (const p of kept) {
+        const k = keyOf(p);
+        if (!seen.has(k)) { seen.add(k); all.push(p); }
+      }
       if (all.length) this._reviewProposals.set(mine.id, all);
     }
     if (myActiveId && this.reviewSessions.some((x) => x.id === myActiveId)) this.activeReviewId = myActiveId;

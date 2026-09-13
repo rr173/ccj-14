@@ -354,6 +354,59 @@ def _effective_review_view(cur, doc):
     return evs, branches, list(exps.values())
 
 
+def _review_signature_bad(session, server_session):
+    """多人签名名单/重复有效签名的轻量校验（与浏览器 assessServerReviewConflict 同构）。"""
+    policy = session.get("policy") if isinstance(session, dict) else None
+    if not isinstance(policy, dict) or policy.get("mode") != "signoff":
+        return None
+    signers = {x for x in policy.get("signers", []) if isinstance(x, str)}
+    try:
+        required = int(policy.get("required") or 0)
+    except (TypeError, ValueError):
+        required = 0
+    if not signers or required < 1 or required > len(signers):
+        return {"reason": "review-policy-invalid"}
+    old_nodes = {n.get("key"): n for n in (server_session or {}).get("nodes", []) if isinstance(n, dict)}
+    for node in session.get("nodes", []) or []:
+        if not isinstance(node, dict):
+            continue
+        old = old_nodes.get(node.get("key")) or {}
+        old_sigs = {s.get("id"): s for s in old.get("signatures", []) if isinstance(s, dict)}
+        seen = {s.get("by") for s in old.get("signatures", []) if isinstance(s, dict) and not s.get("invalid")}
+        active = [s for s in old.get("signatures", []) if isinstance(s, dict) and not s.get("invalid")]
+        for sg in node.get("signatures", []) or []:
+            if not isinstance(sg, dict):
+                continue
+            old_sg = old_sigs.get(sg.get("id"))
+            if old_sg:
+                invalid_changed = bool(old_sg.get("invalid")) != bool(sg.get("invalid"))
+                fields_changed = (
+                    not old_sg.get("invalid") and not sg.get("invalid") and (
+                        old_sg.get("by") != sg.get("by")
+                        or old_sg.get("decision") != sg.get("decision")
+                        or (old_sg.get("reason") or "") != (sg.get("reason") or "")
+                    )
+                )
+                if invalid_changed or fields_changed:
+                    return {"reason": "review-signature-history-changed", "nodeKey": node.get("key")}
+                continue
+            if sg.get("invalid"):
+                continue
+            by = sg.get("by")
+            if by not in signers:
+                return {"reason": "review-signer-not-allowed", "nodeKey": node.get("key")}
+            if by in seen:
+                return {"reason": "review-duplicate-signer", "nodeKey": node.get("key")}
+            seen.add(by)
+            active.append(sg)
+        if session.get("status") == "completed":
+            if len(active) < required:
+                return {"reason": "review-signature-shortfall", "nodeKey": node.get("key")}
+            if policy.get("completeRule") == "no-reject" and any(sg.get("decision") == "reject" for sg in active):
+                return {"reason": "review-completion-has-reject", "nodeKey": node.get("key")}
+    return None
+
+
 def _assess_review_conflict(cur, doc):
     """
     审阅会话乐观并发（与 web/js/geom/reviews.js assessServerReviewConflict 同构）。
@@ -384,6 +437,9 @@ def _assess_review_conflict(cur, doc):
         srv = cur_sessions.get(sid)
         if srv and srv.get("rev") != base:
             return {"reason": "review-advanced", "sessionId": sid, "serverRev": srv.get("rev", 1), "session": srv}
+        sig_bad = _review_signature_bad(s, srv)
+        if sig_bad:
+            return {**sig_bad, "sessionId": sid, "serverRev": (srv or {}).get("rev", base), "session": srv}
         for n in s.get("nodes", []) or []:
             if not isinstance(n, dict):
                 continue

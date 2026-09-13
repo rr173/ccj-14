@@ -51,6 +51,8 @@ const {
   rebaseSession, completeReview, reopenReview, sanitizeReviewSessions,
   mergeReviewSessions, assessServerReviewConflict, buildReviewReport,
   sessionProgress, effectiveDecision, reviewTimelineHash, nodeFingerprint,
+  normalizeReviewPolicy, signReviewNode, mergeReviewSignature, signatureState,
+  activeSignatures, finalReviewVerdict,
   DRIFT_TEXT,
 } = await import('../web/js/geom/reviews.js');
 const { filterNodes, buildExport, stableStringify, exportChecksum } = await import('../web/js/geom/auditbench.js');
@@ -255,6 +257,233 @@ test('全部处理完可标记完成；完成后可重开；仍有未处理/待�
   assert.equal(s.activeReview.status, 'completed');
   assert.equal(s.reopenReview(id).ok, true);
   assert.equal(s.activeReview.status, 'active');
+});
+
+/* ---------- 多人签署流程 ---------- */
+
+function signPolicy(over = {}) {
+  return { mode: 'signoff', signers: ['甲', '乙', '丙'], required: 2, completeRule: 'all-decided', ...over };
+}
+
+test('多人签署：按节点名单/人数/完成条件确认；未列入不能签，人数不足不能完成；报告列出已签未签', async () => {
+  const { s } = await buildFixture();
+  const created = s.createReview('多人审阅', { policy: signPolicy() });
+  assert.equal(created.ok, true);
+  const id = created.session.id;
+  const key = created.session.nodes[0].key;
+  s.setActor('甲');
+  let res = s.submitReviewSignature(id, key, 'pass', '');
+  assert.equal(res.ok, true);
+  let sn = s.reviewView(id).session.nodes[0];
+  assert.equal(signatureState(sn, created.session.policy).confirmed, false);
+  assert.deepEqual(activeSignatures(sn).map((x) => x.by), ['甲']);
+  assert.equal(s.completeReview(id).ok, false);
+
+  s.setActor('外人');
+  res = s.submitReviewSignature(id, key, 'pass', '');
+  assert.equal(res.status, 403);
+  assert.equal(res.reason, 'signer-not-allowed');
+  assert.equal(s.reviewProposals(id).length, 0);
+
+  s.setActor('乙');
+  res = s.submitReviewSignature(id, key, 'pass', '');
+  assert.equal(res.ok, true);
+  sn = s.reviewView(id).session.nodes[0];
+  const st = signatureState(sn, created.session.policy);
+  assert.equal(st.confirmed, true);
+  assert.equal(st.decision, 'pass');
+  assert.deepEqual(st.active.map((x) => x.by), ['甲', '乙']);
+  assert.deepEqual(st.unsignedSigners, ['丙']);
+  assert.ok(sn.confirmedAt > 0);
+
+  const report = s.reviewReport(id, { generatedAt: 'fixed' });
+  const rn = report.nodes[0];
+  assert.equal(rn.confirmed, true);
+  assert.equal(rn.signing.activeCount, 2);
+  assert.deepEqual(rn.signing.unsignedSigners, ['丙']);
+  assert.equal(report.session.policy.required, 2);
+});
+
+test('多人签名重复提交幂等；同一签署人改判保留旧签名并标记 superseded；平票转待复核', async () => {
+  const { s } = await buildFixture();
+  const id = s.createReview('签名幂等', { policy: signPolicy({ required: 2 }) }).session.id;
+  const n0 = s.reviewSessionById(id).nodes[0].key;
+  const n1 = s.reviewSessionById(id).nodes[1].key;
+  s.setActor('甲');
+  const first = s.submitReviewSignature(id, n0, 'pass', '');
+  const revAfterFirst = s.reviewSessionById(id).rev;
+  const again = s.submitReviewSignature(id, n0, 'pass', '');
+  assert.equal(again.ok, true);
+  assert.equal(again.idempotent, true);
+  assert.equal(s.reviewSessionById(id).rev, revAfterFirst);
+  assert.equal(activeSignatures(s.reviewSessionById(id).nodes[0]).length, 1);
+
+  // 同签署人改判：旧记录保留但立即失效，新签名生效
+  s.submitReviewSignature(id, n0, 'reject', '发现问题');
+  const sn0 = s.reviewSessionById(id).nodes[0];
+  assert.equal(activeSignatures(sn0).length, 1);
+  assert.equal(sn0.signatures[0].invalid.code, 'superseded');
+  assert.equal(sn0.signatures[1].decision, 'reject');
+
+  // 两票通过/驳回平票：确定性转待复核，节点仍已确认但聚合决定为 review
+  s.setActor('甲');
+  s.submitReviewSignature(id, n1, 'pass', '');
+  s.setActor('乙');
+  s.submitReviewSignature(id, n1, 'reject', '存在风险');
+  const st1 = signatureState(s.reviewView(id).session.nodes[1], signPolicy());
+  assert.equal(st1.confirmed, true);
+  assert.equal(st1.decision, 'review');
+});
+
+test('完成条件 no-reject：节点均确认但有驳回时不能完成；改判通过后完成并给出最终判定', async () => {
+  const { s } = await buildFixture();
+  const policy = signPolicy({ required: 1, completeRule: 'no-reject' });
+  const id = s.createReview('无驳回完成', { policy }).session.id;
+  s.setActor('甲');
+  for (const n of s.reviewSessionById(id).nodes) {
+    s.submitReviewSignature(id, n.key, 'pass', '');
+  }
+  assert.equal(s.completeReview(id).ok, true);
+  assert.equal(s.reopenReview(id).ok, true);
+  const key = s.reviewSessionById(id).nodes[0].key;
+  s.submitReviewSignature(id, key, 'reject', '重新发现问题');
+  assert.equal(s.completeReview(id).ok, false);
+  s.submitReviewSignature(id, key, 'pass', '问题已修复');
+  const done = s.completeReview(id);
+  assert.equal(done.ok, true);
+  assert.equal(done.session.completedAt > 0, true);
+});
+
+test('多人节点指纹变化：已有签名保留、按原因失效、节点重新待签署；恢复后旧签名也不自动复活', async () => {
+  const { s } = await buildFixture();
+  const created = s.createReview('签名失效', { policy: signPolicy() });
+  const id = created.session.id;
+  const target = created.session.nodes[0].key;
+  s.setActor('甲'); s.submitReviewSignature(id, target, 'pass', '');
+  s.setActor('乙'); s.submitReviewSignature(id, target, 'pass', '');
+  const w = s.workbench();
+  let view = reconcileSession(s.reviewSessionById(id), w);
+  assert.equal(activeSignatures(view.session.nodes[0]).length, 2);
+
+  const live = w.byKey.get(target);
+  const changed = structuredClone(live);
+  changed.hashAfter = '11112222';
+  const wbBad = { ...w, byKey: new Map(w.byKey).set(target, changed), nodes: w.nodes.map((n) => n.key === target ? changed : n) };
+  view = reconcileSession(view.session, wbBad);
+  let sn = view.session.nodes.find((n) => n.key === target);
+  assert.equal(activeSignatures(sn).length, 0);
+  assert.ok(sn.signatures.every((sg) => sg.invalid?.codes.includes('fingerprint-changed')));
+  assert.equal(signatureState(sn, created.session.policy).confirmed, false);
+
+  view = reconcileSession(view.session, w);
+  sn = view.session.nodes.find((n) => n.key === target);
+  assert.equal(activeSignatures(sn).length, 0);
+  assert.ok(sn.autoReview === null);
+  assert.ok(sn.signatures.every((sg) => sg.invalid?.code === 'fingerprint-changed'));
+});
+
+test('多人签名刷新后规则、签名顺序、失效原因与完成状态保持一致', async () => {
+  let s = await freshStore();
+  s.commit((m) => { m.rects[0].x += 33; }, { label: '签名基线' });
+  const oldHead = s.branch.headEventId;
+  const id = s.createReview('重启签名', { policy: signPolicy({ required: 2 }) }).session.id;
+  const key = `event:${oldHead}`;
+  s.setActor('甲'); s.submitReviewSignature(id, key, 'pass', '一');
+  s.setActor('乙'); s.submitReviewSignature(id, key, 'reject', '二');
+  s.undo();
+  s.commit((m) => { m.rects[0].x += 77; }, { label: '新分支头' });
+  await s.flushed();
+
+  const doc = JSON.parse(JSON.stringify(s._payload()));
+  const s2 = new Store({ base: '', tickMs: 1 });
+  await s2._adopt(doc, { seed: false });
+  s2.selectReview(id);
+  const sn1 = s2.reviewView(id).session.nodes.find((n) => n.key === key);
+  assert.equal(sn1.signatures.length, 2);
+  assert.ok(sn1.signatures.every((sg) => sg.invalid?.codes.includes('branch-advanced')));
+  assert.equal(sn1.signatures[0].by, '甲');
+  assert.equal(sn1.signatures[1].by, '乙');
+  assert.equal(s2.reviewSessionById(id).policy.required, 2);
+  assert.equal(s2.completeReview(id).ok, false);
+
+  const s3 = new Store({ base: '', tickMs: 1 });
+  await s3._adopt(JSON.parse(JSON.stringify(doc)), { seed: false });
+  const sn2 = s3.reviewView(id).session.nodes.find((n) => n.key === key);
+  assert.deepEqual(sn2.signatures.map((sg) => [sg.by, sg.invalid.code]), sn1.signatures.map((sg) => [sg.by, sg.invalid.code]));
+});
+
+test('两个窗口同时签同一节点：后提交者 409 且本地签名保留；逐项合并后节点确认', async () => {
+  const { s: s1 } = await buildFixture();
+  const id = s1.createReview('并发签名', { policy: signPolicy({ required: 2 }) }).session.id;
+  await s1.flushed();
+  const iso = isolatedStorage(); iso.use();
+  const s2 = new Store({ base: '', tickMs: 1 });
+  await s2.load();
+  iso.release();
+
+  const key = s1.reviewSessionById(id).nodes[0].key;
+  s1.setActor('甲');
+  assert.equal(s1.submitReviewSignature(id, key, 'pass', '窗口甲').ok, true);
+  await s1.flushed();
+
+  s2.setActor('乙');
+  const local = s2.submitReviewSignature(id, key, 'pass', '窗口乙');
+  assert.equal(local.ok, true);
+  await s2.flushed();
+  assert.equal(s2.reviewConflict?.reason, 'review-advanced');
+  const prop = s2.reviewProposals(id).find((p) => p.type === 'signature' && p.by === '乙');
+  assert.ok(prop);
+  const merged = s2.mergeReviewItem(id, key, prop.decision, prop.reason, { proposal: prop, by: prop.by });
+  assert.equal(merged.ok, true);
+  await s2.flushed();
+  const server = harness.doc.reviewSessions.find((x) => x.id === id);
+  const sn = server.nodes.find((n) => n.key === key);
+  assert.deepEqual(activeSignatures(sn).map((x) => x.by).sort(), ['乙', '甲']);
+  assert.equal(signatureState(sn, server.policy).confirmed, true);
+});
+
+test('服务端校验：不在名单的新签名/同一签署人重复有效签名不能推进会话', () => {
+  const mk = (by) => ({ id: 'sg' + by, seq: 0, at: 1, by, decision: 'pass', reason: '', invalid: null });
+  const baseSession = {
+    id: 'rp', rev: 2, policy: signPolicy({ required: 2 }),
+    nodes: [{ key: 'event:e1', fingerprint: 'h1', branchId: 'main', signatures: [] }],
+  };
+  const server = {
+    events: [{ id: 'e1', hash: 'h1', branch: 'main', parentId: null }],
+    branches: [{ id: 'main', headEventId: 'e1' }], experiments: [],
+    reviewSessions: [{ ...baseSession, rev: 1 }],
+  };
+  const badActor = {
+    reviewSessions: [{ ...baseSession, nodes: [{ ...baseSession.nodes[0], signatures: [mk('外人')] }] }],
+    baseReviewRevs: { rp: 1 },
+  };
+  assert.equal(assessServerReviewConflict(server, badActor).reason, 'review-signer-not-allowed');
+  const dup = {
+    reviewSessions: [{ ...baseSession, nodes: [{ ...baseSession.nodes[0], signatures: [mk('甲'), { ...mk('甲'), id: 'sg2' }] }] }],
+    baseReviewRevs: { rp: 1 },
+  };
+  assert.equal(assessServerReviewConflict(server, dup).reason, 'review-duplicate-signer');
+  const oldSig = mk('甲');
+  const existingSigServer = {
+    events: server.events, branches: server.branches, experiments: [],
+    reviewSessions: [{
+      ...baseSession, rev: 1,
+      nodes: [{ ...baseSession.nodes[0], signatures: [oldSig], decision: 'pending' }],
+    }],
+  };
+  const changedHistory = {
+    reviewSessions: [{
+      ...baseSession, rev: 2,
+      nodes: [{ ...baseSession.nodes[0], signatures: [{ ...oldSig, reason: '历史被改写' }] }],
+    }],
+    baseReviewRevs: { rp: 1 },
+  };
+  assert.equal(assessServerReviewConflict(existingSigServer, changedHistory).reason, 'review-signature-history-changed');
+  const shortCompleted = {
+    reviewSessions: [{ ...baseSession, status: 'completed', rev: 2, nodes: [{ ...baseSession.nodes[0], signatures: [mk('甲')] }] }],
+    baseReviewRevs: { rp: 1 },
+  };
+  assert.equal(assessServerReviewConflict(server, shortCompleted).reason, 'review-signature-shortfall');
 });
 
 /* ---------- 损坏 / 缺失 / 指纹变化 / 分支推进：自动转待复核 ---------- */

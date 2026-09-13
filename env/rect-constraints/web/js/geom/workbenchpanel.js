@@ -12,7 +12,10 @@
 
 import { diffHtml } from './diff.js';
 import { filterNodes, neighborNode, nextReplayable, buildExport, stableStringify, exportChecksum } from './auditbench.js';
-import { DECISION_LABEL, DRIFT_TEXT } from './reviews.js';
+import {
+  DECISION_LABEL, DRIFT_TEXT, normalizeReviewPolicy, signatureState,
+  activeSignatures, isAllowedSigner,
+} from './reviews.js';
 
 const KIND_LABEL = { root: '初始', edit: '编辑', 'fork-root': '分支起点' };
 const SEV_LABEL = { all: '全部节点', issues: '有标注', bad: '仅不可回放', unreplayable: '仅无快照' };
@@ -85,6 +88,39 @@ export class WorkbenchPanel {
       </div>
 
       <div id="wb-cursor" class="wb-cursor"></div>
+      <div id="rv-create-modal" class="modal hidden">
+        <div class="modal-card rv-create-card">
+          <div class="modal-head">创建审阅会话 <span class="spacer"></span><button id="rv-create-x" class="mini">✕</button></div>
+          <div id="rv-create-body" class="rv-create-body">
+            <label class="rv-form-row">会话名称
+              <input id="rv-create-name" maxlength="60" />
+            </label>
+            <label class="rv-form-check"><input id="rv-create-multi" type="checkbox" /> 启用多人签署（决定后必须单独签名确认）</label>
+            <div id="rv-create-policy">
+              <label class="rv-form-row">允许的审阅人（逗号 / 顿号 / 换行分隔）
+                <textarea id="rv-create-signers" rows="3" placeholder="张三、李四、王五"></textarea>
+              </label>
+              <div class="rv-form-grid">
+                <label class="rv-form-row">每节点需要签名数
+                  <input id="rv-create-required" type="number" min="1" value="2" />
+                </label>
+                <label class="rv-form-row">会话完成条件
+                  <select id="rv-create-rule">
+                    <option value="all-decided">所有节点确认即可（允许驳回）</option>
+                    <option value="no-reject">所有节点确认且最终无驳回</option>
+                  </select>
+                </label>
+              </div>
+              <div class="rv-form-note" id="rv-create-hint"></div>
+            </div>
+          </div>
+          <div class="modal-foot">
+            <span class="spacer"></span>
+            <button id="rv-create-cancel" class="mini">取消</button>
+            <button id="rv-create-ok" class="mini primary">创建快照</button>
+          </div>
+        </div>
+      </div>
       <div id="wb-reviews" class="wb-reviews"></div>
       <div id="wb-list" class="list wb-list"></div>`;
 
@@ -98,7 +134,15 @@ export class WorkbenchPanel {
     this.$speed = this.$body.querySelector('#wb-speed');
     this.$cursor = this.$body.querySelector('#wb-cursor');
     this.$reviews = this.$body.querySelector('#wb-reviews');
+    this.$createModal = this.$body.querySelector('#rv-create-modal');
+    this.$createName = this.$body.querySelector('#rv-create-name');
+    this.$createMulti = this.$body.querySelector('#rv-create-multi');
+    this.$createSigners = this.$body.querySelector('#rv-create-signers');
+    this.$createRequired = this.$body.querySelector('#rv-create-required');
+    this.$createRule = this.$body.querySelector('#rv-create-rule');
+    this.$createHint = this.$body.querySelector('#rv-create-hint');
     this.$list = this.$body.querySelector('#wb-list');
+    this._bindCreateModal();
   }
 
   _bind() {
@@ -120,7 +164,7 @@ export class WorkbenchPanel {
     this.$play.onclick = () => this._togglePlay();
     this.$speed.onchange = () => s.setWorkbench({ speedMs: Number(this.$speed.value) });
     this.$body.querySelector('#wb-export').onclick = () => this._export();
-    this.$body.querySelector('#wb-new-review').onclick = () => this._createReview();
+    this.$body.querySelector('#wb-new-review').onclick = () => this._openCreateReview();
   }
 
   /* ---------------- 状态便捷访问 ---------------- */
@@ -450,6 +494,71 @@ export class WorkbenchPanel {
     return this.store.reviewView(id);
   }
 
+  _bindCreateModal() {
+    const close = () => this.$createModal.classList.add('hidden');
+    this.$body.querySelector('#rv-create-x').onclick = close;
+    this.$body.querySelector('#rv-create-cancel').onclick = close;
+    this.$body.querySelector('#rv-create-ok').onclick = () => this._submitCreateReview();
+    this.$createMulti.onchange = () => this._syncCreatePolicyUi();
+    this.$createSigners.oninput = () => this._syncCreatePolicyUi();
+    this.$createRequired.oninput = () => this._syncCreatePolicyUi();
+  }
+
+  _parseSignerText() {
+    const seen = new Set();
+    const out = [];
+    for (const raw of this.$createSigners.value.split(/[\n,，、;；]/)) {
+      const name = raw.trim().slice(0, 40);
+      if (name && !seen.has(name)) { seen.add(name); out.push(name); }
+    }
+    return out;
+  }
+
+  _syncCreatePolicyUi() {
+    const multi = this.$createMulti.checked;
+    this.$createModal.querySelector('#rv-create-policy').classList.toggle('hidden', !multi);
+    if (!multi) return;
+    const signers = this._parseSignerText();
+    const n = Math.max(1, Number(this.$createRequired.value) || 1);
+    this.$createRequired.max = String(Math.max(1, signers.length || 1));
+    if (Number(this.$createRequired.value) > signers.length && signers.length) this.$createRequired.value = signers.length;
+    this.$createHint.textContent = signers.length
+      ? `允许 ${signers.length} 人；节点需 ${Math.min(n, signers.length)} 个有效签名才确认。未署名且不在名单中不能签。`
+      : '请至少填写一名允许的审阅人；也可以把当前操作者填入名单。';
+  }
+
+  _openCreateReview() {
+    const { list } = this._filtered();
+    if (!list.length) { this.hooks.toast('当前筛选没有节点，无法创建审阅会话', 'warn'); return; }
+    const me = (this.store.actor || '').trim();
+    this.$createName.value = `审阅 ${new Date().toLocaleString()}`;
+    this.$createMulti.checked = false;
+    this.$createSigners.value = [me, '审阅人2'].filter(Boolean).join('、');
+    this.$createRequired.value = '2';
+    this.$createRule.value = 'all-decided';
+    this._syncCreatePolicyUi();
+    this.$createModal.classList.remove('hidden');
+    this.$createName.focus();
+  }
+
+  _submitCreateReview() {
+    const name = this.$createName.value.trim();
+    if (!name) { this.hooks.toast('请填写会话名称', 'warn'); return; }
+    let policy = null;
+    if (this.$createMulti.checked) {
+      const signers = this._parseSignerText();
+      if (!signers.length) { this.hooks.toast('多人签署必须设置允许的审阅人名单', 'warn'); return; }
+      const required = Math.max(1, Math.min(signers.length, Number(this.$createRequired.value) || signers.length));
+      policy = { mode: 'signoff', signers, required, completeRule: this.$createRule.value };
+    }
+    const res = this.store.createReview(name, { policy });
+    if (!res.ok) { this.hooks.toast(res.error || '创建失败', 'error'); return; }
+    this.$createModal.classList.add('hidden');
+    const { list } = this._filtered();
+    this.hooks.toast(`已创建审阅会话「${res.session.name}」：已保存规则、节点顺序与 ${list.length} 个节点指纹，可随时恢复`);
+  }
+
+  /** @deprecated 保留供测试/控制台调用：创建默认单人会话。 */
   _createReview() {
     const { list } = this._filtered();
     if (!list.length) { this.hooks.toast('当前筛选没有节点，无法创建审阅会话', 'warn'); return; }
@@ -467,7 +576,9 @@ export class WorkbenchPanel {
     if (!view) return '';
     const sn = view.session.nodes.find((x) => x.key === key);
     if (!sn) return '';
-    const eff = sn.autoReview ? 'review' : sn.decision;
+    const policy = normalizeReviewPolicy(view.session.policy);
+    const st = signatureState(sn, policy);
+    const eff = sn.autoReview ? 'review' : st.decision;
     const tag = {
       pass: '<span class="rv-mark m-pass" title="审阅通过">✓ 通过</span>',
       reject: '<span class="rv-mark m-reject" title="审阅驳回">✗ 驳回</span>',
@@ -536,8 +647,23 @@ export class WorkbenchPanel {
     this.$reviews.querySelectorAll('[data-rv-node] [data-dec]').forEach((btn) => {
       btn.onclick = (e) => {
         e.stopPropagation();
-        const key = btn.closest('[data-rv-node]').dataset.rvNode;
-        this._decide(sid, key, btn.dataset.dec, { force: btn.dataset.force === '1' });
+        const node = btn.closest('[data-rv-node]');
+        const key = node.dataset.rvNode;
+        const sess = view.session;
+        if (normalizeReviewPolicy(sess.policy).mode === 'signoff') {
+          node.dataset.draftDecision = btn.dataset.dec;
+          node.querySelectorAll('[data-dec]').forEach((x) => x.classList.toggle('sel', x === btn));
+          node.querySelector('.rv-sign')?.focus();
+        } else {
+          this._decide(sid, key, btn.dataset.dec, { force: btn.dataset.force === '1' });
+        }
+      };
+    });
+    this.$reviews.querySelectorAll('[data-sign]').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const node = btn.closest('[data-rv-node]');
+        this._signNode(sid, node.dataset.rvNode, btn.dataset.sign);
       };
     });
     this.$reviews.querySelectorAll('[data-rv-node] .rv-reason').forEach((inp) => {
@@ -547,7 +673,11 @@ export class WorkbenchPanel {
         e.stopPropagation();
         const eff = node.querySelector('.rv-dec.sel');
         if (!eff) { this.hooks.toast('请先选择 通过 / 驳回 / 待复核', 'warn'); return; }
-        this._decide(sid, node.dataset.rvNode, eff.dataset.dec);
+        if (normalizeReviewPolicy(s.reviewSessionById(sid)?.policy).mode === 'signoff') {
+          this._signNode(sid, node.dataset.rvNode, 'sign');
+        } else {
+          this._decide(sid, node.dataset.rvNode, eff.dataset.dec);
+        }
       });
     });
   }
@@ -570,6 +700,7 @@ export class WorkbenchPanel {
         <button class="mini" data-rv-act="close" title="关闭会话（数据保留，可随时恢复）">✕</button>
       </div>
       ${this._reviewFilterBanner(view, onlyFiltered)}
+      ${this._reviewPolicyBanner(view)}
       ${this._reviewBaselineBanner(view)}
       ${this._reviewConflictBanner(view, conflict)}
       <div class="rv-progress">
@@ -614,6 +745,18 @@ export class WorkbenchPanel {
       <button class="mini" data-rv-act="apply-filter">恢复该筛选</button></div>`;
   }
 
+  _reviewPolicyBanner(view) {
+    const policy = normalizeReviewPolicy(view.session.policy);
+    if (policy.mode !== 'signoff') return '';
+    const rule = policy.completeRule === 'no-reject' ? '所有节点确认且最终无驳回' : '所有节点确认即可（允许驳回）';
+    const me = (this.store.actor || '').trim();
+    const allowed = me && policy.signers.includes(me);
+    return `<div class="rv-banner info">🔐 多人签署：允许 <b>${policy.signers.map(escapeHtml).join('、')}</b>；
+      每个节点需要 <b>${policy.required}</b> 个有效签名，完成条件：${escapeHtml(rule)}。
+      重复签名幂等；漂移、推进或冲突后旧签名保留但立即失效。
+      <span class="${allowed ? 'rv-ok' : 'rv-bad'}">当前署名：${escapeHtml(me || '未署名')}${allowed ? '（可签）' : '（不在名单）'}</span></div>`;
+  }
+
   _reviewBaselineBanner(view) {
     if (!view.baselineChanged) return '';
     const newCount = view.newNodes.length;
@@ -640,9 +783,12 @@ export class WorkbenchPanel {
       <div class="rv-prop-h">待合并的本地决定（${proposals.length}，409 后保留，未写入会话）</div>
       ${proposals.map((p, i) => {
         const sn = byKey.get(p.nodeKey);
+        const who = p.type === 'signature' ? escapeHtml(p.by || '未署名') : '';
+        const kind = p.type === 'signature' ? '本地签名' : '本地决定';
         return `<div class="rv-prop" data-prop-idx="${i}">
           <span class="rv-prop-node">${escapeHtml(sn?.title || p.nodeKey)}</span>
-          <span class="rv-mark m-${p.decision === 'pass' ? 'pass' : p.decision === 'reject' ? 'reject' : 'review'}">${DECISION_LABEL[p.decision]}</span>
+          ${who ? `<span class="rv-prop-who">${who}</span>` : ''}
+          <span class="rv-mark m-${p.decision === 'pass' ? 'pass' : p.decision === 'reject' ? 'reject' : 'review'}">${kind}：${DECISION_LABEL[p.decision]}</span>
           <span class="rv-prop-reason">${escapeHtml(p.reason || '（无理由）')}</span>
           <span class="spacer"></span>
           <button class="mini primary" data-rv-act="merge-prop" data-idx="${i}" title="以本地决定合并到最新快照（关闭该节点冲突）">采用本地</button>
@@ -653,7 +799,9 @@ export class WorkbenchPanel {
   }
 
   _reviewNodeHtml(view, sn) {
-    const eff = sn.autoReview ? 'review' : sn.decision;
+    const policy = normalizeReviewPolicy(view.session.policy);
+    const st = signatureState(sn, policy);
+    const eff = sn.autoReview ? 'review' : st.decision;
     const live = view.byKey.get(sn.key);
     const driftCodes = view.driftByKey.get(sn.key) || [];
     const orderNum = String((sn.order ?? 0) + 1).padStart(3, '0');
@@ -676,14 +824,97 @@ export class WorkbenchPanel {
       </div>
       ${badges ? `<div class="rvn-badges">${badges}</div>` : ''}
       <div class="rvn-decide">
-        ${DEC_BTN.map((b) =>
-          `<button class="mini rv-dec ${b.cls} ${eff === b.d ? 'sel' : ''}" data-dec="${b.d}">${b.label}</button>`).join('')}
-        <input class="rv-reason" type="text" maxlength="2000" placeholder="${
-          sn.decision === 'pending' ? '审阅理由（驳回 / 待复核必填）' : '审阅理由（修改后回车或点决定按钮保存）'
-        }" value="${escapeHtml(sn.reason || '')}" ${sn.absent ? 'disabled' : ''} />
-        <span class="rvn-who">${sn.decidedBy ? `${escapeHtml(sn.decidedBy)} · ${fmtTime(sn.decidedAt)}` : ''}</span>
+        ${this._reviewDecisionControls(view, sn, st, eff)}
       </div>
+      ${policy.mode === 'signoff' ? this._signatureListHtml(view, sn, st) : ''}
     </div>`;
+  }
+
+  _reviewDecisionControls(view, sn, st, eff) {
+    const policy = normalizeReviewPolicy(view.session.policy);
+    const disabled = sn.absent ? 'disabled' : '';
+    const reasonVal = sn.autoReview ? '' : (st.reason || sn.reason || '');
+    if (policy.mode !== 'signoff') {
+      return `${DEC_BTN.map((b) =>
+        `<button class="mini rv-dec ${b.cls} ${eff === b.d ? 'sel' : ''}" data-dec="${b.d}">${b.label}</button>`).join('')}
+      <input class="rv-reason" type="text" maxlength="2000" placeholder="${
+        sn.decision === 'pending' ? '审阅理由（驳回 / 待复核必填）' : '审阅理由（修改后回车或点决定按钮保存）'
+      }" value="${escapeHtml(sn.reason || '')}" ${disabled} />
+      <span class="rvn-who">${sn.decidedBy ? `${escapeHtml(sn.decidedBy)} · ${fmtTime(sn.decidedAt)}` : ''}</span>`;
+    }
+    const me = (this.store.actor || '').trim();
+    const mine = st.active.find((s) => s.by === me);
+    return `${DEC_BTN.map((b) =>
+      `<button class="mini rv-dec ${b.cls} ${mine?.decision === b.d ? 'sel' : ''}" data-dec="${b.d}" ${disabled}>${b.label}</button>`).join('')}
+      <input class="rv-reason" type="text" maxlength="2000" placeholder="本次签名理由（驳回 / 待复核必填）" value="${escapeHtml(mine?.reason || '')}" ${disabled} />
+      <button class="mini primary rv-sign" data-sign="sign" ${me && !sn.absent ? '' : 'disabled'}
+        title="${me ? '用当前署名单独签名确认所选决定' : '请先在审计页填写操作者署名'}">✍ 签名确认</button>
+      <span class="rvn-who">${st.confirmed ? `已确认 ${st.active.length}/${policy.required}` : `待签名 ${st.active.length}/${policy.required}`}</span>`;
+  }
+
+  _signatureListHtml(view, sn, st) {
+    const policy = normalizeReviewPolicy(view.session.policy);
+    const activeIds = new Set(st.active.map((s) => s.id));
+    const rows = (sn.signatures || []).slice().sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0)).map((sg) => {
+      const valid = !sg.invalid;
+      return `<li class="${valid ? 'sig-ok' : 'sig-bad'}" title="${valid ? '有效签名' : escapeHtml(sg.invalid?.reason || '签名已失效')}">
+        <b>${escapeHtml(sg.by)}</b> · ${DECISION_LABEL[sg.decision]} · ${fmtTime(sg.at)}
+        ${sg.reason ? ` · ${escapeHtml(sg.reason)}` : ''}
+        ${valid ? '<span class="rv-ok">有效</span>' : `<span class="rv-bad">已失效：${escapeHtml(sg.invalid?.code || 'invalid')}</span>`}
+      </li>`;
+    }).join('');
+    const unsigned = policy.signers.filter((name) => !st.active.some((s) => s.by === name));
+    return `<div class="rv-signatures">
+      <div class="rv-sig-h">签名明细：已签 ${st.active.length}/${policy.required}；未签 ${unsigned.map(escapeHtml).join('、') || '无'}</div>
+      <ul class="rv-sig-list">${rows || '<li class="rv-none">还没有签名。</li>'}</ul>
+    </div>`;
+  }
+
+  _signNode(sid, key, action) {
+    const view = this.store.reviewView(sid);
+    const sn = view?.session.nodes.find((n) => n.key === key);
+    if (!sn) return;
+    const policy = normalizeReviewPolicy(view.session.policy);
+    const me = (this.store.actor || '').trim();
+    if (!me) { this.hooks.toast('请先在审计页填写操作者署名，再签名确认', 'warn'); return; }
+    if (!isAllowedSigner(policy, me)) {
+      this.hooks.toast(`当前署名「${me}」不在本节点允许名单：${policy.signers.join('、')}`, 'error');
+      return;
+    }
+    const nodeEl = this.$reviews.querySelector(`[data-rv-node="${CSS.escape(key)}"]`);
+    const decision = nodeEl?.dataset.draftDecision
+      || activeSignatures(sn).find((s) => s.by === me)?.decision
+      || nodeEl?.querySelector('[data-dec].sel')?.dataset.dec;
+    if (!decision) { this.hooks.toast('请先选择 通过 / 驳回 / 待复核，再签名确认', 'warn'); return; }
+    const input = nodeEl?.querySelector('.rv-reason');
+    const reason = input ? input.value : '';
+    if ((decision === 'reject' || decision === 'review') && !String(reason || '').trim()) {
+      this.hooks.toast('驳回 / 待复核签名必须填写理由', 'warn');
+      input?.focus();
+      return;
+    }
+    const res = this.store.submitReviewSignature(sid, key, decision, reason);
+    if (res.ok) {
+      this.hooks.toast(res.idempotent ? '签名已存在：幂等返回，未重复写入' : `已由 ${me} 单独签名确认`);
+      return;
+    }
+    if (res.status === 403) {
+      this.hooks.toast(`签名被拒绝：不在允许名单（${(res.allowed || []).join('、')}）`, 'error');
+      return;
+    }
+    if (res.status === 409) {
+      const text = {
+        'review-advanced': '另一窗口已推进本会话（409）：本地签名已保留，可在待合并区逐项合入',
+        'baseline-changed': '筛选基线已变化（409）：本地签名已保留，请刷新基线或逐项合并',
+        'node-missing': '节点已缺失（409）：本地签名已保留，可刷新基线后处理',
+        corrupt: '节点已损坏（409）：本地签名已保留，需重新核对后再签',
+        'fingerprint-changed': '节点指纹已变化（409）：本地签名已保留，请重新签署最新快照',
+        'branch-advanced': '分支已推进（409）：本地签名已保留，请重新签署',
+      }[res.reason] || `409 冲突：${res.reason}`;
+      this.hooks.toast(text, 'error');
+      return;
+    }
+    this.hooks.toast(res.error || '签名失败', 'error');
   }
 
   _decide(sid, key, decision, { force = false } = {}) {
@@ -748,10 +979,10 @@ export class WorkbenchPanel {
       const p = proposals[idx];
       if (!p) return;
       if (act === 'discard-prop') {
-        s.discardReviewProposal(sid, p.nodeKey);
+        s.discardReviewProposal(sid, p.nodeKey, { signatureId: p.sig?.id || null });
         this.hooks.toast('已放弃该本地决定（采用服务端最新值）');
       } else {
-        const res = s.mergeReviewItem(sid, p.nodeKey, p.decision, p.reason);
+        const res = s.mergeReviewItem(sid, p.nodeKey, p.decision, p.reason, { proposal: p, by: p.by });
         if (!res.ok) { this.hooks.toast(res.error || '合并失败', 'error'); return; }
         this.hooks.toast(`已把本地「${DECISION_LABEL[p.decision]}」合并到最新快照（冲突记录已关闭）`);
       }
