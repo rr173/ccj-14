@@ -22,19 +22,26 @@ import { solve, findCycle } from './solver.js';
 import { validate, normalize, seedModel, uid } from './model.js';
 import { snapshotVersion, compareVersions } from './versions.js';
 import {
-  MAIN_BRANCH, makeRootEvent, makeEvent, makeForkRootEvent,
+  MAIN_BRANCH, makeRootEvent, makeEvent, makeForkRootEvent, makeExperimentForkRootEvent,
   sanitizeAudit, migrateLegacy, timelineFor, localSeqOf, isAncestor,
   mergeDocs, assessConflict, freeze,
 } from './audit.js';
+import {
+  makeExperiment, prepareSpecs, executeVariant, makeVariantResult,
+  sanitizeExperiments, mergeExperiments, experimentConfigHash,
+  diffVariant, variantReplayable, reconcileRunState, variantCounters,
+} from './experiments.js';
 
 const LS_KEY = 'rect-constraints-doc-v2';
 const LS_KEY_LEGACY = 'rect-constraints-doc-v1';
 const ACTOR_KEY = 'rect-constraints-actor';
 
 export class Store extends EventTarget {
-  constructor({ base = '' } = {}) {
+  constructor({ base = '', tickMs = 25, onVariantGate = null } = {}) {
     super();
     this.base = base;
+    this.tickMs = tickMs;           // 变体之间的让出间隔（暂停/继续/取消的响应粒度）
+    this.onVariantGate = onVariantGate; // 测试钩子：每个变体求解前同步调用
     this.events = [];
     this.eventsById = new Map();
     this.branches = [];
@@ -48,6 +55,10 @@ export class Store extends EventTarget {
     this.compare = { a: null, b: null };
     this.branchCompare = { a: null, b: null }; // 分支比较选择（持久化）
     this.auditWarnings = [];
+
+    this.experiments = [];
+    this.experimentWarnings = [];
+    this._runners = new Map();   // experimentId -> {token}（进行中的批量运行）
 
     this.dragPreview = null;
     this.saveConflict = null;   // null | { reason, branchName, headSeq }
@@ -144,6 +155,11 @@ export class Store extends EventTarget {
       b: this.branches.some((b) => b.id === bc.b) ? bc.b : null,
     };
 
+    // 布局方案实验：结构/指纹清洗（变体结果损坏只标该变体，实验照常打开）
+    this.experimentWarnings = [];
+    this.experiments = sanitizeExperiments(doc.experiments, this.experimentWarnings);
+    this._runners = new Map();
+
     this.replayEventId = null;
     this.dragPreview = null;
     this.saveConflict = null;
@@ -168,6 +184,7 @@ export class Store extends EventTarget {
       currentVersionId: this.currentVersionId,
       compare: this.compare,
       branchCompare: this.branchCompare,
+      experiments: this.experiments,
       actor: this.actor,
     };
   }
@@ -176,13 +193,16 @@ export class Store extends EventTarget {
   _saveChain = Promise.resolve();
   _saveVersion = 0;
   persist() {
+    if (this._disposed) return; // dispose() 后一切迟到的防抖保存都是 no-op
     if (this.saveConflict) return; // 冲突未解决：不再写任何存储
     const payload = this._payload();
     let merged = null;
+    let prevExperiments = null;
     try {
       let prev = JSON.parse(localStorage.getItem(LS_KEY) || 'null')
         || JSON.parse(localStorage.getItem(LS_KEY_LEGACY) || 'null');
       if (prev) {
+        prevExperiments = Array.isArray(prev.experiments) ? prev.experiments : null;
         // 连续同步 commit 时，第一次的防抖 PUT 可能还没发出，localStorage 里
         // 尚不含本页刚追加的事件：只把本页已知事件按 id 并集补进去
         // （绝不能快进磁盘上的分支 head，否则会掩盖别的页签对同分支的推进）。
@@ -193,7 +213,10 @@ export class Store extends EventTarget {
         if (this.saveConflict) return;
       }
       // 本地多页签合流：merged 已含本页当前分支最新提交，直接落合并结果
-      localStorage.setItem(LS_KEY, JSON.stringify(merged || { ...payload, rev: this.rev }));
+      const finalDoc = merged || { ...payload, rev: this.rev };
+      // 实验按 id 合入磁盘（别的页签可能建了实验；完成结果永不被降级覆盖）
+      finalDoc.experiments = mergeExperiments(prevExperiments || finalDoc.experiments || [], payload.experiments);
+      localStorage.setItem(LS_KEY, JSON.stringify(finalDoc));
     } catch {}
     this._emit('persist');
     ++this._saveVersion;
@@ -586,6 +609,224 @@ export class Store extends EventTarget {
     this._dirty = true;
     this.persist();
     this._emit('branch', { type: 'compare' });
+  }
+
+  /* ---------- 布局方案实验 ---------- */
+
+  experimentById(id) { return this.experiments.find((x) => x.id === id) || null; }
+
+  /**
+   * 从当前编辑分支（head，或正在回放的历史事件）建立实验并立即排队批量求解。
+   * 幂等：相同来源事件 + 相同有序参数变体（名称只是标签，不参与指纹）只返回已存在的实验。
+   */
+  createExperiment(rawSpecs, { name = '', sourceEventId = null } = {}) {
+    if (this.saveConflict) return { ok: false, error: '版本冲突未解决，请先重新加载' };
+    const srcId = sourceEventId || this.replayEventId || this.branch.headEventId;
+    const event = this.eventsById.get(srcId);
+    if (!event || event.corrupt || !event.model) return { ok: false, error: '来源事件不可用（缺失或损坏），无法建立实验' };
+    let specs;
+    try {
+      specs = prepareSpecs(rawSpecs, event.model);
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+    const ch = experimentConfigHash(event.id, specs);
+    const dup = this.experiments.find((x) => x.source?.eventId === event.id && x.configHash === ch);
+    if (dup) {
+      this._emit('experiments', { type: 'idempotent', id: dup.id });
+      return { ok: true, experiment: dup, idempotent: true };
+    }
+    const t = Date.now();
+    const exp = makeExperiment({
+      name: String(name || '').trim() || `实验 ${this.experiments.length + 1}`,
+      actor: this.actor || '未署名', event, specs, t,
+    });
+    exp.runState = 'running'; // 创建即入队并自动开始批量求解
+    this.experiments = [...this.experiments, exp];
+    this._dirty = true;
+    this.persist();
+    this._emit('experiments', { type: 'create', id: exp.id });
+    this._startRunner(exp.id);
+    return { ok: true, experiment: exp, idempotent: false };
+  }
+
+  /** 实验是否仍有排队变体（可继续/可暂停/可取消的前提）。 */
+  _hasQueued(exp) { return exp.variants.some((v) => v.status === 'queued'); }
+
+  _tick() { return new Promise((r) => setTimeout(r, this.tickMs)); }
+
+  _bumpExp(exp, { now = true } = {}) {
+    exp.updatedAt = Date.now();
+    this._dirty = true;
+    this.persist();
+    if (now) this._emit('experiments', { type: 'progress', id: exp.id });
+  }
+
+  /**
+   * 批量运行器：按 variants 顺序逐个求解；每个变体之间让出事件循环，
+   * 以响应暂停/继续/取消。单个变体失败只标 failed，绝不阻塞其他变体。
+   * 完成结果只写一次：done/failed/cancelled 是终态，后续运行绝不覆盖。
+   */
+  async _startRunner(expId) {
+    // 运行中的实验不重复启动；暂停后继续会安装新 token（旧运行器下一拍让出）
+    const cur = this._runners.get(expId);
+    const exp0 = this.experiments.find((x) => x.id === expId);
+    if (cur && exp0 && exp0.runState === 'running') return;
+    const token = {};
+    this._runners.set(expId, { token });
+    try {
+      await this._runQueue(expId, token);
+    } finally {
+      if (this._runners.get(expId)?.token === token) this._runners.delete(expId);
+    }
+  }
+
+  async _runQueue(expId, token) {
+    for (;;) {
+      const exp = this.experiments.find((x) => x.id === expId);
+      if (!exp || token.cancelled) return;
+      if (exp.runState !== 'running') return;              // 暂停 / 取消：让出，等继续
+      const idx = exp.variants.findIndex((v) => v.status === 'queued');
+      if (idx < 0) {
+        exp.runState = reconcileRunState('done', exp.variants);
+        this._bumpExp(exp);
+        return;
+      }
+      await this._tick();                                  // 暂停/继续/取消的响应点
+      const exp2 = this.experiments.find((x) => x.id === expId);
+      if (!exp2 || token.cancelled || this._runners.get(expId)?.token !== token || exp2.runState !== 'running') return;
+      this.onVariantGate?.(expId, idx);
+      const variant = exp2.variants[idx];
+      if (variant.status !== 'queued') continue;           // 终态不覆盖（防御）
+      const startedAt = Date.now();
+      variant.status = 'running';
+      this._bumpExp(exp2);
+
+      let outcome;
+      try {
+        outcome = executeVariant(exp2, variant);
+      } catch (e) {
+        outcome = { ok: false, error: `求解异常：${e.message}` };
+      }
+      const exp3 = this.experiments.find((x) => x.id === expId);
+      if (!exp3 || token.cancelled || this._runners.get(expId)?.token !== token) return;
+      const v3 = exp3.variants.find((v) => v.id === variant.id);
+      if (!v3 || v3.status === 'done' || v3.status === 'failed') continue; // 终态不覆盖
+      v3.attempts += 1;
+      if (outcome.ok) {
+        v3.status = 'done';
+        v3.error = null;
+        v3.result = makeVariantResult(outcome, { startedAt, completedAt: Date.now() });
+      } else {
+        v3.status = 'failed';
+        v3.error = outcome.error || '求解失败';
+      }
+      if (!exp3.variants.some((v) => v.status === 'queued')) {
+        exp3.runState = exp3.variants.some((v) => v.status === 'cancelled') ? 'cancelled' : 'done';
+      }
+      this._bumpExp(exp3);
+    }
+  }
+
+  pauseExperiment(id) {
+    const exp = this.experiments.find((x) => x.id === id);
+    if (!exp) return { ok: false, error: '实验不存在' };
+    if (!['queued', 'running'].includes(exp.runState)) return { ok: false, error: '该实验已结束，不能暂停' };
+    exp.runState = 'paused';   // 运行器在下一拍（变体之间）让出；正在求解的当前变体正常完成
+    this._bumpExp(exp);
+    return { ok: true };
+  }
+
+  /** 继续：把仍在求解中的“running 变体”视为未落盘（刷新语义），重新排队后重跑。 */
+  resumeExperiment(id) {
+    const exp = this.experiments.find((x) => x.id === id);
+    if (!exp) return { ok: false, error: '实验不存在' };
+    if (!['paused', 'queued'].includes(exp.runState)) return { ok: false, error: '该实验不在暂停/排队状态' };
+    if (!this._hasQueued(exp)) return { ok: false, error: '没有排队中的变体' };
+    exp.runState = 'running';
+    this._dirty = true;
+    this.persist();
+    this._emit('experiments', { type: 'resume', id });
+    this._startRunner(id);
+    return { ok: true };
+  }
+
+  /** 取消：所有排队变体进入 cancelled 终态（完成的结果保留、不覆盖），实验终态 cancelled。 */
+  cancelExperiment(id) {
+    const exp = this.experiments.find((x) => x.id === id);
+    if (!exp) return { ok: false, error: '实验不存在' };
+    if (['done', 'cancelled'].includes(exp.runState)) return { ok: false, error: '该实验已结束' };
+    const r = this._runners.get(id);
+    if (r) r.token.cancelled = true;
+    for (const v of exp.variants) if (v.status === 'queued') v.status = 'cancelled';
+    exp.runState = 'cancelled';
+    this._bumpExp(exp);
+    return { ok: true };
+  }
+
+  /** 测试/卸载用：停止批量运行器并作废所有防抖保存（之后 persist 完全 no-op）。 */
+  dispose() {
+    this._disposed = true;
+    this._runners.clear();
+    clearTimeout(this._saveTimer);
+    this._saveChain = Promise.resolve();
+    this._sendLatest = () => Promise.resolve();
+  }
+
+  /** 测试用：等到该实验不再有运行中的变体且运行器已收尾。 */
+  async experimentSettled(id) {
+    for (let i = 0; i < 100000; i++) {
+      const exp = this.experiments.find((x) => x.id === id);
+      if (exp && !exp.variants.some((v) => v.status === 'running' || v.status === 'queued') && !this._runners.has(id)) return exp;
+      if (exp && this._runners.has(id)) await this._tick();
+      else await Promise.resolve();
+    }
+    throw new Error('experimentSettled 超时');
+  }
+
+  experimentCounters(exp) { return variantCounters(exp.variants); }
+
+  /** 完成变体相对基准的矩形/约束/冲突差异（基准损坏或变体不可回放 → null）。 */
+  diffVariant(expId, variantId) {
+    const exp = this.experiments.find((x) => x.id === expId);
+    const v = exp?.variants.find((x) => x.id === variantId);
+    if (!exp || !v) return null;
+    return diffVariant(exp, v);
+  }
+
+  /**
+   * 把任意完成变体另存为新的编辑分支：fork-root 与变体结果同指纹，
+   * provenance 记录实验来源关系；基准事件 / 实验结果 / 原分支都不被改写。
+   */
+  forkExperimentVariant(expId, variantId, name) {
+    name = String(name ?? '').trim();
+    if (!name) return { ok: false, error: '分支名称不能为空' };
+    if (this.branches.some((b) => b.name === name)) return { ok: false, error: `已存在同名分支「${name}」` };
+    const exp = this.experiments.find((x) => x.id === expId);
+    const v = exp?.variants.find((x) => x.id === variantId);
+    if (!exp || !v) return { ok: false, error: '变体不存在' };
+    if (!variantReplayable(v)) return { ok: false, error: '该变体结果损坏或未完成，无法另存为分支' };
+
+    const id = uid('b');
+    const root = makeExperimentForkRootEvent(id, v, exp, { actor: this.actor || '未署名' });
+    this.events = [...this.events, root];
+    this.eventsById.set(root.id, root);
+    const branch = freeze({
+      id, name, createdAt: root.t,
+      rootEventId: root.id, headEventId: root.id, redoTipId: null,
+      source: { branchId: exp.source?.branchId || null, eventId: exp.source?.eventId || root.id },
+      experimentSource: { experimentId: exp.id, variantId: v.id },
+    });
+    this.branches = [...this.branches, branch];
+    this.currentBranchId = id;
+    this.replayEventId = null;
+    this._syncedHeads[id] = root.id;
+    this._dirty = true;
+    this.persist();
+    this._emit('branch', { type: 'fork', id, sourceEventId: root.id, fromExperiment: true });
+    this._emit('experiments', { type: 'fork', id: expId });
+    this._emit('change', { label: 'experiment-fork' });
+    return { ok: true, branch, event: root };
   }
 
   /* ---------- 布局版本（只读快照） ---------- */

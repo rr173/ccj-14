@@ -3,6 +3,7 @@ import { View } from './geom/view.js';
 import { ConstraintDialog } from './geom/dialog.js';
 import { VersionPanel } from './geom/versionpanel.js';
 import { AuditPanel } from './geom/auditpanel.js';
+import { ExperimentPanel } from './geom/experimentpanel.js';
 import {
   newRect, newSnap, newMinGap, newContain, newLock,
 } from './geom/model.js';
@@ -57,6 +58,7 @@ dialog.hooks = { onCycle: (cyc) => view.setCycleHighlight(cyc) };
 
 const versionPanel = new VersionPanel(store, { toast });
 const auditPanel = new AuditPanel(store, { toast });
+const experimentPanel = new ExperimentPanel(store, { toast });
 
 let activeTab = 'constraints';
 
@@ -105,7 +107,7 @@ window.addEventListener('keydown', (e) => {
   else if (e.key.toLowerCase() === 'a' && !typing && (e.ctrlKey || e.metaKey)) {
     e.preventDefault(); view.select(store.model.rects.map((r) => r.id));
   } else if (e.key === 'Escape') {
-    dialog.close(); view.clearSelection(); view.setCycleHighlight(null);
+    dialog.close(); experimentPanel.closeEditor(); view.clearSelection(); view.setCycleHighlight(null);
   }
 });
 
@@ -197,6 +199,7 @@ function renderPanels() {
   renderConflicts();
   versionPanel.render();
   auditPanel.render();
+  experimentPanel.render();
   updateButtons();
   updateChips();
 }
@@ -415,10 +418,15 @@ function updateBranchChip() {
   if (!b) return;
   const head = store.eventsById.get(b.headEventId);
   const src = b.source ? store.branches.find((x) => x.id === b.source.branchId) : null;
+  const expSrc = b.experimentSource ? store.experiments.find((x) => x.id === b.experimentSource.experimentId) : null;
   chip.textContent = `⎘ ${b.name} #${head?.seq ?? '?'}`;
-  chip.title = src
-    ? `分支「${b.name}」，来自「${src.name}」的历史事件；本分支提交不影响原分支`
-    : `当前编辑分支「${b.name}」，审计事件 #${head?.seq ?? '?'}`;
+  if (expSrc) {
+    chip.title = `分支「${b.name}」来自实验「${expSrc.name}」的变体另存；实验结果与基准事件未被改写`;
+  } else if (src) {
+    chip.title = `分支「${b.name}」，来自「${src.name}」的历史事件；本分支提交不影响原分支`;
+  } else {
+    chip.title = `当前编辑分支「${b.name}」，审计事件 #${head?.seq ?? '?'}`;
+  }
 }
 
 function updateReplayBanner() {

@@ -27,6 +27,7 @@
 import { solve } from './solver.js';
 import { validate, normalize, seedModel, uid } from './model.js';
 import { compareVersions } from './versions.js';
+import { mergeExperiments } from './experiments.js';
 
 export const MAIN_BRANCH = 'main';
 
@@ -84,6 +85,36 @@ export function makeForkRootEvent(newBranchId, source, sourceBranch, { actor, t 
     changes: null,
     conflicts: structuredClone(source.conflicts || source.report?.conflicts || []),
     provenance: { branchId: sourceBranch.id, eventId: source.id, seq: source.seq },
+  });
+}
+
+/**
+ * 从布局方案实验的一个完成变体构造 fork-root 事件：
+ * 内容与变体结果逐字节相同（同指纹），带实验来源 provenance；
+ * 基准事件与实验结果都不被改写。来源分支不存在时 branchName 可为空。
+ */
+export function makeExperimentForkRootEvent(newBranchId, variantResult, exp, { actor, t = Date.now() }) {
+  const v = variantResult;
+  return freeze({
+    id: uid('e'), branch: newBranchId, parentId: null, kind: 'fork-root', seq: 1, t,
+    actor: String(actor || '未署名'),
+    label: `从实验「${exp.name}」的变体「${v.name}」另存为分支`,
+    model: structuredClone(v.result.model),
+    report: structuredClone(v.result.report),
+    hash: v.result.hash,
+    hashBefore: v.result.hash,
+    changes: null,
+    conflicts: structuredClone(v.result.conflicts || v.result.report?.conflicts || []),
+    provenance: {
+      kind: 'experiment',
+      experimentId: exp.id,
+      experimentName: exp.name,
+      variantId: v.id,
+      variantName: v.name,
+      branchId: exp.source?.branchId || null,
+      eventId: exp.source?.eventId || null,
+      seq: exp.source?.seq ?? null,
+    },
   });
 }
 
@@ -257,6 +288,11 @@ export function sanitizeAudit(doc) {
       headEventId: headId,
       redoTipId,
       source: root.provenance ? { branchId: root.provenance.branchId, eventId: root.provenance.eventId } : null,
+      ...(root.provenance?.kind === 'experiment'
+        ? { experimentSource: { experimentId: root.provenance.experimentId, variantId: root.provenance.variantId } }
+        : (b0.experimentSource && typeof b0.experimentSource === 'object'
+          ? { experimentSource: { experimentId: String(b0.experimentSource.experimentId || ''), variantId: String(b0.experimentSource.variantId || '') } }
+          : {})),
     }));
   }
 
@@ -439,11 +475,17 @@ export function mergeDocs(serverDoc, clientDoc) {
   const vs = new Map((serverDoc.versions || []).map((v) => [v.id, v]));
   for (const v of clientDoc.versions || []) if (!vs.has(v.id)) vs.set(v.id, v);
 
+  const experiments = mergeExperiments(
+    Array.isArray(serverDoc.experiments) ? serverDoc.experiments : [],
+    Array.isArray(clientDoc.experiments) ? clientDoc.experiments : [],
+  );
+
   return {
     ...serverDoc,
     events: [...evs.values()],
     branches: outBranches,
     versions: [...vs.values()],
+    experiments,
     currentVersionId: serverDoc.currentVersionId ?? null,
     compare: serverDoc.compare || { a: null, b: null },
     branchCompare: serverDoc.branchCompare || { a: null, b: null },

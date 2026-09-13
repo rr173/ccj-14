@@ -124,6 +124,24 @@ def _valid_shape(doc):
         m = v.get("model")
         if not isinstance(m, dict) or not isinstance(m.get("rects"), list) or not isinstance(m.get("constraints"), list):
             return False
+    # 布局方案实验（可为空）：只做轻量结构校验，指纹/损坏清洗在浏览器
+    experiments = doc.get("experiments", [])
+    if not isinstance(experiments, list):
+        return False
+    for x in experiments:
+        if not isinstance(x, dict) or not isinstance(x.get("id"), str) or not isinstance(x.get("name"), str):
+            return False
+        bm = x.get("baseModel")
+        if not isinstance(bm, dict) or not isinstance(bm.get("rects"), list) or not isinstance(bm.get("constraints"), list):
+            return False
+        vs2 = x.get("variants")
+        if not isinstance(vs2, list) or not vs2:
+            return False
+        for vv in vs2:
+            if not isinstance(vv, dict) or not isinstance(vv.get("id"), str):
+                return False
+            if vv.get("status") not in (None, "queued", "running", "done", "failed", "cancelled"):
+                return False
     return True
 
 
@@ -163,6 +181,98 @@ def _assess_conflict(cur, doc):
     return True, None
 
 
+def _variant_rank(v):
+    if v.get("corrupt"):
+        return 0
+    return {"queued": 0, "running": 1, "cancelled": 2, "failed": 3, "done": 4}.get(v.get("status"), 0)
+
+
+def _merge_variant(a, b):
+    """同 web/js/geom/experiments.js mergeVariant：走得更远的状态胜出，完成结果不降级。"""
+    win = b if _variant_rank(b) > _variant_rank(a) else a
+    out = dict(a)
+    out["name"] = a.get("name")
+    out["order"] = a.get("order", b.get("order"))
+    out["changes"] = a.get("changes")
+    out["status"] = win.get("status")
+    out["error"] = win.get("error", a.get("error"))
+    try:
+        out["attempts"] = max(int(a.get("attempts") or 0), int(b.get("attempts") or 0))
+    except (TypeError, ValueError):
+        out["attempts"] = 0
+    good_a = a.get("result") if not a.get("corrupt") else None
+    good_b = b.get("result") if not b.get("corrupt") else None
+    result = good_a or good_b or a.get("result") or b.get("result")
+    out["result"] = result
+    if not result and (a.get("corrupt") or b.get("corrupt")):
+        out["corrupt"] = True
+        out["corruptReason"] = a.get("corruptReason") or b.get("corruptReason") or "结果损坏"
+    else:
+        out.pop("corrupt", None)
+        out.pop("corruptReason", None)
+    return out
+
+
+def _experiment_terminal_count(x):
+    return sum(1 for v in x.get("variants", []) if v.get("status") in ("done", "failed", "cancelled"))
+
+
+def _merge_one_experiment(s, c):
+    """同 mergeOneExperiment：变体按 id 合并，完成数更多的一方决定实验级运行状态。"""
+    sv = {v["id"]: v for v in s.get("variants", []) if isinstance(v, dict) and isinstance(v.get("id"), str)}
+    order = [v["id"] for v in s.get("variants", []) if isinstance(v, dict) and isinstance(v.get("id"), str)]
+    for cv in c.get("variants", []):
+        if not isinstance(cv, dict) or not isinstance(cv.get("id"), str):
+            continue
+        cid = cv["id"]
+        if cid not in sv:
+            sv[cid] = cv
+            order.append(cid)
+        else:
+            sv[cid] = _merge_variant(sv[cid], cv)
+    variants = [sv[i] for i in order]
+    winner = c if _experiment_terminal_count(c) > _experiment_terminal_count(s) else s
+    has_running = any(v.get("status") == "running" for v in variants)
+    has_queued = any(v.get("status") == "queued" for v in variants)
+    has_cancelled = any(v.get("status") == "cancelled" for v in variants)
+    rs = winner.get("runState")
+    if has_running:
+        state = "running"
+    elif rs == "cancelled":
+        state = "cancelled"
+    elif has_queued:
+        state = "paused" if rs in ("running", "paused") else "queued"
+    else:
+        state = "cancelled" if (has_cancelled or rs == "cancelled") else "done"
+    merged = dict(s)
+    merged["variants"] = variants
+    try:
+        merged["updatedAt"] = max(int(s.get("updatedAt") or 0), int(c.get("updatedAt") or 0))
+    except (TypeError, ValueError):
+        merged["updatedAt"] = s.get("updatedAt", 0)
+    merged["runState"] = state
+    if s.get("baseCorrupt") or c.get("baseCorrupt"):
+        merged["baseCorrupt"] = True
+    return merged
+
+
+def _merge_experiments(server_list, client_list):
+    """实验按 id 并集（与 web/js/geom/experiments.js mergeExperiments 同构）。"""
+    by_id = {}
+    order = []
+    for x in list(server_list or []) + list(client_list or []):
+        if not isinstance(x, dict) or not isinstance(x.get("id"), str):
+            continue
+        xid = x["id"]
+        if xid not in by_id:
+            by_id[xid] = x
+            order.append(xid)
+        else:
+            # 后出现的是 client 侧
+            by_id[xid] = _merge_one_experiment(by_id[xid], x)
+    return [by_id[i] for i in order]
+
+
 def _merge_docs(server_doc, client_doc):
     """跨分支并发合流。与 web/js/geom/audit.js mergeDocs 同构。"""
     evs = {e["id"]: e for e in server_doc.get("events", []) if isinstance(e, dict)}
@@ -185,11 +295,14 @@ def _merge_docs(server_doc, client_doc):
         if isinstance(v, dict):
             vs.setdefault(v["id"], v)
 
+    experiments = _merge_experiments(server_doc.get("experiments", []), client_doc.get("experiments", []))
+
     merged = dict(server_doc)
     merged.update({
         "events": list(evs.values()),
         "branches": out_branches,
         "versions": list(vs.values()),
+        "experiments": experiments,
         "currentVersionId": server_doc.get("currentVersionId"),
         "compare": server_doc.get("compare", {"a": None, "b": None}),
         "branchCompare": server_doc.get("branchCompare", {"a": None, "b": None}),

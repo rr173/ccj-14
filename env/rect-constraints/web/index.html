@@ -68,6 +68,7 @@
         <button class="tab" data-tab="conflicts">冲突 <span id="conflict-count" class="badge">0</span></button>
         <button class="tab" data-tab="versions">版本 <span id="version-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="audit">审计/分支 <span id="audit-count" class="badge zero">0</span></button>
+        <button class="tab" data-tab="experiments">实验 <span id="exp-count" class="badge zero">0</span></button>
       </div>
 
       <div class="tab-body" data-body="constraints">
@@ -119,8 +120,38 @@
         </div>
         <div id="branch-compare-result"></div>
       </div>
+
+      <div class="tab-body hidden" data-body="experiments">
+        <div class="exp-bar">
+          <button id="btn-new-experiment" class="primary">⚗ 从当前分支建立实验…</button>
+        </div>
+        <div class="note" style="margin:0 0 10px">
+          实验从当前编辑分支（回放中则为该历史时刻）派生：定义多组矩形位置/尺寸、约束启停与优先级变体，
+          批量确定性求解。每个变体保存完整模型、求解结果、冲突链与指纹；完成结果不可覆盖，可与基准比较或另存为新分支。
+        </div>
+        <div id="exp-warnings" class="audit-warnings hidden"></div>
+        <div id="experiment-list" class="list"></div>
+      </div>
     </aside>
   </main>
+</div>
+
+<!-- 新建实验对话框 -->
+<div id="exp-dlg" class="modal hidden">
+  <div class="modal-card" style="width:640px">
+    <div class="modal-head">
+      <span>⚗ 新建布局方案实验</span>
+      <span class="spacer"></span>
+      <button id="exp-dlg-close" class="icon-btn">✕</button>
+    </div>
+    <div id="exp-dlg-body"></div>
+    <div class="modal-foot">
+      <span id="exp-dlg-error" class="dlg-error"></span>
+      <span class="spacer"></span>
+      <button id="exp-dlg-cancel">取消</button>
+      <button id="exp-dlg-ok" class="primary">建立并批量运行</button>
+    </div>
+  </div>
 </div>
 
 <!-- 添加约束对话框 -->
