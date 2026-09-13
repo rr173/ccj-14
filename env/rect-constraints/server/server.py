@@ -306,6 +306,8 @@ def _merge_docs(server_doc, client_doc):
         "currentVersionId": server_doc.get("currentVersionId"),
         "compare": server_doc.get("compare", {"a": None, "b": None}),
         "branchCompare": server_doc.get("branchCompare", {"a": None, "b": None}),
+        # 审计工作台视图状态（筛选/回放位置/前后面）：服务端为准，缺失时采用客户端
+        "auditWorkbench": server_doc.get("auditWorkbench") or client_doc.get("auditWorkbench"),
         "currentBranchId": cur if cur in sb or cur in cb else server_doc.get("currentBranchId", "main"),
         "actor": client_doc.get("actor") or server_doc.get("actor", ""),
     })

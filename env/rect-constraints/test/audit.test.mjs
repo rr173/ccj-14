@@ -152,7 +152,9 @@ test('每次提交追加不可变审计事件：操作者/时间/前后指纹/�
 
 test('冲突结果记入事件；同模型事件回放 report 逐字节一致', async () => {
   const { s } = await freshStore();
-  const A = s.model.rects[0].id, C = s.model.rects[2].id;
+  // 按名称取矩形（rects 按随机 id 排序，索引 [0]/[2] 在不同运行指向不同矩形会让冲突数抖动）
+  const A = s.model.rects.find((r) => r.name === '卡片A').id;
+  const C = s.model.rects.find((r) => r.name === '按钮组C').id;
   s.commit((m) => {
     m.constraints.push(
       { id: 'cx1', kind: 'snap', rect: C, other: A, axis: 'x', edge: 'l', otherEdge: 'l', gap: 0, priority: 95, enabled: true },

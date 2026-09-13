@@ -228,10 +228,11 @@ export function sanitizeAudit(doc) {
   }
 
   // 父链完整性：父事件缺失 → 该事件不可回放
-  for (const ev of byId.values()) {
-    if (ev.corrupt || !ev.parentId) continue;
-    if (!byId.has(ev.parentId)) {
-      markCorrupt(ev, '父事件丢失，审计链断裂');
+  for (const [id, ev0] of byId) {
+    if (ev0.corrupt || !ev0.parentId) continue;
+    if (!byId.has(ev0.parentId)) {
+      const ev = markCorrupt({ ...ev0 }, '父事件丢失，审计链断裂');
+      byId.set(id, ev);
       warnings.push({ level: 'error', text: `审计事件「${ev.label}」的父事件丢失，无法回放` });
     }
   }
@@ -489,6 +490,8 @@ export function mergeDocs(serverDoc, clientDoc) {
     currentVersionId: serverDoc.currentVersionId ?? null,
     compare: serverDoc.compare || { a: null, b: null },
     branchCompare: serverDoc.branchCompare || { a: null, b: null },
+    // 工作台视图状态以服务端为准（本地防抖保存随后会再同步），缺失时采用客户端
+    auditWorkbench: serverDoc.auditWorkbench || clientDoc.auditWorkbench || null,
     currentBranchId: cur && (sb.has(cur) || cb.has(cur)) ? cur : (serverDoc.currentBranchId || MAIN_BRANCH),
     actor: clientDoc.actor || serverDoc.actor || '',
   };
@@ -539,7 +542,13 @@ export function freeze(obj) {
 }
 
 function markCorrupt(ev, reason) {
-  Object.defineProperty(ev, 'corrupt', { value: true, configurable: true, enumerable: true, writable: true });
-  Object.defineProperty(ev, 'corruptReason', { value: reason, configurable: true, enumerable: true, writable: true });
-  return freeze(ev);
+  // 持久化文档经 structuredClone / JSON 往返后对象可能仍处于冻结态：
+  // 标损坏前先确保可扩展（浅拷贝外壳，快照数据不再需要写入）。
+  let target = ev;
+  if (!Object.isExtensible(ev)) {
+    target = { ...ev };
+  }
+  Object.defineProperty(target, 'corrupt', { value: true, configurable: true, enumerable: true, writable: true });
+  Object.defineProperty(target, 'corruptReason', { value: reason, configurable: true, enumerable: true, writable: true });
+  return freeze(target);
 }

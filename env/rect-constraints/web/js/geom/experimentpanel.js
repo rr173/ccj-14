@@ -39,6 +39,11 @@ export class ExperimentPanel {
 
   openEditor() {
     const s = this.store;
+    // 工作台“求解前 / 实验基准”是不落审计流的临时快照：不能作为实验来源
+    if (s.replaySnapshot) {
+      this.hooks.toast('正在查看求解前快照（非审计事件）：请切到某次求解“后”再建立实验', 'warn');
+      return;
+    }
     const srcId = s.replayEventId || s.branch.headEventId;
     const event = s.eventsById.get(srcId);
     if (!event || event.corrupt) { this.hooks.toast('当前分支事件不可用，无法建立实验', 'error'); return; }

@@ -69,6 +69,7 @@
         <button class="tab" data-tab="versions">版本 <span id="version-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="audit">审计/分支 <span id="audit-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="experiments">实验 <span id="exp-count" class="badge zero">0</span></button>
+        <button class="tab" data-tab="workbench" title="可回放的实验审计工作台：跨实验/变体/分支筛选、求解前后模型与冲突链、顺序回放与差异切换">审计台 <span id="wb-count" class="badge zero">0</span></button>
       </div>
 
       <div class="tab-body" data-body="constraints">
@@ -132,6 +133,8 @@
         <div id="exp-warnings" class="audit-warnings hidden"></div>
         <div id="experiment-list" class="list"></div>
       </div>
+
+      <div class="tab-body hidden" data-body="workbench"></div>
     </aside>
   </main>
 </div>

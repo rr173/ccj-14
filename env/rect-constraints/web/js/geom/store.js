@@ -31,6 +31,9 @@ import {
   sanitizeExperiments, mergeExperiments, experimentConfigHash,
   diffVariant, variantReplayable, reconcileRunState, variantCounters,
 } from './experiments.js';
+import {
+  buildWorkbench, defaultWorkbench, normalizeWorkbench,
+} from './auditbench.js';
 
 const LS_KEY = 'rect-constraints-doc-v2';
 const LS_KEY_LEGACY = 'rect-constraints-doc-v1';
@@ -47,6 +50,7 @@ export class Store extends EventTarget {
     this.branches = [];
     this.currentBranchId = MAIN_BRANCH;
     this.replayEventId = null;   // 只读回放指向的事件 id
+    this.replaySnapshot = null;  // 通用快照回放：求解前/变体基准等非事件节点的只读克隆
     this.actor = localStorage.getItem(ACTOR_KEY) || '';
 
     this.rev = 0;
@@ -54,6 +58,7 @@ export class Store extends EventTarget {
     this.currentVersionId = null;
     this.compare = { a: null, b: null };
     this.branchCompare = { a: null, b: null }; // 分支比较选择（持久化）
+    this.auditWorkbench = defaultWorkbench(); // 实验审计工作台视图状态（筛选/回放位置/前后面）
     this.auditWarnings = [];
 
     this.experiments = [];
@@ -161,11 +166,25 @@ export class Store extends EventTarget {
     this._runners = new Map();
 
     this.replayEventId = null;
+    this.replaySnapshot = null;
     this.dragPreview = null;
     this.saveConflict = null;
     this._syncedHeads = {};
     for (const b of this.branches) this._syncedHeads[b.id] = b.headEventId;
     this.rev = Number.isFinite(doc.rev) ? doc.rev : 0;
+
+    // 实验审计工作台：筛选条件 / 回放位置 / 前后面随文档持久化；
+    // 失效引用回退，playing 一律收敛为暂停（重启位置保留、不自动播放）
+    const wb = buildWorkbench({
+      events: this.events, eventsById: this.eventsById,
+      branches: this.branches, branchesById: this.branchesById,
+      experiments: this.experiments,
+    });
+    this.auditWorkbench = normalizeWorkbench(doc.auditWorkbench, {
+      branchIds: new Set(this.branches.map((b) => b.id)),
+      experiments: this.experiments,
+      nodeKeys: wb.byKey,
+    });
   }
 
   async _fetchDoc() {
@@ -185,6 +204,7 @@ export class Store extends EventTarget {
       compare: this.compare,
       branchCompare: this.branchCompare,
       experiments: this.experiments,
+      auditWorkbench: this.auditWorkbench,
       actor: this.actor,
     };
   }
@@ -379,16 +399,45 @@ export class Store extends EventTarget {
       const ev = this.eventsById.get(this.replayEventId);
       if (ev && !ev.corrupt) return ev;
     }
+    if (this.replaySnapshot) return this.replaySnapshot;
     return this.eventsById.get(this.branch.headEventId);
   }
   get current() { return this.headEvent; }
-  get model() { return this.dragPreview ? this._dragModel : this.headEvent.model; }
+  get model() {
+    if (this.dragPreview) return this._dragModel;
+    return this.headEvent.model;
+  }
   get report() { return this.dragPreview || this.headEvent.report; }
   get replaying() {
     // 显式进入回放即只读（哪怕回放到的恰是 head 事件），直到 exitReplay
-    if (!this.replayEventId) return false;
-    const ev = this.eventsById.get(this.replayEventId);
-    return !!ev && !ev.corrupt;
+    if (this.replayEventId) {
+      const ev = this.eventsById.get(this.replayEventId);
+      if (ev && !ev.corrupt) return true;
+    }
+    return !!this.replaySnapshot;
+  }
+  /** 当前只读回放指向的描述（横幅/审计台共用）。 */
+  get replayInfo() {
+    if (this.replayEventId) {
+      const ev = this.eventsById.get(this.replayEventId);
+      if (ev && !ev.corrupt) {
+        return { mode: 'event', eventId: ev.id, label: ev.label, actor: ev.actor, t: ev.t, hash: ev.hash };
+      }
+    }
+    if (this.replaySnapshot) {
+      const s = this.replaySnapshot;
+      return {
+        mode: s.__replayKind || 'snapshot',
+        eventId: null,
+        label: s.__replayLabel || '历史快照',
+        actor: s.actor || '',
+        t: s.t,
+        hash: s.hash,
+        side: s.__replaySide || 'after',
+        originKey: s.__originKey || null,
+      };
+    }
+    return null;
   }
 
   /* ---------- 修改 ---------- */
@@ -530,16 +579,41 @@ export class Store extends EventTarget {
       return { ok: false, error: `该事件无法回放：${ev.corruptReason || '快照损坏'}` };
     }
     this.replayEventId = eventId;
+    this.replaySnapshot = null;
     this.dragPreview = null;
     this._emit('replay', { eventId });
     this._emit('change', { label: 'replay' });
     return { ok: true };
   }
 
+  /**
+   * 通用快照只读回放：用于工作台查看“求解前”（父事件 / fork 来源 / 实验基准）
+   * 等不属于审计链节点的完整模型。快照被克隆成伪事件，绝不写入审计流、绝不持久化。
+   */
+  replayEntry(entry, { label = '求解前快照', actor = '', t = 0, side = 'before', kind = 'snapshot', originKey = null } = {}) {
+    if (!entry || !entry.model || !entry.report) return { ok: false, error: '该快照不可回放' };
+    this.replaySnapshot = {
+      id: `replay:${originKey || Math.random().toString(36).slice(2)}`,
+      branch: null, parentId: null, kind: 'edit', seq: 0,
+      t, actor: actor || '快照', label,
+      model: structuredClone(entry.model),
+      report: structuredClone(entry.report),
+      hash: entry.hash || entry.report.hash,
+      conflicts: structuredClone(entry.report.conflicts || []),
+      __replayKind: kind, __replayLabel: label, __replaySide: side, __originKey: originKey,
+    };
+    this.replayEventId = null;
+    this.dragPreview = null;
+    this._emit('replay', { snapshot: true, originKey });
+    this._emit('change', { label: 'replay-entry' });
+    return { ok: true };
+  }
+
   /** 退出回放，回到分支 head（不改写任何事件）。 */
   exitReplay() {
-    if (!this.replayEventId) return;
+    if (!this.replayEventId && !this.replaySnapshot) return;
     this.replayEventId = null;
+    this.replaySnapshot = null;
     this.dragPreview = null;
     this._emit('replayexit', {});
     this._emit('change', { label: 'replay-exit' });
@@ -572,6 +646,7 @@ export class Store extends EventTarget {
     this.branches = [...this.branches, branch];
     this.currentBranchId = id;
     this.replayEventId = null;
+    this.replaySnapshot = null;
     this._syncedHeads[id] = root.id;
     this._dirty = true;
     this.persist();
@@ -585,6 +660,7 @@ export class Store extends EventTarget {
     if (!b || id === this.currentBranchId) return { ok: false };
     this.currentBranchId = id;
     this.replayEventId = null;
+    this.replaySnapshot = null;
     this.dragPreview = null;
     this._dirty = true; // 记住用户最后停留的分支
     this.persist();
@@ -611,6 +687,75 @@ export class Store extends EventTarget {
     this._emit('branch', { type: 'compare' });
   }
 
+  /* ---------- 实验审计工作台（视图状态持久化） ---------- */
+
+  /** 当前文档对应的统一时间线（纯函数，每次重建且确定）。 */
+  workbench() {
+    return buildWorkbench({
+      events: this.events, eventsById: this.eventsById,
+      branches: this.branches, branchesById: this.branchesById,
+      experiments: this.experiments,
+    });
+  }
+
+  /**
+   * 更新工作台视图状态（筛选 / 光标 / 前后面 / 详情展开 / 播放 / 速度）。
+   * 只合并提供的字段；persist 控制是否落盘（播放自动推进时节流调用）。
+   */
+  setWorkbench(patch = {}, { persist = true } = {}) {
+    const prev = this.auditWorkbench;
+    const next = {
+      filter: { ...prev.filter, ...(patch.filter || {}) },
+      cursorKey: patch.cursorKey !== undefined ? patch.cursorKey : prev.cursorKey,
+      side: patch.side !== undefined ? patch.side : prev.side,
+      detailOpen: patch.detailOpen !== undefined ? patch.detailOpen : prev.detailOpen,
+      playing: patch.playing !== undefined ? !!patch.playing : prev.playing,
+      speedMs: patch.speedMs !== undefined ? patch.speedMs : prev.speedMs,
+    };
+    this.auditWorkbench = next;
+    if (persist) {
+      this._dirty = true;
+      this.persist();
+    }
+    this._emit('workbench', { patch });
+    return next;
+  }
+
+  /**
+   * 把画布重放到工作台节点的指定面（after=求解后 / before=求解前）。
+   * 不可回放节点被拒绝（其余节点仍可查看）；事件节点走事件回放，变体/求解前走快照回放。
+   */
+  showWorkbenchNode(node, side = 'after') {
+    if (!node || !node.replayable) {
+      return { ok: false, error: `节点「${node?.title || '?'}」不可回放（记录仍保留可查看）` };
+    }
+    const wantBefore = side === 'before';
+    if (wantBefore) {
+      const base = node.baseEntry;
+      if (!base) return { ok: false, error: '该节点没有可回放的“求解前”状态（初始事件 / 基准损坏 / 来源缺失）' };
+      const originName = node.kind === 'experiment-variant'
+        ? `实验「${node.experiment.name}」基准` : '求解前';
+      const res = this.replayEntry(base, {
+        label: `${originName} · ${node.title}`,
+        actor: node.actor, t: node.t, side: 'before',
+        kind: node.kind === 'experiment-variant' ? 'variant-baseline' : 'event-before',
+        originKey: node.key,
+      });
+      if (!res.ok) return res;
+    } else if (node.kind === 'edit-event') {
+      const res = this.replay(node.fork.eventId);
+      if (!res.ok) return res;
+    } else {
+      const res = this.replayEntry(node.entry, {
+        label: node.title, actor: node.actor, t: node.t, side: 'after',
+        kind: 'variant-result', originKey: node.key,
+      });
+      if (!res.ok) return res;
+    }
+    this.setWorkbench({ cursorKey: node.key, side: wantBefore ? 'before' : 'after' });
+    return { ok: true };
+  }
+
   /* ---------- 布局方案实验 ---------- */
 
   experimentById(id) { return this.experiments.find((x) => x.id === id) || null; }
@@ -622,6 +767,7 @@ export class Store extends EventTarget {
   createExperiment(rawSpecs, { name = '', sourceEventId = null } = {}) {
     if (this.saveConflict) return { ok: false, error: '版本冲突未解决，请先重新加载' };
     const srcId = sourceEventId || this.replayEventId || this.branch.headEventId;
+    // 工作台“求解前/变体基准”是临时快照：不允许作为实验来源（它不是审计事件，无法持久化来源）
     const event = this.eventsById.get(srcId);
     if (!event || event.corrupt || !event.model) return { ok: false, error: '来源事件不可用（缺失或损坏），无法建立实验' };
     let specs;
@@ -820,6 +966,7 @@ export class Store extends EventTarget {
     this.branches = [...this.branches, branch];
     this.currentBranchId = id;
     this.replayEventId = null;
+    this.replaySnapshot = null;
     this._syncedHeads[id] = root.id;
     this._dirty = true;
     this.persist();

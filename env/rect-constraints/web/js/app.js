@@ -4,6 +4,7 @@ import { ConstraintDialog } from './geom/dialog.js';
 import { VersionPanel } from './geom/versionpanel.js';
 import { AuditPanel } from './geom/auditpanel.js';
 import { ExperimentPanel } from './geom/experimentpanel.js';
+import { WorkbenchPanel } from './geom/workbenchpanel.js';
 import {
   newRect, newSnap, newMinGap, newContain, newLock,
 } from './geom/model.js';
@@ -59,6 +60,7 @@ dialog.hooks = { onCycle: (cyc) => view.setCycleHighlight(cyc) };
 const versionPanel = new VersionPanel(store, { toast });
 const auditPanel = new AuditPanel(store, { toast });
 const experimentPanel = new ExperimentPanel(store, { toast });
+const workbenchPanel = new WorkbenchPanel(store, { toast });
 
 let activeTab = 'constraints';
 
@@ -178,6 +180,12 @@ store.addEventListener('saveconflict', (e) => {
 $('#btn-reload').onclick = () => location.reload();
 $('#btn-replay-exit').onclick = () => store.exitReplay();
 $('#btn-replay-fork').onclick = () => {
+  const info = store.replayInfo;
+  // 快照回放（求解前 / 实验基准）不是审计节点，不能直接另存为分支：回到事件后再操作
+  if (!info || info.mode !== 'event') {
+    toast('该快照不是审计事件：请在「审计台」对求解后事件或变体结果使用“另存编辑分支”', 'warn');
+    return;
+  }
   const ev = store.eventsById.get(store.replayEventId);
   const name = prompt('把这一刻另存为新分支，名称：', `回放 #${ev?.seq ?? ''} 分支`);
   if (name === null) return;
@@ -200,6 +208,7 @@ function renderPanels() {
   versionPanel.render();
   auditPanel.render();
   experimentPanel.render();
+  workbenchPanel.render();
   updateButtons();
   updateChips();
 }
@@ -431,16 +440,21 @@ function updateBranchChip() {
 
 function updateReplayBanner() {
   const banner = $('#replay-banner');
-  if (!store.replaying) {
+  const info = store.replayInfo;
+  if (!info) {
     banner.classList.add('hidden');
     $('#canvas-wrap').classList.remove('readonly');
     return;
   }
-  const ev = store.eventsById.get(store.replayEventId);
-  banner.classList.remove('hidden');
+  const when = info.t ? new Date(info.t).toLocaleString() : '快照';
+  const modeText = info.mode === 'variant-result' ? '实验变体结果'
+    : info.mode === 'variant-baseline' ? '实验基准（求解前）'
+    : info.mode === 'event-before' ? '求解前快照'
+    : info.mode === 'snapshot' ? '历史快照' : '历史事件';
   $('#replay-text').innerHTML =
-    `▶ 正在回放 <b>#${ev.seq}「${escapeHtml(ev.label)}」</b> · ${escapeHtml(ev.actor)} · ${
-      new Date(ev.t).toLocaleString()} · 只读（历史事件不可修改）`;
+    `▶ 正在回放${modeText} <b>「${escapeHtml(info.label)}」</b>${info.actor ? ' · ' + escapeHtml(info.actor) : ''} · ${
+      when} · 指纹 <code>${(info.hash || '').slice(0, 8)}</code> · 只读（审计数据不可修改）`;
+  banner.classList.remove('hidden');
   $('#canvas-wrap').classList.add('readonly');
 }
 
@@ -473,6 +487,12 @@ function toast(text, level = '') {
 /* ---------- 启动 ---------- */
 
 await store.load();
+// 恢复工作台持久化的回放位置：位置保留、播放一律暂停；失效位置静默留在 head
+if (store.auditWorkbench.cursorKey && !store.replaying) {
+  const w = store.workbench();
+  const n = w.byKey.get(store.auditWorkbench.cursorKey);
+  if (n?.replayable) store.showWorkbenchNode(n, store.auditWorkbench.side || 'after');
+}
 updateButtons();
 renderPanels();
 view.render();
