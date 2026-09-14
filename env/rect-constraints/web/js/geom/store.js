@@ -52,6 +52,12 @@ import {
   applyBatchNotifications, makeBatchRecord, batchId, sanitizeBatches, mergeBatches,
   makeDraft, sanitizeDrafts, mergeDrafts, scheduleIsOpenAt, scheduleClosedReason,
 } from './notifications.js';
+import {
+  createReleaseCandidate, reconcileRelease, releaseView as releaseViewPure,
+  approveRelease, revokeRelease, regenerateRelease,
+  sanitizeReleases, mergeReleases, assessServerReleaseConflict,
+  assessReleaseStaleAgainstDoc, frozenGateBlocked, buildReleaseReport,
+} from './releases.js';
 
 const LS_KEY = 'rect-constraints-doc-v2';
 const LS_KEY_LEGACY = 'rect-constraints-doc-v1';
@@ -111,6 +117,15 @@ export class Store extends EventTarget {
     this._notifyLockedItems = new Set();
     this._notifyAuthoredRuleRevs = new Map(); // ruleId -> Set(rev)：本页自写 rev（localStorage 自检不判冲突）
     this.online = true;                 // 最近一次网络结果（断网时发送留在队列）
+
+    // 发布门禁与证据快照
+    this.releases = [];                       // 发布候选（不可变证据快照 + 门禁结果 + 审批/撤销记录）
+    this.activeReleaseId = null;              // 当前打开的发布候选 id（随文档持久化）
+    this._releaseSyncedRevs = {};             // releaseId -> 已与服务端确认的候选 rev（发布乐观锁）
+    this._releaseAuthoredRevs = new Map();    // releaseId -> Set(rev)：本页自己写入过的 rev
+    this._releaseProposals = new Map();       // releaseId -> [{approver, comment, at, rejected}]（409 后本地保留的审批意见）
+    this._releasePendingApprovals = new Map(); // releaseId -> [{id,by}] 本页已本地接受、尚未被服务端确认的批准
+    this.releaseConflict = null;              // null | { releaseId, reason, serverRev, release }
     this._transport = null;             // 可注入的发送通道（测试）；默认 in-app 持久化即送达
     this._flushing = false;             // outbox 单飞刷新
     this._notifyOutboxTombstones = new Set(); // 本页已终结（送达/确认/转交/陈旧移除）的 outbox 条目 id：合流时防磁盘旧值复活
@@ -261,6 +276,24 @@ export class Store extends EventTarget {
     }
 
     this._adoptNotify(doc, { seed });
+
+    // 发布门禁：候选 / 证据快照 / 门禁结果 / 审批意见 / 撤销记录随文档持久化；
+    // 加载时只做结构清洗，过期 / 门禁由 releaseView() 在当前上下文上确定性重算。
+    // _releasePendingApprovals 是【本页本地已接受、尚未被服务端确认】的批准：
+    // 合流 adopt 必须保留（否则同 rev 并发审批的晚到 merged 响应无法识别本页意见被覆盖）。
+    // _releasePendingApprovals 是【本页本地已接受、尚未被服务端确认】的批准：
+    // adopt 始终保留（在飞保存的早一轮 merged 响应不能把并发审批检测所需记录清空；
+    // 直存成功后的收敛在保存链按服务端确认的批准 id 进行）。
+    const savedPendingApprovals = new Map(this._releasePendingApprovals || []);
+    const savedReleaseProposals = keepReviewConflict ? new Map(this._releaseProposals || []) : new Map();
+    this.releases = sanitizeReleases(doc.releases, { now: Date.now() });
+    this.activeReleaseId = this.releases.some((x) => x.id === doc.activeReleaseId) ? doc.activeReleaseId : null;
+    this._releaseSyncedRevs = {};
+    this._releaseAuthoredRevs = new Map();
+    for (const r of this.releases) this._releaseSyncedRevs[r.id] = r.rev;
+    this._releaseProposals = savedReleaseProposals;
+    this._releasePendingApprovals = savedPendingApprovals;
+    if (!keepReviewConflict) this.releaseConflict = null;
   }
 
   /**
@@ -423,6 +456,8 @@ export class Store extends EventTarget {
       notifyOutbox: this.notifyOutbox,
       notifyBatches: this.notifyBatches,
       notifyDrafts: this.notifyDrafts,
+      releases: this.releases,
+      activeReleaseId: this.activeReleaseId,
       actor: this.actor,
     };
   }
@@ -463,6 +498,12 @@ export class Store extends EventTarget {
           this._onNotifyConflict(notifyConflict);
           return;
         }
+        // 发布门禁：候选被另一窗口前进（批准 / 撤销 / 重新生成）→ release-* 409，本地审批意见保留
+        const releaseConflict = this._checkLocalReleaseConflict(prev, payload);
+        if (releaseConflict) {
+          this._onReleaseConflict(releaseConflict);
+          return;
+        }
       }
       // 本地多页签合流：merged 已含本页当前分支最新提交，直接落合并结果
       const finalDoc = merged || { ...payload, rev: this.rev };
@@ -489,6 +530,12 @@ export class Store extends EventTarget {
         Array.isArray(prev?.notifyBatches) ? prev.notifyBatches : [], finalDoc.notifyBatches || []);
       finalDoc.notifyDrafts = mergeDrafts(
         Array.isArray(prev?.notifyDrafts) ? prev.notifyDrafts : [], finalDoc.notifyDrafts || []);
+      // 发布候选按 id 并集（同 id rev 更大者整体胜出；审批/历史记录按 id 并集，审计链不丢）
+      finalDoc.releases = mergeReleases(
+        Array.isArray(prev?.releases) ? prev.releases : [], finalDoc.releases || []);
+      finalDoc.activeReleaseId = finalDoc.releases.some((x) => x.id === finalDoc.activeReleaseId)
+        ? finalDoc.activeReleaseId
+        : (payload.activeReleaseId && finalDoc.releases.some((x) => x.id === payload.activeReleaseId) ? payload.activeReleaseId : null);
       finalDoc.activeReviewId = finalDoc.reviewSessions.some((x) => x.id === finalDoc.activeReviewId)
         ? finalDoc.activeReviewId
         : (payload.activeReviewId && finalDoc.reviewSessions.some((x) => x.id === payload.activeReviewId) ? payload.activeReviewId : null);
@@ -501,6 +548,10 @@ export class Store extends EventTarget {
       for (const r of payload.notifyRules || []) {
         if (!this._notifyAuthoredRuleRevs.has(r.id)) this._notifyAuthoredRuleRevs.set(r.id, new Set());
         this._notifyAuthoredRuleRevs.get(r.id).add(Math.max(r.rev || 0, r.deleteRev || 0));
+      }
+      for (const rc of payload.releases || []) {
+        if (!this._releaseAuthoredRevs.has(rc.id)) this._releaseAuthoredRevs.set(rc.id, new Set());
+        this._releaseAuthoredRevs.get(rc.id).add(rc.rev);
       }
     } catch {}
     this._emit('persist');
@@ -558,6 +609,7 @@ export class Store extends EventTarget {
       if (!hasForeignEvents && !hasForeignBranches) return null;
       const merged = mergeDocs(stored, { ...payload, baseHeads: this._syncedHeads });
       merged.reviewSessions = mergeReviewSessions(merged.reviewSessions || [], payload.reviewSessions || []);
+      merged.releases = mergeReleases(stored.releases || [], payload.releases || []);
       merged.rev = Math.max(Number.isFinite(stored.rev) ? stored.rev : 0, this.rev) + 1;
       this.rev = merged.rev;
       if (merged.events.length > this.events.length) {
@@ -587,6 +639,7 @@ export class Store extends EventTarget {
     }
     const merged = mergeDocs(stored, client);
     merged.reviewSessions = mergeReviewSessions(merged.reviewSessions || [], payload.reviewSessions || []);
+    merged.releases = mergeReleases(stored.releases || [], payload.releases || []);
     merged.rev = Math.max(Number.isFinite(stored.rev) ? stored.rev : 0, this.rev) + 1;
     this.rev = merged.rev;
     if (merged.events.length > this.events.length) {
@@ -687,6 +740,7 @@ export class Store extends EventTarget {
         baseReviewRevs: this._baseReviewRevs(),
         baseNotifyRuleRevs: this._baseNotifyRuleRevs(),
         baseNotifyItemRevs: this._baseNotifyItemRevs(),
+        baseReleaseRevs: this._baseReleaseRevs(),
         // 已终结 outbox 条目的墓碑（瞬态字段，不持久化进文档）：服务端合并时删除其旧副本
         notifyOutboxTombstones: [...this._notifyOutboxTombstones],
       };
@@ -699,6 +753,26 @@ export class Store extends EventTarget {
       // 快照本次请求发出时的乐观动作：后续 409（可能在又一次保存清空 map 后才到达）
       // 用它恢复并保留本地未提交操作。
       const pendingSnapshot = new Map(this._notifyPendingItemActions);
+      // 快照本请求载荷中携带的候选批准：直存成功后只收敛这些批准的 pending，
+      // 不能清空整个候选的 pending（在飞的后一轮请求可能在此响应到达前又本地批准）。
+      const releaseApprovalsInFlight = new Map();
+      // 同时保留批准明细（by/comment），合流响应 409 时用于把被拒批准保留为提案。
+      const releaseApprovalDetailsInFlight = new Map();
+      for (const r of payload.releases || []) {
+        const ids = new Set((r.approvals || []).map((a) => a.id));
+        releaseApprovalsInFlight.set(r.id, ids);
+        releaseApprovalDetailsInFlight.set(r.id, (r.approvals || []).map((a) => ({ id: a.id, by: a.by, comment: a.comment || '' })));
+      }
+      // 请求发出前最后快照一次候选 / 批准：上面的 payload 可能是为早一轮防抖保存构造的，
+      // await 期间本页刚做的批准只存在于 this.releases，必须带到请求与合流 409 检测里。
+      payload.releases = [...this.releases];
+      payload.baseReleaseRevs = this._baseReleaseRevs();
+      releaseApprovalsInFlight.clear();
+      releaseApprovalDetailsInFlight.clear();
+      for (const r of payload.releases || []) {
+        releaseApprovalsInFlight.set(r.id, new Set((r.approvals || []).map((a) => a.id)));
+        releaseApprovalDetailsInFlight.set(r.id, (r.approvals || []).map((a) => ({ id: a.id, by: a.by, comment: a.comment || '' })));
+      }
       let body = JSON.stringify(payload);
       // 审阅冲突未解决：该会话的【本地过期内容】不外发（本地决定已保留为提案，等逐项
       // 合并 / 放弃）。但不能直接删除该会话——同 rev 直存时客户端文档即权威，删除会把
@@ -749,6 +823,21 @@ export class Store extends EventTarget {
         }
         body = JSON.stringify(payload);
       }
+      // 发布候选冲突未解决：冲突候选的【本地过期内容】不外发（本地审批意见已保留为
+      // proposal），其余候选 / 几何 / 审阅保存照常。携带服务端权威副本而非删除
+      // （同 rev 直存时客户端文档即权威，删除会清掉服务端仍存在的候选）。
+      if (this.releaseConflict) {
+        const cid = this.releaseConflict.releaseId;
+        const serverDoc0 = await this._fetchDoc().catch(() => null);
+        const serverRelease = (serverDoc0?.releases || []).find((x) => x.id === cid);
+        if (serverRelease) {
+          payload.releases = (payload.releases || []).map((x) => (x.id === cid ? serverRelease : x));
+        } else {
+          payload.releases = (payload.releases || []).filter((x) => x.id !== cid);
+        }
+        delete payload.baseReleaseRevs[cid];
+        body = JSON.stringify(payload);
+      }
       try {
         // 发请求前再次快照乐观动作：调用方可能在该保存入队后、实际发出前才执行确认/转交。
         const requestSnapshot = new Map([...pendingSnapshot, ...this._notifyPendingItemActions]);
@@ -773,6 +862,11 @@ export class Store extends EventTarget {
             this._onNotifyConflict(data);
             return;
           }
+          if (typeof data?.releaseId === 'string' && String(data.reason || '').startsWith('release-')) {
+            // 发布门禁冲突（候选 rev 前进 / 证据过期 / 门禁阻断）：本地审批意见保留
+            this._onReleaseConflict(data);
+            return;
+          }
           this._onSaveConflict(data, Number.isFinite(data?.rev) ? data.rev : null);
           return;
         }
@@ -787,11 +881,27 @@ export class Store extends EventTarget {
             return;
           }
           // 与另一页面的不同分支编辑合流：采用合并后的权威文档
+          // 先快照本页在【请求发出时】载荷中的候选批准：合流按 rev 取一份会丢掉
+          // 本页的同 rev 并发批准；adopt 后 this.releases 已被覆盖，无法再从本地状态读出。
+          const rejectedReleasePreMerge = this._findRejectedInMerged(data.doc, releaseApprovalsInFlight);
           const myReview = this.reviewSessions;
           const myActiveReview = this.activeReviewId;
           const myProposals = this._reviewProposals;
           const myNotifyLocks = { rules: new Set(this._notifyLockedRules), items: new Set(this._notifyLockedItems), conflict: this.notifyConflict };
+          const myReleases = this.releases;
+          const myReleaseProposals = this._releaseProposals;
           await this._adopt(data.doc, { seed: false, keepReviewConflict: true });
+          // 合流（跨分支 / 不同 rev）同样可能发生在同一候选的并发审批上：合流按 rev 取
+          // 服务端值会丢掉本页的批准 / 撤销。优先用请求载荷里的批准 id 判定（adopt 不
+          // 依赖待确认集合），再用待确认集合兜底；命中按 release 409 处理，本地意见保留。
+          const rejectedRelease = rejectedReleasePreMerge || this._findPendingRejectedRelease(data.doc);
+          if (rejectedRelease) {
+            if (rejectedReleasePreMerge) {
+              this._stashRejectedReleaseApprovals(rejectedReleasePreMerge, releaseApprovalsInFlight, releaseApprovalDetailsInFlight);
+            }
+            this._onReleaseConflict(rejectedRelease);
+            return;
+          }
           // 合流可能把本页已终结（送达/确认/转交）的旧队列条目从服务端并回：按墓碑剔除
           if (this._notifyOutboxTombstones.size) {
             this.notifyOutbox = this.notifyOutbox.filter((o) => !this._notifyOutboxTombstones.has(o.id));
@@ -800,6 +910,8 @@ export class Store extends EventTarget {
           this._reconcileOutboxTombstones(data.doc?.notifyOutbox || []);
           // 合流文档以服务端为准，但本页刚刚提交且未被服务端纳入的审阅决定要保留为待合并提案
           this._carryReviewProposals(myReview, myProposals, myActiveReview, data.doc);
+          // 合流文档里被拒的发布候选推进（另一窗口同 rev 批准/撤销）：本地审批意见保留为提案
+          this._carryReleaseProposals(myReleases, myReleaseProposals, data.doc);
           // 通知中心冲突锁在合流重载后继续保留（本地未提交操作不丢）
           if (myNotifyLocks.conflict) {
             this._notifyLockedRules = myNotifyLocks.rules;
@@ -819,6 +931,17 @@ export class Store extends EventTarget {
         for (const s of this.reviewSessions) {
           this._reviewSyncedRevs[s.id] = s.rev;
           this._reviewAuthoredRevs.get(s.id)?.add(s.rev);
+        }
+        // 发布候选基线前进到服务端确认值；只收敛本请求载荷携带的批准 id
+        for (const r of this.releases) {
+          this._releaseSyncedRevs[r.id] = r.rev;
+          this._releaseAuthoredRevs.get(r.id)?.add(r.rev);
+          const confirmed = releaseApprovalsInFlight.get(r.id) || new Set();
+          if (confirmed.size) {
+            const pend = (this._releasePendingApprovals.get(r.id) || []).filter((p) => !p.id || !confirmed.has(p.id));
+            if (pend.length) this._releasePendingApprovals.set(r.id, pend);
+            else this._releasePendingApprovals.delete(r.id);
+          }
         }
         // 通知中心基线前进到服务端确认值（规则 rev / 通知项状态）
         for (const r of this.notifyRules) {
@@ -1677,6 +1800,412 @@ export class Store extends EventTarget {
       if (all.length) this._reviewProposals.set(mine.id, all);
     }
     if (myActiveId && this.reviewSessions.some((x) => x.id === myActiveId)) this.activeReviewId = myActiveId;
+  }
+
+  /**
+   * 合流响应里是否有【本请求载荷携带、但服务端合并结果未纳入】的候选批准 / 撤销。
+   * inFlight: Map(releaseId -> Set(approvalId))，在请求构造时快照。
+   * 撤销（载荷里没有该批准 id 之外的信息）由调用方单独比对状态。
+   */
+  _findRejectedInMerged(serverDoc, inFlight) {
+    const byId = new Map((serverDoc.releases || []).map((r) => [r.id, r]));
+    for (const [id, approvalIds] of (inFlight || new Map()).entries()) {
+      if (!approvalIds.size) continue;
+      const srv = byId.get(id);
+      if (!srv) continue;
+      const remoteIds = new Set((srv.approvals || []).map((a) => a.id));
+      if ([...approvalIds].some((aid) => !remoteIds.has(aid))) {
+        return { reason: 'release-advanced', releaseId: id, serverRev: srv.rev, release: srv };
+      }
+    }
+    return null;
+  }
+
+  /** 合流 409 前把被拒批准按批准人保留为本地提案（用载荷快照的 id → 批准人映射）。 */
+  _stashRejectedReleaseApprovals(info, inFlight, detailsInFlight) {
+    const id = info.releaseId;
+    const rejectedIds = inFlight.get(id) || new Set();
+    const serverIds = new Set((info.release?.approvals || []).map((a) => a.id));
+    for (const a of detailsInFlight?.get(id) || []) {
+      if (rejectedIds.has(a.id) && !serverIds.has(a.id)) this._stashReleaseProposal(id, a.comment, a.by);
+    }
+  }
+
+  /**
+   * 合流响应里是否有本页本地已接受、但服务端合并结果并未纳入的批准 / 撤销。
+   * 与 _findRejectedRelease 的区别：输入是 adopt 不会重置的 _releasePendingApprovals，
+   * 因此即使合流响应先把 this.releases 覆盖成服务端值，本页刚做的批准仍可识别。
+   */
+  _findPendingRejectedRelease(serverDoc) {
+    const byId = new Map((serverDoc.releases || []).map((r) => [r.id, r]));
+    for (const [id, pending] of this._releasePendingApprovals.entries()) {
+      if (!pending.length) continue;
+      const srv = byId.get(id);
+      if (!srv) continue;
+      const remoteBy = new Set((srv.approvals || []).map((a) => a.by));
+      const remoteIds = new Set((srv.approvals || []).map((a) => a.id));
+      const missingApproval = pending.some((p) => !p.revocation && !remoteBy.has(p.by) && !remoteIds.has(p.id));
+      const missingRevocation = pending.some((p) => p.revocation && srv.state !== 'revoked');
+      if (missingApproval || missingRevocation) {
+        return { reason: 'release-advanced', releaseId: id, serverRev: srv.rev, release: srv };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 合流响应里是否有本页推进过、但服务端合并结果并未接纳的候选。
+   * 真实 server.py 会在合流前先用发布乐观锁返回 409；这里是客户端防御，
+   * 兼容“文档级合并但候选按 rev 取服务端值”的响应。同 rev 竞态（本页刚批准、
+   * adopt 后 this.releases 已被服务端值覆盖）由 _findPendingRejectedRelease 识别。
+   */
+  _findRejectedRelease(serverDoc) {
+    const byId = new Map((serverDoc.releases || []).map((r) => [r.id, r]));
+    for (const mine of this.releases) {
+      const base = this._releaseSyncedRevs[mine.id] ?? 0;
+      if (!(mine.rev > base)) continue;
+      const srv = byId.get(mine.id);
+      if (!srv) continue;
+      if (srv.rev < mine.rev) {
+        return { reason: 'release-advanced', releaseId: mine.id, serverRev: srv.rev, release: srv };
+      }
+    }
+    return null;
+  }
+
+  /** 跨分支合流（merged 响应）后，把本页已提交但未纳入合流文档的审批意见保留为提案。 */
+  _carryReleaseProposals(myReleases, myProposals, mergedDoc) {
+    const serverById = new Map((mergedDoc.releases || []).map((r) => [r.id, r]));
+    for (const mine of myReleases) {
+      const srv = serverById.get(mine.id);
+      this._releaseSyncedRevs[mine.id] = srv ? srv.rev : (this._releaseSyncedRevs[mine.id] ?? 0);
+      this._releaseAuthoredRevs.delete(mine.id);
+      if (mine.state !== 'approved' || !(mine.approvals || []).length) continue;
+      const remoteBy = new Set((srv?.approvals || []).map((a) => a.by));
+      for (const a of mine.approvals) {
+        if (!remoteBy.has(a.by)) this._stashReleaseProposal(mine.id, a.comment);
+      }
+    }
+    // 409 前已在内存保留的提案（同对象在 myProposals 中）继续保留
+    for (const [id, list] of (myProposals || new Map()).entries()) {
+      const cur = this._releaseProposals.get(id) || [];
+      const seen = new Set(cur.map((p) => `${p.approver}|${p.comment}|${p.at}`));
+      for (const p of list) if (!seen.has(`${p.approver}|${p.comment}|${p.at}`)) cur.push(p);
+      if (cur.length) this._releaseProposals.set(id, cur);
+    }
+    if (this.activeReleaseId && !this.releases.some((x) => x.id === this.activeReleaseId)) this.activeReleaseId = null;
+  }
+
+  /* ==================== 审阅通知与升级中心 ==================== */
+
+  /* ---------- 发布门禁与证据快照 ---------- */
+
+  _baseReleaseRevs() {
+    const out = {};
+    for (const r of this.releases) out[r.id] = this._releaseSyncedRevs[r.id] ?? 0;
+    return out;
+  }
+
+  /** 发布候选对账上下文：工作体 + 当前会话/分支/实验/通知状态（确定性纯函数输入）。 */
+  _releaseCtx() {
+    const workbench = this.workbench();
+    return {
+      workbench,
+      sessions: this.reviewSessions,
+      branches: this.branches,
+      experiments: this.experiments,
+      eventsById: this.eventsById,
+      notify: this._releaseNotifyState(),
+    };
+  }
+
+  _releaseNotifyState() {
+    return {
+      events: this.notifyEvents, items: this.notifications,
+      outbox: this.notifyOutbox, rules: this.notifyRules,
+    };
+  }
+
+  releaseById(id) { return this.releases.find((x) => x.id === id) || null; }
+
+  get activeRelease() { return this.releases.find((x) => x.id === this.activeReleaseId) || null; }
+
+  /** 候选当前视图：在实时文档状态上重算过期原因与门禁（不写入、不持久化）。 */
+  releaseViewFor(id = this.activeReleaseId) {
+    const release = this.releases.find((x) => x.id === id);
+    if (!release) return null;
+    return releaseViewPure(release, this._releaseCtx());
+  }
+
+  selectRelease(id) {
+    if (id && !this.releases.some((x) => x.id === id)) return { ok: false };
+    this.activeReleaseId = id || null;
+    this._dirty = true;
+    this.persist();
+    this._emit('releases', { type: 'select', id });
+    return { ok: true };
+  }
+
+  /** 从审阅会话创建发布候选：冻结证据快照并运行首次门禁评估。 */
+  createRelease(sessionId, { name = '', gatePolicy = {}, setActive = true } = {}) {
+    if (this.saveConflict) return { ok: false, error: '版本冲突未解决，请先重新加载' };
+    const session = this.reviewSessions.find((x) => x.id === sessionId);
+    if (!session) return { ok: false, error: '审阅会话不存在，无法创建发布候选' };
+    const view = this.reviewView(sessionId);
+    let release;
+    try {
+      release = createReleaseCandidate(session, view, this._releaseCtx(), {
+        name, actor: this.actor, now: Date.now(),
+        notify: this._releaseNotifyState(), gatePolicy,
+      });
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+    this.releases = [...this.releases, release];
+    this._releaseSyncedRevs[release.id] = 0; // HTTP 首次保存：服务端尚无此候选
+    if (!this._releaseAuthoredRevs.has(release.id)) this._releaseAuthoredRevs.set(release.id, new Set());
+    this._releaseAuthoredRevs.get(release.id).add(release.rev);
+    if (setActive) this.activeReleaseId = release.id;
+    this._dirty = true;
+    this.persist();
+    this._emit('releases', { type: 'create', id: release.id });
+    return { ok: true, release, view: this.releaseViewFor(release.id) };
+  }
+
+  /**
+   * 批准发布：必须未过期且门禁全过。另一窗口已前进该候选（rev 不匹配）→ 409，
+   * 本地审批意见（approver/comment）原样保留为提案，可重试或放弃。
+   */
+  approveRelease(id, comment = '') {
+    const release0 = this.releases.find((x) => x.id === id);
+    if (!release0) return { ok: false, status: 404, reason: 'release-missing', error: '发布候选不存在' };
+    if (this.releaseConflict?.releaseId === id) {
+      const proposal = this._stashReleaseProposal(id, comment);
+      return { ok: false, status: 409, reason: this.releaseConflict.reason, conflict: this.releaseConflict, proposal };
+    }
+    const view = this.releaseViewFor(id);
+    if (view.stale) {
+      const proposal = this._stashReleaseProposal(id, comment);
+      return { ok: false, status: 409, reason: 'release-stale', staleCodes: view.staleCodes, proposal };
+    }
+    if (!view.gate.ok) {
+      return { ok: false, status: 409, reason: 'release-gate-blocked', blockers: view.gate.blockers, gate: view.gate };
+    }
+    const res = approveRelease(release0, {
+      approver: this.actor || '未署名', comment, staleCodes: view.staleCodes, gate: view.gate,
+    });
+    if (res.status !== 200) {
+      const proposal = this._stashReleaseProposal(id, comment);
+      return { ok: false, ...res, proposal };
+    }
+    if (!res.idempotent) this._replaceRelease(res.release);
+    // 记录本页本地已接受、尚未被服务端确认的批准：若紧接着的保存走合流响应且服务端
+    // 合并结果没有这条批准（另一窗口同 rev 批准），按 release-advanced 409 保留本地意见。
+    if (res.approval && !res.idempotent) {
+      const list = this._releasePendingApprovals.get(id) || [];
+      list.push({ id: res.approval.id, by: res.approval.by });
+      this._releasePendingApprovals.set(id, list);
+    }
+    this._dirty = true;
+    this.persist();
+    this._emit('releases', { type: 'approve', id, idempotent: !!res.idempotent });
+    return { ok: true, idempotent: !!res.idempotent, release: res.release, approval: res.approval };
+  }
+
+  /** 撤销已批准候选（必须填写原因）；完整审计链保留。 */
+  revokeRelease(id, reason) {
+    const release0 = this.releases.find((x) => x.id === id);
+    if (!release0) return { ok: false, status: 404, reason: 'release-missing', error: '发布候选不存在' };
+    const res = revokeRelease(release0, reason, { actor: this.actor });
+    if (res.status !== 200) {
+      return { ok: false, ...res, error: res.reason === 'revocation-reason-required' ? '撤销必须填写原因' : res.reason };
+    }
+    this._replaceRelease(res.release);
+    const list = this._releasePendingApprovals.get(id) || [];
+    list.push({ revocation: true, by: this.actor });
+    this._releasePendingApprovals.set(id, list);
+    this._dirty = true;
+    this.persist();
+    this._emit('releases', { type: 'revoke', id });
+    return { ok: true, release: res.release, revocation: res.revocation };
+  }
+
+  /** 重新生成证据快照：旧候选标记 superseded（快照/门禁/审批意见保留），另立新候选。 */
+  regenerateRelease(id, { name = null } = {}) {
+    const old = this.releases.find((x) => x.id === id);
+    if (!old) return { ok: false, error: '发布候选不存在' };
+    const session = this.reviewSessions.find((x) => x.id === old.sessionId);
+    if (!session) return { ok: false, status: 409, reason: 'release-session-missing', error: '原审阅会话已不存在，无法重新生成快照' };
+    const view = this.reviewView(session.id);
+    const res = regenerateRelease(old, session, view, this._releaseCtx(), {
+      name: name || old.name, actor: this.actor, notify: this._releaseNotifyState(),
+    });
+    if (res.status !== 200) return { ok: false, ...res };
+    this.releases = this.releases.map((x) => (x.id === old.id ? res.previous : x));
+    this.releases = [...this.releases, res.release];
+    this._releaseSyncedRevs[old.id] = this._releaseSyncedRevs[old.id] ?? 0;
+    this._releaseSyncedRevs[res.release.id] = 0;
+    if (!this._releaseAuthoredRevs.has(res.release.id)) this._releaseAuthoredRevs.set(res.release.id, new Set());
+    this._releaseAuthoredRevs.get(res.release.id).add(res.release.rev);
+    this._releaseAuthoredRevs.get(old.id)?.add(res.previous.rev);
+    if (this.activeReleaseId === old.id) this.activeReleaseId = res.release.id;
+    this._dirty = true;
+    this.persist();
+    this._emit('releases', { type: 'regenerate', id: res.release.id, previousId: old.id });
+    return { ok: true, release: res.release, previous: res.previous };
+  }
+
+  _replaceRelease(release) {
+    this.releases = this.releases.map((x) => (x.id === release.id ? release : x));
+  }
+
+  _stashReleaseProposal(id, comment, approver = null) {
+    const p = { approver: approver || this.actor || '未署名', comment: String(comment || '').slice(0, 2000), at: Date.now(), rejected: true };
+    const list = this._releaseProposals.get(id) || [];
+    const dup = list.some((x) => x.approver === p.approver && x.comment === p.comment);
+    if (!dup) list.push(p);
+    this._releaseProposals.set(id, list);
+    this._emit('releases', { type: 'proposal', id });
+    return p;
+  }
+
+  releaseProposals(id = this.activeReleaseId) { return this._releaseProposals.get(id) || []; }
+
+  /** 409 后在最新候选 rev 上重试本地保留的审批意见（过期候选仍会被拒绝，需先重新生成快照）。 */
+  retryReleaseApproval(id, proposal) {
+    this.releaseConflict = null;
+    const res = this.approveRelease(id, proposal?.comment || '');
+    if (res.ok) {
+      const list = (this._releaseProposals.get(id) || []).filter((p) => p !== proposal);
+      this._releaseProposals.set(id, list);
+    }
+    return res;
+  }
+
+  discardReleaseProposal(id, proposal) {
+    const list = (this._releaseProposals.get(id) || []).filter((p) => p !== proposal);
+    this._releaseProposals.set(id, list);
+    if (this.releaseConflict?.releaseId === id && !list.length) this.releaseConflict = null;
+    this._emit('releases', { type: 'proposal-discard', id });
+    return { ok: true };
+  }
+
+  /** 放弃指定批准人的全部本地保留审批意见。 */
+  discardReleaseProposalsBy(id, approver) {
+    const list = (this._releaseProposals.get(id) || []).filter((p) => p.approver !== approver);
+    this._releaseProposals.set(id, list);
+    if (this.releaseConflict?.releaseId === id && !list.length) this.releaseConflict = null;
+    this._emit('releases', { type: 'proposal-discard', id });
+    return { ok: true };
+  }
+
+  _dedupReleaseProposals(id) {
+    const list = this._releaseProposals.get(id) || [];
+    const seen = new Set();
+    const out = [];
+    for (const p of list) {
+      const key = p.approver + '|' + p.comment;
+      if (!seen.has(key)) { seen.add(key); out.push(p); }
+    }
+    this._releaseProposals.set(id, out);
+    return out;
+  }
+
+  releaseReport(id = this.activeReleaseId, { generatedAt = null } = {}) {
+    const release = this.releases.find((x) => x.id === id);
+    if (!release) return null;
+    return buildReleaseReport(release, this.releaseViewFor(id), { generatedAt });
+  }
+
+  /**
+   * localStorage 多页签发布候选冲突检测（离线 / 服务端不可用时的协调）。
+   * 本页自写 rev 不算外来推进；候选 rev 被另一页签前进 / 会话缺失 / 冻结门禁被篡改 → release-* 冲突。
+   */
+  _checkLocalReleaseConflict(stored, payload) {
+    const storedById = new Map((stored.releases || []).map((r) => [r.id, r]));
+    for (const r of payload.releases || []) {
+      const authored = this._releaseAuthoredRevs.get(r.id);
+      const srv = storedById.get(r.id);
+      if (srv && authored?.has(srv.rev)) continue;
+      const base = this._releaseSyncedRevs[r.id] ?? 0;
+      if (!(r.rev > base)) continue;
+      if (srv && srv.rev !== base) {
+        return { reason: 'release-advanced', releaseId: r.id, serverRev: srv.rev, release: srv };
+      }
+      if (r.state === 'revoked' && !String(r.revocation?.reason || '').trim()) {
+        return { reason: 'release-revocation-reason-required', releaseId: r.id };
+      }
+      if (r.state === 'approved' && r.approvals?.length) {
+        const blockers = frozenGateBlocked(r);
+        if (blockers.length) return { reason: 'release-gate-blocked', releaseId: r.id, blockers };
+      }
+      if (!srv) continue;
+      // 本地存储陈旧时无法重建完整上下文：只做会话引用与冻结状态校验，实时过期由服务端复验
+      const sessExists = (stored.reviewSessions || []).some((s) => s.id === r.sessionId);
+      if (!sessExists) return { reason: 'release-session-missing', releaseId: r.id, sessionId: r.sessionId };
+    }
+    return null;
+  }
+
+  /** 服务端 409（release-*）：采用服务端权威候选，本地审批意见保留为提案。 */
+  _onReleaseConflict(info) {
+    const id = info.releaseId;
+    const adopt = (serverRelease) => {
+      if (!serverRelease) return;
+      const clean = sanitizeReleases([serverRelease])[0];
+      if (!clean) return;
+      const mine = this.releases.find((x) => x.id === id);
+      // 保留本地（被拒）审批意见
+      if (mine?.approvals?.length) {
+        const remoteBy = new Set(clean.approvals.map((a) => a.by));
+        for (const a of mine.approvals) {
+          if (!remoteBy.has(a.by)) this._stashReleaseProposal(id, a.comment, a.by);
+        }
+      }
+      // 本页本地已接受但服务端合并结果未纳入的批准：按批准人保留为提案；
+      // 合流 409 路径可能已经保留了带意见的同批准人提案，只在缺失时补充一条。
+      const pending = this._releasePendingApprovals.get(id) || [];
+      const remoteBy = new Set(clean.approvals.map((a) => a.by));
+      const remoteIds = new Set(clean.approvals.map((a) => a.id));
+      const stashedBy = new Set((this._releaseProposals.get(id) || []).map((p) => p.approver));
+      for (const p of pending) {
+        if (!p.revocation && !remoteBy.has(p.by) && !remoteIds.has(p.id) && !stashedBy.has(p.by)) {
+          this._stashReleaseProposal(id, '', p.by);
+          stashedBy.add(p.by);
+        }
+      }
+      this._releasePendingApprovals.delete(id);
+      if (this.releases.some((x) => x.id === id)) {
+        this.releases = this.releases.map((x) => (x.id === id ? clean : x));
+      }
+      this._releaseSyncedRevs[id] = clean.rev;
+      this._releaseAuthoredRevs.delete(id);
+      return stashedBy;
+    };
+    const stashedBy = adopt(info.release || null) || new Set();
+    // 合流响应里可能没有权威候选副本：GET 一次
+    if (!info.release) {
+      this._fetchDoc().then((doc) => {
+        if (!doc) return;
+        const srv = (Array.isArray(doc.releases) ? doc.releases : []).find((x) => x.id === id);
+        if (srv) {
+        const stashed = adopt(srv) || new Set();
+        // 延迟 GET 到达的候选可能与合流 409 已保留的提案重复：按批准人去重
+        if (stashed.size) this._dedupReleaseProposals(id);
+        this._emit('releases', { type: 'conflict', id });
+      }
+      }).catch(() => {});
+    }
+    this.releaseConflict = {
+      releaseId: id,
+      reason: info.reason,
+      staleCodes: info.staleCodes || null,
+      blockers: info.blockers || null,
+      serverRev: info.serverRev ?? null,
+      serverRelease: info.release || null,
+      at: Date.now(),
+    };
+    this._emit('releases', { type: 'conflict', id });
   }
 
   /* ==================== 审阅通知与升级中心 ==================== */

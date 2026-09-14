@@ -224,6 +224,24 @@ def _valid_notify_shape(doc):
             return False
         if d.get("action") not in ("ack", "snooze", "transfer"):
             return False
+    # 发布门禁候选（可为空）：轻量结构校验，证据哈希 / 过期对账在浏览器纯函数里
+    releases = doc.get("releases", [])
+    if not isinstance(releases, list):
+        return False
+    for rc in releases:
+        if not isinstance(rc, dict) or not isinstance(rc.get("id"), str) or not isinstance(rc.get("sessionId"), str):
+            return False
+        if rc.get("state") not in ("pending", "approved", "revoked", "superseded"):
+            return False
+        if not isinstance(rc.get("rev"), int) or isinstance(rc.get("rev"), bool) or rc.get("rev") < 1:
+            return False
+        ev = rc.get("evidence")
+        if not isinstance(ev, dict) or not isinstance(ev.get("session"), dict):
+            return False
+        if rc.get("state") == "revoked":
+            rv = rc.get("revocation")
+            if not isinstance(rv, dict) or not str(rv.get("reason") or "").strip():
+                return False
     return True
 
 
@@ -776,6 +794,152 @@ def _assess_notify_conflict(cur, doc):
     return None
 
 
+def _release_gate_blocked(release):
+    """批准载荷携带的冻结门禁快照仍有阻断项 -> 拒绝（防止伪造直接批准）。"""
+    gate = release.get("gate") if isinstance(release, dict) else None
+    if not isinstance(gate, dict):
+        return ["missing-gate"]
+    blockers = [c for c in (gate.get("blockers") or []) if isinstance(c, str)]
+    if blockers:
+        return blockers
+    return [c.get("code") for c in (gate.get("checks") or [])
+            if isinstance(c, dict) and not c.get("ok") and c.get("blocking", True)]
+
+
+def _release_stale_against(cur, release):
+    """
+    服务端轻量过期复核（无求解器上下文，做保守的字段比较）：
+      - 源审阅会话 rev 变化 / 节点指纹变化 / 节点确认状态变化；
+      - 通知状态：outbox 非空 / 存在待处理通知项 / 通知项状态与冻结摘要不一致。
+    完整的实验 / 分支 / 基线对账在浏览器 releases.js 内完成。
+    """
+    codes = []
+    sess = next((s for s in cur.get("reviewSessions", []) if isinstance(s, dict) and s.get("id") == release.get("sessionId")), None)
+    if sess is None:
+        return ["release-session-changed"]
+    frozen_session = ((release.get("evidence") or {}).get("session") or {})
+    if int(sess.get("rev") or 0) != int(frozen_session.get("sessionRev") or 0):
+        codes.append("release-session-changed")
+    frozen_nodes = {n.get("key"): n for n in frozen_session.get("nodes", []) if isinstance(n, dict)}
+    for n in sess.get("nodes", []) or []:
+        if not isinstance(n, dict):
+            continue
+        f = frozen_nodes.get(n.get("key"))
+        if f is None:
+            codes.append("release-node-drift")
+            break
+        fp = n.get("fingerprint")
+        if isinstance(fp, str) and isinstance(f.get("fingerprint"), str) and fp != f.get("fingerprint"):
+            codes.append("release-node-drift")
+            break
+        policy = sess.get("policy") or {}
+        required = int(policy.get("required") or 1) if policy.get("mode") == "signoff" else 1
+        active = [sg for sg in (n.get("signatures") or []) if isinstance(sg, dict) and not sg.get("invalid")]
+        confirmed = (policy.get("mode") != "signoff" and n.get("decision") in ("pass", "reject", "review")) \
+            or (policy.get("mode") == "signoff" and len(active) >= required and not n.get("autoReview"))
+        if bool(f.get("confirmed")) != bool(confirmed):
+            codes.append("release-session-changed")
+            break
+
+    outbox = [o for o in cur.get("notifyOutbox", []) if isinstance(o, dict)]
+    if outbox:
+        codes.append("release-notify-changed")
+    actionable = {"pending", "sent", "delivered", "snoozed", "failed", "deferred"}
+    if any(isinstance(n, dict) and n.get("status") in actionable for n in cur.get("notifications", []) or []):
+        codes.append("release-notify-changed")
+    # 冻结摘要里记录了通知项状态：与当前服务端状态逐条比对
+    frozen_items = {x.get("id"): x.get("status") for x in (((release.get("evidence") or {}).get("notify") or {}).get("actionable") or []) if isinstance(x, dict)}
+    server_items = {n.get("id"): n.get("status") for n in cur.get("notifications", []) if isinstance(n, dict)}
+    for nid, status in frozen_items.items():
+        if server_items.get(nid) != status:
+            codes.append("release-notify-changed")
+            break
+    return sorted(set(codes))
+
+
+def _assess_release_conflict(cur, doc):
+    """
+    发布门禁乐观并发（与 web/js/geom/releases.js assessServerReleaseConflict 同构）。
+    只对本次推进了 rev 的候选核验：另一窗口已前进（批准/撤销/取代）-> release-advanced；
+    源会话缺失 / 撤销无原因 / 批准时门禁不过或证据已过期 -> 对应 release-* 409。
+    """
+    base_revs = doc.get("baseReleaseRevs")
+    if not isinstance(base_revs, dict):
+        return None
+    if not isinstance(cur, dict):
+        cur = {}
+    cur_releases = {r.get("id"): r for r in cur.get("releases", []) if isinstance(r, dict) and isinstance(r.get("id"), str)}
+    # 有效会话 = 服务端已有会话 ∪ 本次提交自带的新会话（同一次保存里新建会话与候选原子出现）
+    cur_sessions = {s.get("id") for s in cur.get("reviewSessions", []) if isinstance(s, dict) and s.get("id")}
+    for s in doc.get("reviewSessions", []) or []:
+        if isinstance(s, dict) and s.get("id"):
+            cur_sessions.add(s.get("id"))
+    for r in doc.get("releases", []) or []:
+        if not isinstance(r, dict) or not isinstance(r.get("id"), str):
+            continue
+        rid = r["id"]
+        base = base_revs.get(rid)
+        if not isinstance(base, int) or isinstance(base, bool):
+            continue
+        try:
+            rrev = int(r.get("rev"))
+        except (TypeError, ValueError):
+            continue
+        if rrev <= base:
+            continue
+        srv = cur_releases.get(rid)
+        if srv is not None and int(srv.get("rev") or 0) != base:
+            return {"reason": "release-advanced", "releaseId": rid, "serverRev": srv.get("rev", 1), "release": srv}
+        if r.get("sessionId") not in cur_sessions:
+            return {"reason": "release-session-missing", "releaseId": rid, "sessionId": r.get("sessionId")}
+        if r.get("state") == "revoked":
+            rev = r.get("revocation") or {}
+            if not str(rev.get("reason") or "").strip():
+                return {"reason": "release-revocation-reason-required", "releaseId": rid}
+        if r.get("state") == "approved" and r.get("approvals"):
+            blocked = _release_gate_blocked(r)
+            if blocked:
+                return {"reason": "release-gate-blocked", "releaseId": rid, "blockers": blocked}
+            stale = _release_stale_against(cur, r)
+            if stale:
+                return {"reason": "release-stale", "releaseId": rid, "staleCodes": stale}
+    return None
+
+
+def _merge_releases(server_list, client_list):
+    """发布候选按 id 并集；同 id rev 更大者整体胜出，审批/历史记录按 id 并集（审计链不丢）。"""
+    by_id = {}
+    order = []
+    for r in list(server_list or []) + list(client_list or []):
+        if not isinstance(r, dict) or not isinstance(r.get("id"), str):
+            continue
+        rid = r["id"]
+        ex = by_id.get(rid)
+        if ex is None:
+            by_id[rid] = r
+            order.append(rid)
+            continue
+        winner = r if int(r.get("rev") or 0) > int(ex.get("rev") or 0) else ex
+        merged = dict(winner)
+        appr = {a.get("id"): a for a in (ex.get("approvals") or []) if isinstance(a, dict) and a.get("id")}
+        for a in r.get("approvals") or []:
+            if isinstance(a, dict) and a.get("id"):
+                prev = appr.get(a["id"])
+                appr[a["id"]] = {**(prev or {}), **a}
+        merged["approvals"] = sorted(appr.values(), key=lambda a: (int(a.get("at") or 0), str(a.get("id") or "")))
+        hist = {}
+        for h in list(ex.get("history") or []) + list(r.get("history") or []):
+            if isinstance(h, dict):
+                hist[f'{h.get("at")}|{h.get("action")}|{h.get("by") or ""}|{h.get("detail") or ""}'] = h
+        merged["history"] = sorted(hist.values(), key=lambda h: (int(h.get("at") or 0), str(h.get("action") or "")))
+        if not merged.get("revocation") and (ex.get("revocation") or r.get("revocation")):
+            merged["revocation"] = ex.get("revocation") or r.get("revocation")
+        by_id[rid] = merged
+    out = [by_id[i] for i in order]
+    out.sort(key=lambda r: (int(r.get("createdAt") or 0), int(r.get("candidateNo") or 1), str(r.get("id") or "")))
+    return out
+
+
 def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
     """跨分支并发合流。与 web/js/geom/audit.js mergeDocs 同构。"""
     evs = {e["id"]: e for e in server_doc.get("events", []) if isinstance(e, dict)}
@@ -810,6 +974,7 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
         server_doc.get("notifyOutbox", []), client_doc.get("notifyOutbox", []), outbox_tombstones)
     notify_batches = _merge_batches(server_doc.get("notifyBatches", []), client_doc.get("notifyBatches", []))
     notify_drafts = _merge_drafts(server_doc.get("notifyDrafts", []), client_doc.get("notifyDrafts", []))
+    releases = _merge_releases(server_doc.get("releases", []), client_doc.get("releases", []))
 
     merged = dict(server_doc)
     merged.update({
@@ -824,6 +989,9 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
         "notifyOutbox": notify_outbox,
         "notifyBatches": notify_batches,
         "notifyDrafts": notify_drafts,
+        "releases": releases,
+        "activeReleaseId": server_doc.get("activeReleaseId")
+            or (client_doc.get("activeReleaseId") if any(r.get("id") == client_doc.get("activeReleaseId") for r in releases) else None),
         "activeReviewId": server_doc.get("activeReviewId")
             or (client_doc.get("activeReviewId") if any(s.get("id") == client_doc.get("activeReviewId") for s in review_sessions) else None),
         "currentVersionId": server_doc.get("currentVersionId"),
@@ -917,6 +1085,11 @@ class Handler(BaseHTTPRequestHandler):
             if notify_conflict:
                 self._send_json(409, {"error": "notify-conflict", "rev": cur_rev, **notify_conflict})
                 return
+            # 发布门禁：候选被另一窗口前进 / 证据过期 / 门禁阻断 / 撤销无原因 → 409（本地审批意见保留）
+            release_conflict = _assess_release_conflict(cur, doc)
+            if release_conflict:
+                self._send_json(409, {"error": "release-conflict", "rev": cur_rev, **release_conflict})
+                return
             if doc["baseRev"] != cur_rev:
                 # 文档已被其他页面前进：先判断是否可以按分支合流
                 mergeable, info = _assess_conflict(cur, doc)
@@ -934,6 +1107,7 @@ class Handler(BaseHTTPRequestHandler):
                     merged.pop("baseReviewRevs", None)
                     merged.pop("baseNotifyRuleRevs", None)
                     merged.pop("baseNotifyItemRevs", None)
+                    merged.pop("baseReleaseRevs", None)
                     merged.pop("notifyOutboxTombstones", None)
                     merged["rev"] = cur_rev + 1
                     _save_doc(merged)
@@ -945,6 +1119,7 @@ class Handler(BaseHTTPRequestHandler):
                 doc.pop("baseReviewRevs", None)
                 doc.pop("baseNotifyRuleRevs", None)
                 doc.pop("baseNotifyItemRevs", None)
+                doc.pop("baseReleaseRevs", None)
                 doc.pop("notifyOutboxTombstones", None)
                 doc["rev"] = 1
                 _save_doc(doc)
@@ -960,6 +1135,7 @@ class Handler(BaseHTTPRequestHandler):
             doc.pop("baseReviewRevs", None)
             doc.pop("baseNotifyRuleRevs", None)
             doc.pop("baseNotifyItemRevs", None)
+            doc.pop("baseReleaseRevs", None)
             doc.pop("notifyOutboxTombstones", None)
             # 直存：客户端文档即权威；仅按其墓碑兜底过滤可能残留的已终结队列条目
             if outbox_tombstones and isinstance(doc.get("notifyOutbox"), list):

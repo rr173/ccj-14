@@ -5,11 +5,12 @@
   "type": "module",
   "description": "确定性几何约束矩形编辑器（贴齐/最小间距/画布包含/锁定尺寸 + 冲突链 + 环检测 + 撤销重做）",
   "scripts": {
-    "test": "node --test test/solver.test.mjs test/versions.test.mjs test/audit.test.mjs test/experiments.test.mjs test/workbench.test.mjs test/reviews.test.mjs test/notifications.test.mjs",
+    "test": "node --test test/solver.test.mjs test/versions.test.mjs test/audit.test.mjs test/experiments.test.mjs test/workbench.test.mjs test/reviews.test.mjs test/notifications.test.mjs test/releases.test.mjs",
     "test:e2e": "node test/e2e.mjs",
     "test:e2e:experiments": "node test/e2e-experiments.mjs",
     "test:e2e:reviews": "node test/e2e-reviews.mjs",
     "test:e2e:notify": "node test/e2e-notify.mjs",
+    "test:e2e:releases": "node test/e2e-releases.mjs",
     "start": "python3 server/server.py"
   }
 }

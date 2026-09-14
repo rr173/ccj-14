@@ -215,6 +215,47 @@ ants 多边形标出。`contain → 画布` 不算矩形间边，不会参与成
 有效签名数 / 完成条件以及既有签名历史不可变。跨分支合流时会话按 id 并集、同 id 以
 rev 更大者整体胜出、冲突记录按 id 并集。
 
+## 发布门禁与证据快照（release candidates）
+
+「审计台」页可从一个审阅会话（或已完成会话）**创建发布候选**，创建瞬间冻结一份
+不可变**证据快照**（`web/js/geom/releases.js`，随文档持久化在 `releases[]`）：
+
+- 创建时刻的筛选条件、节点顺序（`order`）与基线哈希；
+- 每个节点的**最新决定与签署状态**（有效签名 id/决定/理由、失效签名、确认状态、待复核）；
+- **实验来源**：快照引用的实验 / 变体身份、完成变体结果指纹、实验基准指纹；
+- 相关编辑分支身份与冻结 head；
+- **通知处理摘要**：通知事件数、通知项按状态分布、待处理项明细、FIFO 队列条目与规则版本（带 `stateHash`）。
+
+门禁只有在全部阻断检查通过时才放行（冻结时与审批时各评估一次）：所有节点达到策略
+配置的有效签署人数、没有待复核（含系统转待复核）、没有损坏 / 缺失节点、没有指纹漂移
+与分支推进、没有未决冲突记录、会话基线与当前时间线一致、会话已按完成条件完成、
+**通知 FIFO 队列没有未处理条目且没有待处理通知项**（待到期通知只提示不阻断）、
+实验变体结果与编辑分支引用完整。缺失 / 过期 / 待复核项在候选详情中明确列出。
+
+**审批期间源会话、实验分支或通知状态发生任何变化**，候选由确定性对账
+（`reconcileRelease`：重算会话 / 实验 / 分支 / 通知摘要哈希并与冻结值比较）标记为
+**过期（stale）**，批准被阻止；必须**重新生成快照**——旧候选保留为 `superseded`
+（证据、门禁、审批意见原样保留），新候选 `candidateNo+1` 并以 `supersedesId` 指向旧候选。
+已批准 / 已撤销候选是审计事实，不再翻转过期状态。
+
+多窗口同时审批同一候选：候选带单调递增 `rev`，保存携带 `baseReleaseRevs`，后提交者
+收到 `409 release-advanced`（另有 `release-stale` / `release-gate-blocked` /
+`release-revocation-reason-required` / `release-session-missing`），本地审批意见
+（批准人 / 意见）原样保留为提案，可在最新 rev 上重试或放弃；与发布无关的几何 / 审阅
+保存不被锁。已批准候选可以**撤销（必须填写原因）**，撤销记录包含当时审批链与证据哈希，
+完整审计链（`history[]`：created / approved / revoked / superseded）永久保留。
+
+刷新 / 重启后候选、证据内容、门禁结果、审批意见、撤销记录全部恢复；加载清洗
+（`sanitizeReleases`）对旧版候选补全缺失门禁检查项（按未通过处理，防止伪造批准）。
+发布报告 `buildReleaseReport` 导出证据快照、冻结 / 当前门禁、过期原因、审批与撤销
+记录及缺失 / 损坏 / 待复核节点清单，键名递归排序保证逐字节确定，并附 FNV 校验和。
+
+服务端 `server.py` 的 `_assess_release_conflict` 与浏览器同构：候选 rev 前进、
+源会话缺失、撤销无原因、冻结门禁带阻断项、以及服务端可复验的过期（会话 rev /
+节点指纹 / 确认状态、通知 outbox 与待处理项、冻结通知状态）均返回 409；
+结构校验还会直接拒绝无撤销原因的 revoked 载荷（422）。跨分支合流时候选按 id 并集、
+同 id 以 rev 更大者整体胜出、审批意见与历史按 id 并集。
+
 ## 运行
 
 ### Docker（推荐）
@@ -244,13 +285,15 @@ DATA_PATH=./data/doc.json HOST=127.0.0.1 PORT=8080 python3 server/server.py
 
 ```bash
 npm test          # 单元测试（求解器 15 + 布局版本 9 + 审计/分支 14 + 布局方案实验 17
-                  # + 实验审计工作台 21 + 可恢复审阅会话 29）
+                  # + 实验审计工作台 21 + 可恢复审阅会话 35 + 通知中心 26
+                  # + 发布门禁与证据快照 20）
 # 端到端（需要先启动 server）：
 DATA_PATH=/tmp/rc.json python3 server/server.py &
 npm run test:e2e  # Store ↔ HTTP：提交、环拒绝、冲突链、undo/redo、刷新一致性、
                   # 版本保存/比较/恢复/发布、审计回放/fork、409 分支已前进不覆盖
 npm run test:e2e:experiments   # 实验建立/批量求解/幂等/暂停继续取消/损坏容忍/另存分支（真实 HTTP）
 npm run test:e2e:reviews       # 审阅会话快照/决定持久化/多窗口 409 + 逐项合并/指纹 409/报告导出（真实 HTTP）
+npm run test:e2e:releases      # 证据快照冻结/门禁阻断/过期与重新生成/多窗口审批 409/撤销/伪造拒绝（真实 HTTP）
 ```
 
 ## 目录
@@ -258,7 +301,8 @@ npm run test:e2e:reviews       # 审阅会话快照/决定持久化/多窗口 40
 ```
 server/server.py        零依赖 HTTP：静态文件 + /api/doc（原子持久化 + baseRev/baseHeads
                          乐观并发：同分支 head 前进 -> 409，不同分支 -> 事件/实验并集合流；
-                         审阅会话 baseReviewRevs + 节点指纹/存在性/分支链校验 -> review-* 409）
+                         审阅会话 baseReviewRevs + 节点指纹/存在性/分支链校验 -> review-* 409；
+                         发布候选 baseReleaseRevs + rev/会话/门禁/撤销原因/通知状态 -> release-* 409）
 web/index.html
 web/css/app.css
 web/js/app.js           装配：工具栏 / 面板 / 审计分支事件 / 实验面板 / 冲突与回放横幅 / 快捷键 / toast
@@ -270,16 +314,20 @@ web/js/geom/experiments.js 实验纯函数：变体定义/配置指纹/批量求
 web/js/geom/auditbench.js 实验审计工作台纯函数：统一节点时间线/健康标注（缺失/重复/指纹/分支推进）/筛选/步进/状态清洗/导出
 web/js/geom/reviews.js  可恢复审阅会话纯函数：创建快照/决定与变更记录/进度/对账（损坏·缺失·指纹·分支推进转待复核）/
                          刷新基线/完成重开/清洗/合流/服务端冲突判定/审阅报告（纯函数，无 DOM 依赖）
-web/js/geom/store.js    事件流+分支+实验运行器（排队/暂停/继续/取消）、审阅会话（409 提案/逐项合并）、回放/fork、版本与持久化
+web/js/geom/releases.js 发布门禁纯函数：证据快照冻结（会话决定签署/实验来源/通知摘要）/门禁评估/
+                         过期对账（会话·实验分支·通知哈希）/批准/撤销/重新生成/清洗/合流/服务端冲突判定/发布报告
+web/js/geom/store.js    事件流+分支+实验运行器（排队/暂停/继续/取消）、审阅会话（409 提案/逐项合并）、
+                         发布候选（门禁/过期/审批 409 意见保留/撤销）、回放/fork、版本与持久化
 web/js/geom/versions.js 版本快照 + 版本间差异比较（纯函数，无 DOM 依赖）
 web/js/geom/diff.js     差异结果 HTML 渲染（版本比较 / 分支比较 / 实验变体比较共用）
 web/js/geom/versionpanel.js  版本页 UI（保存/恢复/发布/删除/比较）
 web/js/geom/auditpanel.js    审计/分支页 UI（时间线/回放/fork/分支比较/健康警告）
 web/js/geom/experimentpanel.js 实验页 UI（变体编辑器/状态/暂停继续取消/与基准差异/另存分支）
 web/js/geom/workbenchpanel.js 审计台页 UI（筛选、求解前后切换、顺序回放、审阅会话决定/409 合并/报告、导出）
+web/js/geom/releasepanel.js 审计台页发布门禁 UI（候选/证据快照/门禁清单/缺失过期待复核/批准/重新生成/撤销/409 意见/报告）
 web/js/geom/view.js     SVG 渲染与统一指针手势（拖动/组拖/框选/调尺寸，回放时只读）
 web/js/geom/dialog.js   添加约束对话框（环拒绝时定位）
-test/                   单元测试 + HTTP 端到端冒烟（e2e.mjs / e2e-experiments.mjs / e2e-reviews.mjs）
+test/                   单元测试 + HTTP 端到端冒烟（e2e.mjs / e2e-experiments.mjs / e2e-reviews.mjs / e2e-releases.mjs）
 ```
 
 ## 操作提示
@@ -289,5 +337,9 @@ test/                   单元测试 + HTTP 端到端冒烟（e2e.mjs / e2e-expe
 - 双击矩形重命名；右下角手柄调尺寸（锁定尺寸的矩形无手柄，手势被拒绝并提示）。
 - 约束列表可改优先级、启停、复制、删除；悬停约束会在画布上高亮对应连线。
 - 冲突页列出每条未满足约束的冲突链、偏差量，并可一键提高优先级或定位。
+- 发布门禁：审阅会话全部节点签署完成并「标记完成」、通知中心没有待处理项与队列
+  条目后，在「审计台」会话标题栏点「🚪 创建发布候选」；候选红色阻断项清零才能批准。
+  若审批期间有人提交几何 / 审阅签名 / 处理通知，候选会显示「已过期」，请
+  「⟳ 重新生成快照」（旧候选保留为审计记录）再批准。
 - 快捷键：`Ctrl+Z` 撤销，`Ctrl+Y` / `Ctrl+Shift+Z` 重做，`Ctrl+A` 全选，
   `Del` 删除，`Esc` 取消。

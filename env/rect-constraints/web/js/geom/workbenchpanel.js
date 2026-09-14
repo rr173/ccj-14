@@ -122,6 +122,7 @@ export class WorkbenchPanel {
         </div>
       </div>
       <div id="wb-reviews" class="wb-reviews"></div>
+      <div id="wb-releases" class="wb-releases"></div>
       <div id="wb-list" class="list wb-list"></div>`;
 
     this.$branch = this.$body.querySelector('#wb-branch');
@@ -696,6 +697,7 @@ export class WorkbenchPanel {
           ? '<button class="mini" data-rv-act="reopen">重开会话</button>'
           : `<button class="mini primary" data-rv-act="complete" ${p.complete ? '' : 'disabled'} title="全部节点（含系统转待复核）处理完后可完成">标记完成</button>`}
         <button class="mini" data-rv-act="rebase" title="按当前筛选结果重建基线：保留全部决定与变更历史，新节点成为未处理项">⟳ 刷新基线</button>
+        <button class="mini" data-rv-act="create-release" title="从本会话冻结证据快照并创建发布候选（门禁：签署门槛/待复核/损坏缺失/通知队列全部通过才能批准）">🚪 创建发布候选</button>
         <button class="mini" data-rv-act="report" title="导出完整审阅报告（快照/进度/每节点决定理由/变更记录/冲突）">⬇ 导出报告</button>
         <button class="mini" data-rv-act="close" title="关闭会话（数据保留，可随时恢复）">✕</button>
       </div>
@@ -965,6 +967,7 @@ export class WorkbenchPanel {
       return;
     }
     if (act === 'report') { this._exportReviewReport(sid); return; }
+    if (act === 'create-release') { this._createRelease(sid); return; }
     if (act === 'apply-filter') {
       const sess = s.reviewSessionById(sid);
       if (sess) {
@@ -1032,6 +1035,22 @@ export class WorkbenchPanel {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
     this.hooks.toast(`已导出完整审阅报告（${report.progress.total} 节点 / 变更 ${report.changeLog.length} / 冲突 ${report.conflicts.length} / 校验和 ${doc.contentChecksum}）`);
+  }
+
+  /* ---------------- 发布门禁与证据快照 ---------------- */
+
+  _createRelease(sid) {
+    const sess = this.store.reviewSessionById(sid);
+    if (!sess) { this.hooks.toast('审阅会话不存在，无法创建发布候选', 'error'); return; }
+    const defName = `发布 ${sess.name}`.slice(0, 60);
+    const name = prompt('从审阅会话「' + sess.name + '」冻结证据快照并创建发布候选，名称：', defName);
+    if (name === null) return;
+    const res = this.store.createRelease(sid, { name: name.trim() || defName });
+    if (!res.ok) { this.hooks.toast(res.error || '创建发布候选失败', 'error'); return; }
+    const blockers = res.view.gate.blockers.length;
+    this.hooks.toast(blockers
+      ? `证据快照已冻结（候选 #${res.release.candidateNo}）：门禁有 ${blockers} 项阻断，处理后才能批准发布`
+      : `证据快照已冻结（候选 #${res.release.candidateNo}）：门禁全部通过，可以批准发布`);
   }
 
   /* ---------------- 导出 ---------------- */
