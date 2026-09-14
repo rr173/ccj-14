@@ -194,7 +194,7 @@ def _valid_notify_shape(doc):
         if not isinstance(n.get("eventId"), str) or not isinstance(n.get("recipient"), str):
             return False
         if n.get("status") not in (
-            "scheduled", "pending", "sent", "delivered", "acknowledged",
+            "scheduled", "deferred", "pending", "sent", "delivered", "acknowledged",
             "snoozed", "transferred", "failed", "cancelled",
         ):
             return False
@@ -203,6 +203,26 @@ def _valid_notify_shape(doc):
         return False
     for o in outbox:
         if not isinstance(o, dict) or not isinstance(o.get("id"), str) or not isinstance(o.get("notifyId"), str):
+            return False
+    # 批量处理结果（append-only，可为空）：轻量结构校验
+    batches = doc.get("notifyBatches", [])
+    if not isinstance(batches, list):
+        return False
+    for b in batches:
+        if not isinstance(b, dict) or not isinstance(b.get("id"), str):
+            return False
+        if b.get("action") not in ("ack", "snooze", "transfer"):
+            return False
+        if not isinstance(b.get("results", []), list):
+            return False
+    # 本地通知草稿（批量部分版本冲突保留，可为空）
+    drafts = doc.get("notifyDrafts", [])
+    if not isinstance(drafts, list):
+        return False
+    for d in drafts:
+        if not isinstance(d, dict) or not isinstance(d.get("id"), str) or not isinstance(d.get("notifyId"), str):
+            return False
+        if d.get("action") not in ("ack", "snooze", "transfer"):
             return False
     return True
 
@@ -568,8 +588,8 @@ def _merge_notify_rules(server_list, client_list):
 
 def _item_rank(n):
     return {
-        "scheduled": 0, "cancelled": 1, "pending": 2, "snoozed": 2, "failed": 2,
-        "sent": 3, "delivered": 4, "transferred": 5, "acknowledged": 6,
+        "scheduled": 0, "deferred": 1, "cancelled": 1, "pending": 2, "snoozed": 2,
+        "failed": 2, "sent": 3, "delivered": 4, "transferred": 5, "acknowledged": 6,
     }.get(n.get("status"), 0)
 
 
@@ -591,6 +611,15 @@ def _merge_notifications(server_list, client_list):
             merged["attempts"] = max(int(ex.get("attempts") or 0), int(n.get("attempts") or 0))
         except (TypeError, ValueError):
             merged["attempts"] = ex.get("attempts", 0)
+        # 物化原顺序序号取小（静音窗口结束后按原顺序发送）
+        try:
+            merged["seq"] = min(int(ex.get("seq") or 0), int(n.get("seq") or 0))
+        except (TypeError, ValueError):
+            pass
+        # readyAt 取早（两方对静音顺延的一致估计）
+        ra = [x for x in (ex.get("readyAt"), n.get("readyAt")) if isinstance(x, (int, float))]
+        if ra:
+            merged["readyAt"] = min(ra)
         hist = {}
         for h in list(ex.get("history") or []) + list(n.get("history") or []):
             if isinstance(h, dict):
@@ -600,6 +629,35 @@ def _merge_notifications(server_list, client_list):
     out = list(by_id.values())
     out.sort(key=lambda n: (int(n.get("dueAt") or 0), int(n.get("eventAt") or 0), int(n.get("level") or 0), n.get("id") or ""))
     return out
+
+
+def _merge_appendonly(server_list, client_list, id_key="id", sort_key="at"):
+    """批量结果 / 草稿：按稳定 id append-only 并集（同 id 字段更完整者胜出）。"""
+    by_id = {}
+    order = []
+    for x in list(server_list or []) + list(client_list or []):
+        if not isinstance(x, dict) or not isinstance(x.get(id_key), str):
+            continue
+        xid = x[id_key]
+        ex = by_id.get(xid)
+        if ex is None:
+            by_id[xid] = x
+            order.append(xid)
+            continue
+        # 同 id：results / 成功失败计数取更完整的一份（结果一旦写入不可变）
+        if len(x.get("results") or []) > len(ex.get("results") or []):
+            by_id[xid] = x
+    out = [by_id[i] for i in order]
+    out.sort(key=lambda b: (int(b.get(sort_key) or 0), b.get(id_key) or ""))
+    return out
+
+
+def _merge_batches(server_list, client_list):
+    return _merge_appendonly(server_list, client_list, "id", "at")
+
+
+def _merge_drafts(server_list, client_list):
+    return _merge_appendonly(server_list, client_list, "id", "at")
 
 
 def _tombstone_set(doc):
@@ -635,6 +693,10 @@ def _merge_outbox(server_list, client_list, tombstones=None):
             merged["attempts"] = max(int(ex.get("attempts") or 0), int(o.get("attempts") or 0))
         except (TypeError, ValueError):
             pass
+        try:
+            merged["seq"] = min(int(ex.get("seq") or 0), int(o.get("seq") or 0))
+        except (TypeError, ValueError):
+            pass
         t1, t2 = ex.get("enqueuedAt"), o.get("enqueuedAt")
         if isinstance(t1, (int, float)) and isinstance(t2, (int, float)):
             merged["enqueuedAt"] = min(t1, t2)
@@ -642,7 +704,7 @@ def _merge_outbox(server_list, client_list, tombstones=None):
         merged["nextAttemptAt"] = min(nxt) if nxt else (ex.get("nextAttemptAt") if ex.get("nextAttemptAt") is not None else o.get("nextAttemptAt"))
         by_notify[nid] = merged
     out = list(by_notify.values())
-    out.sort(key=lambda o: (int(o.get("enqueuedAt") or 0), o.get("id") or ""))
+    out.sort(key=lambda o: (int(o.get("enqueuedAt") or 0), int(o.get("seq") or 0), o.get("id") or ""))
     return out
 
 
@@ -739,12 +801,15 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
     experiments = _merge_experiments(server_doc.get("experiments", []), client_doc.get("experiments", []))
     review_sessions = _merge_review_sessions(server_doc.get("reviewSessions", []), client_doc.get("reviewSessions", []))
 
-    # 通知中心：事件 append-only 并集；规则按 rev/墓碑；通知项远端状态胜出 + 历史并集；队列 FIFO 并集
+    # 通知中心：事件 append-only 并集；规则按 rev/墓碑；通知项远端状态胜出 + 历史并集；队列 FIFO 并集；
+    # 批量结果 / 本地草稿按稳定 id append-only 并集（部分冲突失败项在刷新 / 重启后仍保留）
     notify_events = _merge_notify_events(server_doc.get("notifyEvents", []), client_doc.get("notifyEvents", []))
     notify_rules = _merge_notify_rules(server_doc.get("notifyRules", []), client_doc.get("notifyRules", []))
     notifications = _merge_notifications(server_doc.get("notifications", []), client_doc.get("notifications", []))
     notify_outbox = _merge_outbox(
         server_doc.get("notifyOutbox", []), client_doc.get("notifyOutbox", []), outbox_tombstones)
+    notify_batches = _merge_batches(server_doc.get("notifyBatches", []), client_doc.get("notifyBatches", []))
+    notify_drafts = _merge_drafts(server_doc.get("notifyDrafts", []), client_doc.get("notifyDrafts", []))
 
     merged = dict(server_doc)
     merged.update({
@@ -757,6 +822,8 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
         "notifyRules": notify_rules,
         "notifications": notifications,
         "notifyOutbox": notify_outbox,
+        "notifyBatches": notify_batches,
+        "notifyDrafts": notify_drafts,
         "activeReviewId": server_doc.get("activeReviewId")
             or (client_doc.get("activeReviewId") if any(s.get("id") == client_doc.get("activeReviewId") for s in review_sessions) else None),
         "currentVersionId": server_doc.get("currentVersionId"),

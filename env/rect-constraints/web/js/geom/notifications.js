@@ -10,18 +10,28 @@
  * 2. 通知规则（notifyRules[]，按会话配置，多级接收人 / 延迟 / 升级顺序）
  *    rule.rev 单调递增，携带乐观并发；规则修改后 revisedAt 作为水位：旧事件不会因为
  *    新规则 / 新接收人被补发（已物化的 (事件,级别,接收人) 仍保留）。
+ *    rule.schedule 配置【每周工作时段】（workHours: 每周 0..10079 分钟的开区间段）
+ *    与【静音窗口】（quietWindows: 一次性 [startAt,endAt] 绝对时间窗口 + 可重复的每周段）。
  *
  * 3. 通知项（notifications[]，按事件 × 升级级别 × 接收人幂等物化）
  *    id = hash32(ruleId|rev|eventId|level|recipient)。页面内可
- *    确认(ack) / 稍后提醒(snooze) / 转交(transfer) / 重排队(retry)。
+ *    确认(ack) / 稍后提醒(snooze) / 转交(transfer) / 重排队(retry) / 批量(batch*)。
  *    事件在规则任一接收人确认后，后续升级级别不再物化（已经送达的更高级别不撤回）。
+ *    静音窗口 / 非工作时段触发的通知：可发送时刻顺延到窗口结束后的第一个工作时刻
+ *    （readyAt），状态为 deferred；窗口结束后按物化原顺序（seq / enqueuedAt）继续发送与升级。
  *
  * 4. 发送队列（notifyOutbox[]，严格 FIFO）
  *    due 的通知项按物化顺序入队；网络不可用时留在队列，恢复后按原顺序重试，
  *    每项有稳定 outbox id，重复入队 / 重复发送都按 id 幂等，attempts 持久化。
+ *    队头处于 deferred（未到工作时刻）时阻塞后续项，保证「窗口结束后按原顺序」。
+ *
+ * 5. 批量处理（notifyBatches[]，append-only）
+ *    收件箱可按会话批量 确认 / 稍后提醒 / 转交；批请求只提交成功项，遇到版本冲突
+ *    （409 / 不可操作 / 缺失）的项保留为本地草稿（notifyDrafts[]），成功项照常提交。
+ *    批量结果（成功 / 失败 / 冲突清单与原因）随文档持久化，刷新 / 重启后保持一致。
  *
  * 所有清洗 / 对账都是确定性、幂等的纯函数：刷新、重启、跨窗口合流后规则、队列、
- * 重试次数、升级状态、确认记录和最终送达结果逐字节一致。
+ * 重试次数、升级状态、确认记录、静音计时、队列顺序、批处理结果和最终送达结果逐字节一致。
  */
 
 import { uid } from './model.js';
@@ -54,12 +64,16 @@ export const EVENT_LABEL = {
   'session-reopened': '会话重开',
 };
 
-/** 通知项生命周期状态 */
-export const ITEM_STATES = ['scheduled', 'pending', 'sent', 'delivered', 'acknowledged', 'snoozed', 'transferred', 'failed', 'cancelled'];
+/** 通知项生命周期状态（deferred：在静音窗口 / 非工作时段内等待，到工作时刻后按原顺序发送） */
+export const ITEM_STATES = ['scheduled', 'deferred', 'pending', 'sent', 'delivered', 'acknowledged', 'snoozed', 'transferred', 'failed', 'cancelled'];
 
-const ACTIONABLE = new Set(['pending', 'sent', 'delivered', 'snoozed', 'failed']);
+const ACTIONABLE = new Set(['pending', 'sent', 'delivered', 'snoozed', 'failed', 'deferred']);
 const TERMINAL = new Set(['acknowledged', 'transferred', 'cancelled']);
 export const MAX_ATTEMPTS = 5;
+
+/** 每周分钟数（0=本地时间周一 00:00）。 */
+export const WEEK_MIN = 7 * 24 * 60;
+export const DAY_MIN = 24 * 60;
 
 /* ============================== 工具 ============================== */
 
@@ -83,6 +97,180 @@ function clampInt(v, min, max, fallback) {
   const n = Number(v);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+/* ============================== 工作时段 / 静音窗口（schedule） ============================== */
+
+/** 本地时间的「周内分钟数」（0 = 周一 00:00 … 10079 = 周日 23:59）。 */
+export function minuteOfWeek(d) {
+  const x = d instanceof Date ? d : new Date(d);
+  // JS getDay(): 周日=0 .. 周六=6 → 周一=0 .. 周日=6
+  const day = (x.getDay() + 6) % 7;
+  return day * DAY_MIN + x.getHours() * 60 + x.getMinutes();
+}
+
+function dateFromWeekMinute(refDate, target) {
+  const refMin = minuteOfWeek(refDate);
+  let delta = target - refMin;
+  if (delta <= 0) delta += WEEK_MIN;
+  return new Date(refDate.getTime() + delta * 60_000 - (refDate.getSeconds() * 1000 + refDate.getMilliseconds()));
+}
+
+function normalizeWorkRanges(raw) {
+  const out = [];
+  for (const r of Array.isArray(raw) ? raw : []) {
+    const from = clampInt(r?.from, 0, WEEK_MIN - 1, NaN);
+    const to = clampInt(r?.to, 0, WEEK_MIN, NaN);
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) continue;
+    out.push({ from, to });
+  }
+  // 确定性合并重叠 / 相邻段
+  out.sort((a, b) => (a.from - b.from) || (a.to - b.to));
+  const merged = [];
+  for (const r of out) {
+    const last = merged[merged.length - 1];
+    if (last && r.from <= last.to) last.to = Math.max(last.to, r.to);
+    else merged.push({ ...r });
+  }
+  return merged;
+}
+
+function normalizeQuietWeekly(raw) {
+  const out = [];
+  for (const r of Array.isArray(raw) ? raw : []) {
+    const from = clampInt(r?.from, 0, WEEK_MIN - 1, NaN);
+    const to = clampInt(r?.to, 1, WEEK_MIN, NaN);
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) continue;
+    out.push({ from, to });
+  }
+  out.sort((a, b) => (a.from - b.from) || (a.to - b.to));
+  return out;
+}
+
+function normalizeQuietWindows(raw) {
+  const out = [];
+  for (const w of Array.isArray(raw) ? raw : []) {
+    const startAt = clampInt(w?.startAt, 0, 8.64e15, NaN);
+    const endAt = clampInt(w?.endAt, 0, 8.64e15, NaN);
+    if (!Number.isFinite(startAt) || !Number.isFinite(endAt) || endAt <= startAt) continue;
+    out.push({ startAt, endAt, label: String(w?.label || '').slice(0, 60) });
+  }
+  out.sort((a, b) => (a.startAt - b.startAt) || (a.endAt - b.endAt));
+  return out;
+}
+
+/**
+ * 规范化规则的工作时间配置：
+ *  - workHours：每周工作时段 [{from,to}]（周内分钟，可跨周）；空数组表示全天 24×7 可发送。
+ *  - quietWeekly：每周重复的静音段 [{from,to}]（非工作时段之外的额外静音）。
+ *  - quietWindows：一次性静音窗口 [{startAt,endAt,label}]（绝对时间，例如节假日 / 临时静默）。
+ */
+export function normalizeSchedule(raw = {}) {
+  return {
+    workHours: normalizeWorkRanges(raw.workHours),
+    quietWeekly: normalizeQuietWeekly(raw.quietWeekly),
+    quietWindows: normalizeQuietWindows(raw.quietWindows),
+  };
+}
+
+function inWeeklyRanges(min, ranges) {
+  return ranges.some((r) => min >= r.from && min < r.to);
+}
+
+/** 给定时刻是否处于规则的可发送时间（在工作时段内且不在任何静音窗口内）。 */
+export function scheduleIsOpenAt(schedule, at) {
+  const sch = schedule && (schedule.workHours || schedule.quietWeekly || schedule.quietWindows)
+    ? schedule : normalizeSchedule(schedule);
+  const d = new Date(at);
+  const min = minuteOfWeek(d);
+  if (sch.workHours.length && !inWeeklyRanges(min, sch.workHours)) return false;
+  if (sch.quietWeekly.length && inWeeklyRanges(min, sch.quietWeekly)) return false;
+  for (const w of sch.quietWindows || []) if (at >= w.startAt && at < w.endAt) return false;
+  return true;
+}
+
+/** 收集一次性静音窗口在 [base, base+14d] 内的结束时刻（候选）。 */
+function quietWindowEnds(sch, base) {
+  const out = [];
+  const horizon = base + 14 * 24 * 60 * 60_000;
+  for (const w of sch.quietWindows || []) {
+    if (w.endAt > base && w.endAt <= horizon) out.push(w.endAt);
+  }
+  return out;
+}
+
+/**
+ * 计算不早于 earliest 的下一个可发送时刻（schedule 开放）。
+ * 若 earliest 本身已开放，直接返回 earliest；否则扫描未来 14 天内所有
+ * 工作时段 / 静音段边界，取第一个落在开放区间的时刻。全部配置为空时永远开放。
+ */
+export function nextOpenAt(schedule, earliest) {
+  const sch = normalizeSchedule(schedule);
+  const base = earliest;
+  if (scheduleIsOpenAt(sch, base)) return base;
+  if (!sch.workHours.length && !sch.quietWeekly.length && !sch.quietWindows.length) return base;
+
+  const baseDate = new Date(base);
+  const candidates = new Set(quietWindowEnds(sch, base));
+  // 未来两周内每周工作段 / 静音段的起点（分钟边界）
+  for (let k = 0; k <= 14; k++) {
+    const day = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate() + k);
+    day.setHours(0, 0, 0, 0);
+    for (const r of sch.workHours) {
+      candidates.add(dateFromWeekMinute(day, r.from).getTime());
+      candidates.add(dateFromWeekMinute(day, r.to).getTime());
+    }
+    for (const r of sch.quietWeekly) {
+      candidates.add(dateFromWeekMinute(day, r.from).getTime());
+      candidates.add(dateFromWeekMinute(day, r.to).getTime());
+    }
+  }
+  const sorted = [...candidates].filter((t) => t >= base).sort((a, b) => a - b);
+  for (const t of sorted) {
+    if (scheduleIsOpenAt(sch, t)) return t;
+  }
+  return base; // 兜底：配置极端（无任何工作段）时不无限推迟
+}
+
+/**
+ * 通知项最早可发送 / 升级时刻：名义到期（事件时间 + 级别延迟，或稍后提醒时刻）
+ * 再叠加工作时段与静音窗口顺延。返回绝对时间戳。
+ */
+export function readyAtFor(schedule, nominalDueAt) {
+  const sch = normalizeSchedule(schedule || {});
+  if (!sch.workHours.length && !sch.quietWeekly.length && !sch.quietWindows.length) return nominalDueAt;
+  return nextOpenAt(sch, nominalDueAt);
+}
+
+/** 当前处于静音 / 非工作时段的人类可读说明（用于横幅 / 卡片）。 */
+export function scheduleClosedReason(schedule, now = Date.now()) {
+  const sch = normalizeSchedule(schedule || {});
+  for (const w of sch.quietWindows || []) {
+    if (now >= w.startAt && now < w.endAt) return `静音窗口${w.label ? `「${w.label}」` : ''}中，${fmtClock(w.endAt)} 结束`;
+  }
+  const min = minuteOfWeek(new Date(now));
+  if (sch.quietWeekly.length && inWeeklyRanges(min, sch.quietWeekly)) {
+    const r = sch.quietWeekly.find((x) => min >= x.from && min < x.to);
+    return `每周静音时段中，${fmtClock(nextOpenAt(sch, now))} 恢复`;
+  }
+  if (sch.workHours.length && !inWeeklyRanges(min, sch.workHours)) {
+    return `非工作时段，下个工作时刻 ${fmtClock(nextOpenAt(sch, now))}`;
+  }
+  return '';
+}
+
+const WEEKDAY_CN = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+export function formatWeekMinute(m) {
+  const day = Math.floor(m / DAY_MIN);
+  const hm = m % DAY_MIN;
+  const p = (n) => String(n).padStart(2, '0');
+  return `${WEEKDAY_CN[day] || ''} ${p(Math.floor(hm / 60))}:${p(hm % 60)}`;
+}
+
+function fmtClock(ts) {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 /* ============================== 规则 ============================== */
@@ -130,6 +318,7 @@ export function normalizeRule(raw = {}, { now = Date.now() } = {}) {
     enabled,
     triggers,
     levels,
+    schedule: normalizeSchedule(raw.schedule || {}),
     createdAt,
     updatedAt: Number.isFinite(raw.updatedAt) ? raw.updatedAt : createdAt,
     revisedAt: Number.isFinite(raw.revisedAt) ? raw.revisedAt : (Number.isFinite(raw.createdAt) ? raw.createdAt : now),
@@ -149,9 +338,9 @@ export function validateRule(raw) {
 }
 
 /** 新建规则（rev=1，revisedAt=now：只对创建之后的事件生效，旧事件不补发）。 */
-export function createRule({ sessionId, name, triggers, levels, actor = '', now = Date.now() }) {
+export function createRule({ sessionId, name, triggers, levels, schedule = null, actor = '', now = Date.now() }) {
   const check = validateRule({
-    id: uid('nr'), sessionId, name, triggers, levels,
+    id: uid('nr'), sessionId, name, triggers, levels, schedule,
     createdAt: now, updatedAt: now, revisedAt: now, createdBy: actor, rev: 1,
   });
   if (!check.ok) throw new Error(check.error);
@@ -159,7 +348,7 @@ export function createRule({ sessionId, name, triggers, levels, actor = '', now 
 }
 
 /**
- * 修改规则：triggers / levels / name / enabled 的编辑会推进 rev 并把 revisedAt
+ * 修改规则：triggers / levels / schedule / name 的编辑会推进 rev 并把 revisedAt
  * 推到当前时间（旧事件不再因新配置补发）；启用 / 停用切换是「暂停 / 恢复」语义，
  * 不推进 rev、不移动 revisedAt（恢复后未确认旧事件可继续升级）。
  */
@@ -173,6 +362,7 @@ export function editRule(rule, patch = {}, { now = Date.now() } = {}) {
     name: patch.name ?? rule.name,
     triggers: { ...rule.triggers, ...(patch.triggers || {}) },
     levels: patch.levels ?? rule.levels,
+    schedule: patch.schedule ?? rule.schedule,
     updatedAt: now,
     revisedAt: now,
     rev: rule.rev + 1,
@@ -399,13 +589,24 @@ export function materializeNotifications(prevItems, rules, events, { now = Date.
   }
 
   // 已物化但规则被删除 / 修订不再覆盖的项：保留（历史不删除），不做清理。
-  const all = [...items.values()].sort(compareItems);
+  // seq 按物化顺序（dueAt → eventAt → level → id）确定性分配；新插入项顺延，
+  // 相对顺序永远一致（刷新 / 重启后由同一排序重建，见 sanitizeNotifications）。
+  const all = assignSeq([...items.values()].sort(compareItems));
   return { items: all, added };
+}
+
+/** 确定性序号：通知项的「物化原顺序」，静音窗口结束后据此按原顺序继续发送。 */
+export function assignSeq(items) {
+  let n = 0;
+  for (const it of items) it.seq = n++;
+  return items;
 }
 
 function makeNotificationItem({ rule, level, recipient, event, now }) {
   const lv = levelByIndex(rule, level) || { delayMin: 0 };
-  const dueAt = level === 0 ? event.at : event.at + lv.delayMin * 60_000;
+  const nominalDueAt = level === 0 ? event.at : event.at + lv.delayMin * 60_000;
+  const readyAt = readyAtFor(rule.schedule, nominalDueAt);
+  const status = nominalDueAt > now ? 'scheduled' : (readyAt > now ? 'deferred' : 'pending');
   return {
     id: notifyItemId(rule.id, rule.rev, event.id, level, recipient),
     anchorKey: `${rule.id}|${event.id}`,
@@ -420,8 +621,10 @@ function makeNotificationItem({ rule, level, recipient, event, now }) {
     summary: summarizeEvent(event),
     eventAt: event.at,
     createdAt: now,
-    dueAt,
-    status: dueAt <= now ? 'pending' : 'scheduled',
+    dueAt: nominalDueAt,
+    readyAt,
+    seq: 0,
+    status,
     attempts: 0,
     lastError: null,
     sentAt: null,
@@ -430,7 +633,8 @@ function makeNotificationItem({ rule, level, recipient, event, now }) {
     ackedBy: null,
     snoozeUntil: null,
     transferOf: null,
-    history: [{ at: now, action: 'created', by: '系统', detail: `级别 ${level + 1} · ${recipient}` }],
+    history: [{ at: now, action: 'created', by: '系统',
+      detail: `级别 ${level + 1} · ${recipient}${status === 'deferred' ? ' · 静音/非工作时段延迟' : ''}` }],
   };
 }
 
@@ -460,65 +664,113 @@ export function summarizeEvent(ev) {
 }
 
 function compareItems(a, b) {
-  return (a.dueAt - b.dueAt) || (a.eventAt - b.eventAt) || (a.level - b.level) || (a.id < b.id ? -1 : 1);
+  return (a.dueAt - b.dueAt) || (a.eventAt - b.eventAt) || (a.level - b.level)
+    || ((a.seq ?? 0) - (b.seq ?? 0)) || (a.id < b.id ? -1 : 1);
 }
 
 /* ============================== pump：时间推进 + 升级抑制 + 队列 ============================== */
 
 /**
  * 通知心跳（确定性）。在给定时间 now：
- *  1. scheduled 到期 → pending（先并入队列）；
- *  2. snoozed 到点 → pending（重新进入待处理）；
- *  3. 事件已被确认：scheduled 的更高级别转为 cancelled（不升级）；已 pending/sent 的保留；
- *  4. pending 项按物化顺序（compareItems）追加进 FIFO outbox（稳定 outbox id，幂等）；
- *  5. failed 且到达退避时刻（backoffMs）的项重新排队（attempts 保留）。
+ *  1. scheduled 到期（名义到期）→ 若工作时段开放转 pending，否则进入 deferred（静音 / 非工作延迟）；
+ *  2. deferred 到工作时刻（readyAt）→ pending（按物化原顺序继续）；
+ *  3. snoozed 到点 → 开放则 pending；仍在静音 / 非工作时段则 deferred；
+ *  4. 事件已被确认：scheduled/deferred 的更高级别转为 cancelled（不升级）；已 pending/sent 的保留；
+ *  5. pending 项按物化顺序（enqueuedAt, seq, id）追加进 FIFO outbox（稳定 outbox id，幂等）；
+ *  6. failed 且到达退避时刻（backoffMs）的项重新排队（attempts 保留；落在静音时段则 deferred）。
  * 不实际发送（发送在 store 的传输层），只推进状态与队列。
  */
-export function pumpNotifications(items, outbox, { now = Date.now(), backoffMs = 30_000 } = {}) {
+export function pumpNotifications(items, outbox, { now = Date.now(), backoffMs = 30_000, schedules = null } = {}) {
   const ackedAnchors = new Set();
   for (const it of items) if (it.status === 'acknowledged') ackedAnchors.add(it.anchorKey);
+  const scheduleOf = (it) => (schedules && schedules.get(it.ruleId)) || null;
 
   let changed = false;
   const nextItems = items.map((it0) => {
     let it = it0;
-    if (it.status === 'scheduled' && ackedAnchors.has(it.anchorKey) && hasLowerAck(items, it)) {
+    const ackedHigher = () => ackedAnchors.has(it.anchorKey) && hasLowerAck(items, it);
+    if (it.status === 'scheduled' && ackedHigher()) {
       it = { ...it, status: 'cancelled', history: [...it.history, { at: now, action: 'cancelled', by: '系统', detail: '事件已确认，升级取消' }] };
       changed = true;
     } else if (it.status === 'scheduled' && it.dueAt <= now) {
-      it = { ...it, status: 'pending' };
+      const ready = it.readyAt ?? it.dueAt;
+      if (ready > now) {
+        it = { ...it, status: 'deferred', history: appendHist(it.history, now, 'deferred', '进入静音 / 非工作时段，窗口结束后按原顺序发送') };
+      } else {
+        it = { ...it, status: 'pending' };
+      }
       changed = true;
+    } else if (it.status === 'deferred') {
+      // 事件在延迟期间被确认 → 取消升级
+      if (ackedHigher()) {
+        it = { ...it, status: 'cancelled', history: appendHist(it.history, now, 'cancelled', '事件已确认，静音中的升级取消') };
+        changed = true;
+      } else if ((it.readyAt ?? it.dueAt ?? 0) <= now) {
+        it = { ...it, status: 'pending', history: appendHist(it.history, now, 'resume', '静音窗口结束，按原顺序继续发送') };
+        changed = true;
+      }
     } else if (it.status === 'snoozed' && (it.snoozeUntil ?? Infinity) <= now) {
-      it = { ...it, status: 'pending', snoozeUntil: null, history: [...it.history, { at: now, action: 'snooze-done', by: it.ackedBy || it.recipient, detail: '稍后提醒到期' }] };
+      const sch = scheduleOf(it);
+      const ready = sch ? readyAtFor(sch, it.snoozeUntil) : it.snoozeUntil;
+      if (ready > now) {
+        it = { ...it, status: 'deferred', snoozeUntil: null, readyAt: ready,
+          history: appendHist(it.history, now, 'deferred', '稍后提醒到期但处于静音 / 非工作时段，工作时刻继续提醒') };
+      } else {
+        it = { ...it, status: 'pending', snoozeUntil: null, readyAt: ready,
+          history: appendHist(it.history, now, 'snooze-done', it.ackedBy || it.recipient, '稍后提醒到期') };
+      }
       changed = true;
     } else if (it.status === 'failed' && it.retryAfter != null && it.retryAfter <= now && it.attempts < MAX_ATTEMPTS) {
-      it = { ...it, status: 'pending', retryAfter: null };
+      const sch = scheduleOf(it);
+      const ready = sch ? readyAtFor(sch, it.retryAfter) : it.retryAfter;
+      if (ready > now) {
+        it = { ...it, status: 'deferred', retryAfter: null, readyAt: ready,
+          history: appendHist(it.history, now, 'deferred', '退避到期但处于静音 / 非工作时段') };
+      } else {
+        it = { ...it, status: 'pending', retryAfter: null, readyAt: ready };
+      }
       changed = true;
     }
     return it;
   });
 
-  // FIFO 入队：按 dueAt/eventAt/level/id 确定性排序。
+  // FIFO 入队：按 (enqueuedAt, seq, id) 确定性排序。延迟项在窗口结束的同一拍转 pending，
+  // 用 seq（物化原顺序）作次序，保证「窗口结束后按原顺序继续发送」。
   // 已在队列的不重复；同时剔除引用已非 pending（已送达/确认/转交/取消）项的陈旧队列条目，
   // 避免 recordDeliveryAttempt 与 pump 交错时把已送达项重新入队。
   const statusById = new Map(nextItems.map((x) => [x.id, x.status]));
+  const seqById = new Map(nextItems.map((x) => [x.id, Number.isFinite(x.seq) ? x.seq : 0]));
   const liveOutbox = (Array.isArray(outbox) ? outbox : [])
-    .filter((o) => statusById.get(o.notifyId) === 'pending');
+    .filter((o) => statusById.get(o.notifyId) === 'pending')
+    .map((o) => (Number.isFinite(o.seq) ? o : { ...o, seq: seqById.get(o.notifyId) ?? 0 }));
   const queued = new Set(liveOutbox.map((o) => o.notifyId));
   const enqueued = new Set();
   const additions = [];
-  for (const it of [...nextItems].sort(compareItems)) {
+  for (const it of [...nextItems].sort(compareQueueOrder)) {
     if (it.status !== 'pending') continue;
     if (queued.has(it.id) || enqueued.has(it.id)) continue;
     enqueued.add(it.id);
     additions.push({
       id: outboxItemId(it.id), notifyId: it.id,
-      enqueuedAt: now, attempts: 0, status: 'queued',
+      enqueuedAt: now, seq: Number.isFinite(it.seq) ? it.seq : 0, attempts: 0, status: 'queued',
     });
   }
 
-  const nextOutbox = [...liveOutbox, ...additions]
-    .sort((a, b) => (a.enqueuedAt - b.enqueuedAt) || (a.id < b.id ? -1 : 1));
+  const nextOutbox = [...liveOutbox, ...additions].sort(compareOutbox);
   return { items: nextItems, outbox: nextOutbox, changed: changed || additions.length > 0 || liveOutbox.length !== (Array.isArray(outbox) ? outbox.length : 0), enqueued: additions.length };
+}
+
+function appendHist(history, at, action, by, detail = '') {
+  return [...history, detail ? { at, action, by, detail } : { at, action, by }];
+}
+
+function compareQueueOrder(a, b) {
+  return (a.dueAt - b.dueAt) || (a.eventAt - b.eventAt) || (a.level - b.level)
+    || ((a.seq ?? 0) - (b.seq ?? 0)) || (a.id < b.id ? -1 : 1);
+}
+
+function compareOutbox(a, b) {
+  return (a.enqueuedAt - b.enqueuedAt) || ((a.seq ?? 0) - (b.seq ?? 0)) || (a.id < b.id ? -1 : 1);
 }
 
 function hasLowerAck(items, it) {
@@ -602,10 +854,11 @@ export function snoozeNotification(items, id, snoozeMin, { by = '', now = Date.n
 }
 
 /**
- * 转交：原项进入 transferred 终态（保留记录），在同级别为新接收人创建一条 pending 通知，
+ * 转交：原项进入 transferred 终态（保留记录），在同级别为新接收人创建一条通知，
  * id 含来源通知 id → 同一转交幂等；重复转交给同一人不产生副本。
+ * 新通知按规则工作时段 / 静音窗口决定 readyAt（落在静音中为 deferred）。
  */
-export function transferNotification(items, id, to, { by = '', now = Date.now(), reason = '' } = {}) {
+export function transferNotification(items, id, to, { by = '', now = Date.now(), reason = '', schedule = null } = {}) {
   const it = findItem(items, id);
   if (!it) return { status: 404, reason: 'notification-missing' };
   if (!ACTIONABLE.has(it.status)) return { status: 409, reason: `not-actionable:${it.status}` };
@@ -621,28 +874,214 @@ export function transferNotification(items, id, to, { by = '', now = Date.now(),
     ? { ...x, status: 'transferred', transferredTo: recipient, transferredAt: now,
         history: [...x.history, { at: now, action: 'transfer', by, detail: `转交给 ${recipient}${reason ? `：${reason}` : ''}` }] }
     : x));
+  const readyAt = readyAtFor(schedule, now);
   const fresh = {
     id: newId, anchorKey: it.anchorKey, ruleId: it.ruleId, ruleRev: it.ruleRev,
     sessionId: it.sessionId, eventId: it.eventId, eventType: it.eventType,
     level: it.level, recipient, title: it.title, summary: it.summary,
-    eventAt: it.eventAt, createdAt: now, dueAt: now, status: 'pending',
+    eventAt: it.eventAt, createdAt: now, dueAt: now, readyAt, seq: 0,
+    status: readyAt > now ? 'deferred' : 'pending',
     attempts: 0, lastError: null, sentAt: null, deliveredAt: null, ackedAt: null,
     ackedBy: null, snoozeUntil: null, transferOf: it.id,
-    history: [{ at: now, action: 'created', by: '系统', detail: `由 ${it.recipient} 转交（级别 ${it.level + 1}）` }],
+    history: [{ at: now, action: 'created', by: '系统',
+      detail: `由 ${it.recipient} 转交（级别 ${it.level + 1}）${readyAt > now ? ' · 静音/非工作时段延迟' : ''}` }],
   };
-  return { status: 200, items: [...closed, fresh].sort(compareItems), newId };
+  return { status: 200, items: assignSeq([...closed, fresh].sort(compareItems)), newId };
 }
 
-/** 失败项手动重排队：attempts 清零、回到 pending（下一次 pump 重新入队）。 */
-export function retryNotification(items, id, { now = Date.now(), by = '' } = {}) {
+/** 失败项手动重排队：attempts 清零、回到 pending（下一次 pump 重新入队）；落在静音时段则 deferred。 */
+export function retryNotification(items, id, { now = Date.now(), by = '', schedule = null } = {}) {
   const it = findItem(items, id);
   if (!it) return { status: 404, reason: 'notification-missing' };
   if (it.status !== 'failed') return { status: 409, reason: 'not-failed' };
+  const readyAt = readyAtFor(schedule, now);
   const next = items.map((x) => (x.id === id
-    ? { ...x, status: 'pending', attempts: 0, lastError: null, retryAfter: null,
-        history: [...x.history, { at: now, action: 'retry', by, detail: '手动重新排队' }] }
+    ? { ...x, status: readyAt > now ? 'deferred' : 'pending', attempts: 0, lastError: null, retryAfter: null, readyAt,
+        history: [...x.history, { at: now, action: 'retry', by, detail: readyAt > now ? '手动重新排队（静音 / 非工作时段延迟）' : '手动重新排队' }] }
     : x));
   return { status: 200, items: next };
+}
+
+/* ============================== 批量处理（按会话） ============================== */
+
+export const BATCH_ACTIONS = ['ack', 'snooze', 'transfer'];
+
+export function batchId() {
+  return uid('nb');
+}
+
+/**
+ * 在给定 id 列表上逐项应用同一动作（确认 / 稍后 / 转交）。
+ * 纯函数，逐项隔离：单项失败（缺失 / 状态不可操作 / 参数非法 / 幂等）绝不影响其他项。
+ * 返回：
+ *  - items：应用成功后的完整通知项列表（顺序重排为 compareItems 并重新分配 seq）；
+ *  - results：每项 { id, ok, status, reason?, until?/newId? }，保持入参 id 顺序；
+ *  - success / failed 计数；
+ *  - spawned：转交产生的新通知项映射 sourceId -> newId（store 用来注册乐观动作）。
+ */
+export function applyBatchNotifications(items, ids, action, opts = {}) {
+  const by = opts.by || '';
+  const now = opts.now ?? Date.now();
+  const schedules = opts.schedules || null;
+  const results = [];
+  let current = items;
+  const spawned = new Map();
+  let success = 0; let failed = 0;
+
+  for (const id of Array.isArray(ids) ? ids : []) {
+    const target = current.find((x) => x.id === id);
+    if (!target) { results.push({ id, ok: false, status: 404, reason: 'notification-missing' }); failed++; continue; }
+    let res;
+    if (action === 'ack') {
+      res = acknowledgeNotification(current, id, { by, now, note: opts.note || '' });
+    } else if (action === 'snooze') {
+      res = snoozeNotification(current, id, opts.snoozeMin, { by, now });
+    } else if (action === 'transfer') {
+      const rule = schedules.get(target.ruleId);
+      res = transferNotification(current, id, opts.to, { by, now, reason: opts.reason || '', schedule: rule?.schedule || null });
+    } else {
+      res = { status: 400, reason: 'unknown-action' };
+    }
+    if (res.status === 200 && res.idempotent) {
+      results.push({ id, ok: true, idempotent: true, status: 200 });
+      success++;
+      continue;
+    }
+    if (res.status === 200) {
+      current = res.items;
+      const r = { id, ok: true, status: 200 };
+      if (res.until) r.until = res.until;
+      if (res.newId) { r.newId = res.newId; spawned.set(id, res.newId); }
+      results.push(r);
+      success++;
+    } else {
+      results.push({ id, ok: false, status: res.status, reason: res.reason || 'failed' });
+      failed++;
+    }
+  }
+
+  // 转交产生新项后重排原顺序（seq 确定性重建）
+  if (spawned.size) current = assignSeq([...current].sort(compareItems));
+  return { items: current, results, success, failed, spawned };
+}
+
+/**
+ * 构建一条持久化的批量处理结果（notifyBatches[]，append-only）。
+ * 部分版本冲突：成功项照常提交，失败项（含原因）保留，store 同时为其保留本地草稿。
+ */
+export function makeBatchRecord({ id, sessionId = null, action, ids = [], results = [], by = '', now = Date.now(), payload = {} }) {
+  const success = results.filter((r) => r.ok).length;
+  return {
+    id,
+    sessionId,
+    action,
+    by: String(by || '未署名').slice(0, 40),
+    at: now,
+    requested: ids.length,
+    success,
+    failed: results.length - success,
+    payload: action === 'snooze'
+      ? { snoozeMin: clampInt(payload.snoozeMin, 1, 60 * 24 * 30, 15) }
+      : action === 'transfer'
+        ? { to: normalizeRecipient(payload.to) || '', reason: String(payload.reason || '').slice(0, 300) }
+        : { note: String(payload.note || '').slice(0, 300) },
+    results: results.map((r) => ({
+      id: r.id, ok: !!r.ok, idempotent: !!r.idempotent,
+      status: r.status || (r.ok ? 200 : 0),
+      reason: r.reason || null, newId: r.newId || null, until: r.until || null,
+    })),
+  };
+}
+
+export function sanitizeBatches(raw) {
+  const seen = new Set();
+  const out = [];
+  for (const b0 of Array.isArray(raw) ? raw : []) {
+    if (!b0 || typeof b0.id !== 'string' || !BATCH_ACTIONS.includes(b0.action)) continue;
+    if (seen.has(b0.id)) continue;
+    seen.add(b0.id);
+    const results = (Array.isArray(b0.results) ? b0.results : []).filter((r) => r && typeof r.id === 'string').slice(0, 5000)
+      .map((r) => ({
+        id: r.id, ok: !!r.ok, idempotent: !!r.idempotent,
+        status: Number.isInteger(r.status) ? r.status : (r.ok ? 200 : 0),
+        reason: typeof r.reason === 'string' ? r.reason.slice(0, 120) : null,
+        newId: typeof r.newId === 'string' ? r.newId : null,
+        until: Number.isFinite(r.until) ? r.until : null,
+      }));
+    out.push({
+      id: b0.id,
+      sessionId: typeof b0.sessionId === 'string' ? b0.sessionId : null,
+      action: b0.action,
+      by: String(b0.by || '未署名').slice(0, 40),
+      at: Number.isFinite(b0.at) ? b0.at : 0,
+      requested: clampInt(b0.requested, 0, 5000, results.length),
+      success: clampInt(b0.success, 0, 5000, results.filter((r) => r.ok).length),
+      failed: clampInt(b0.failed, 0, 5000, results.filter((r) => !r.ok).length),
+      payload: b0.payload && typeof b0.payload === 'object' ? {
+        snoozeMin: Number.isInteger(b0.payload.snoozeMin) ? b0.payload.snoozeMin : null,
+        to: typeof b0.payload.to === 'string' ? b0.payload.to.slice(0, 40) : null,
+        reason: typeof b0.payload.reason === 'string' ? b0.payload.reason.slice(0, 300) : null,
+        note: typeof b0.payload.note === 'string' ? b0.payload.note.slice(0, 300) : null,
+      } : {},
+      results,
+    });
+  }
+  return out.sort((a, b) => (a.at - b.at) || (a.id < b.id ? -1 : 1));
+}
+
+export function mergeBatches(serverList, clientList) {
+  const byId = new Map();
+  for (const b of [...(Array.isArray(serverList) ? serverList : []), ...(Array.isArray(clientList) ? clientList : [])]) {
+    if (b && typeof b.id === 'string') byId.set(b.id, b); // append-only 幂等并集
+  }
+  return [...byId.values()].sort((a, b) => (a.at - b.at) || (a.id < b.id ? -1 : 1));
+}
+
+/* ============================== 本地草稿（批量部分失败时保留，随文档持久化） ============================== */
+
+/** 本地未提交通知项草稿 id：稳定身份，重复失败不产生副本。 */
+export function draftId(notifyId, action, payload = {}) {
+  const key = `${notifyId}|${action}|${payload.to || ''}|${payload.snoozeMin || ''}|${payload.note || ''}`;
+  return `nd_${hash32(key)}`;
+}
+
+export function makeDraft({ notifyId, action, payload = {}, by = '', at = Date.now(), reason = '' }) {
+  return {
+    id: draftId(notifyId, action, payload),
+    notifyId, action,
+    payload: action === 'snooze'
+      ? { snoozeMin: clampInt(payload.snoozeMin, 1, 60 * 24 * 30, 15) }
+      : action === 'transfer'
+        ? { to: normalizeRecipient(payload.to) || '', reason: String(payload.reason || '').slice(0, 300) }
+        : { note: String(payload.note || '').slice(0, 300) },
+    by: String(by || '未署名').slice(0, 40),
+    at,
+    reason: String(reason || '').slice(0, 120),
+  };
+}
+
+export function sanitizeDrafts(raw) {
+  const seen = new Set();
+  const out = [];
+  for (const d0 of Array.isArray(raw) ? raw : []) {
+    if (!d0 || typeof d0.id !== 'string' || typeof d0.notifyId !== 'string' || !BATCH_ACTIONS.includes(d0.action)) continue;
+    if (seen.has(d0.id)) continue;
+    seen.add(d0.id);
+    const d = makeDraft({
+      notifyId: d0.notifyId, action: d0.action, payload: d0.payload || {},
+      by: d0.by, at: Number.isFinite(d0.at) ? d0.at : 0, reason: d0.reason || '',
+    });
+    out.push({ ...d, id: d0.id }); // 保留稳定 id（跨窗口合流 / 去重以它为准）
+  }
+  return out.sort((a, b) => (a.at - b.at) || (a.id < b.id ? -1 : 1));
+}
+
+export function mergeDrafts(serverList, clientList) {
+  const byId = new Map();
+  for (const d of [...(Array.isArray(serverList) ? serverList : []), ...(Array.isArray(clientList) ? clientList : [])]) {
+    if (d && typeof d.id === 'string') byId.set(d.id, d);
+  }
+  return [...byId.values()].sort((a, b) => (a.at - b.at) || (a.id < b.id ? -1 : 1));
 }
 
 /* ============================== 待处理收件箱 / 统计 ============================== */
@@ -658,12 +1097,12 @@ export function pendingInbox(items, recipient, { now = Date.now() } = {}) {
 
 export function notificationCounters(items, recipient = null) {
   const scope = recipient ? items.filter((it) => it.recipient === normalizeRecipient(recipient)) : items;
-  const c = { total: scope.length, scheduled: 0, pending: 0, delivered: 0, acknowledged: 0, snoozed: 0, transferred: 0, failed: 0, cancelled: 0, actionable: 0 };
+  const c = { total: scope.length, scheduled: 0, deferred: 0, pending: 0, delivered: 0, acknowledged: 0, snoozed: 0, transferred: 0, failed: 0, cancelled: 0, actionable: 0 };
   for (const it of scope) {
     if (it.status === 'sent') c.delivered += 1;
     else if (it.status === 'delivered') c.delivered += 1;
     else c[it.status] = (c[it.status] || 0) + 1;
-    if (ACTIONABLE.has(it.status) && !(it.status === 'snoozed')) c.actionable += 1;
+    if (ACTIONABLE.has(it.status) && it.status !== 'snoozed') c.actionable += 1;
   }
   return c;
 }
@@ -733,6 +1172,8 @@ export function sanitizeNotifications(raw, { now = Date.now() } = {}) {
       eventAt: Number.isFinite(n0.eventAt) ? n0.eventAt : 0,
       createdAt: Number.isFinite(n0.createdAt) ? n0.createdAt : now,
       dueAt: Number.isFinite(n0.dueAt) ? n0.dueAt : 0,
+      readyAt: Number.isFinite(n0.readyAt) ? n0.readyAt : (Number.isFinite(n0.dueAt) ? n0.dueAt : 0),
+      seq: Number.isFinite(n0.seq) ? n0.seq : 0,
       status,
       attempts: clampInt(n0.attempts, 0, 999, 0),
       lastError: n0.lastError ? String(n0.lastError).slice(0, 500) : null,
@@ -748,11 +1189,14 @@ export function sanitizeNotifications(raw, { now = Date.now() } = {}) {
       history: sanitizeHistory(n0.history, now),
     });
   }
-  return out.sort(compareItems);
+  // 旧版文档没有 seq / readyAt：按物化顺序确定性重建，重启后队列原顺序逐字节一致
+  out.sort(compareItems);
+  assignSeq(out);
+  return out;
 }
 
 function sanitizeHistory(raw, now) {
-  const ACTIONS = new Set(['created', 'delivered', 'send-error', 'failed', 'acknowledge', 'snooze', 'snooze-done', 'transfer', 'retry', 'cancelled']);
+  const ACTIONS = new Set(['created', 'delivered', 'send-error', 'failed', 'acknowledge', 'snooze', 'snooze-done', 'transfer', 'retry', 'cancelled', 'deferred', 'resume']);
   const out = [];
   for (const h of Array.isArray(raw) ? raw : []) {
     if (!h || !ACTIONS.has(h.action)) continue;
@@ -777,13 +1221,14 @@ export function sanitizeOutbox(raw, { now = Date.now() } = {}) {
       id: o0.id,
       notifyId: o0.notifyId,
       enqueuedAt: Number.isFinite(o0.enqueuedAt) ? o0.enqueuedAt : now,
+      seq: Number.isFinite(o0.seq) ? o0.seq : 0,
       attempts: clampInt(o0.attempts, 0, 999, 0),
       status: ['queued', 'dead'].includes(o0.status) ? o0.status : 'queued',
       lastError: o0.lastError ? String(o0.lastError).slice(0, 500) : null,
       nextAttemptAt: Number.isFinite(o0.nextAttemptAt) ? o0.nextAttemptAt : null,
     });
   }
-  return out.sort((a, b) => (a.enqueuedAt - b.enqueuedAt) || (a.id < b.id ? -1 : 1));
+  return out.sort(compareOutbox);
 }
 
 /* ============================== 跨窗口合流 ============================== */
@@ -831,7 +1276,7 @@ export function mergeNotifications(serverList, clientList) {
 }
 
 function itemRank(it) {
-  return { scheduled: 0, cancelled: 1, pending: 2, snoozed: 2, failed: 2, sent: 3, delivered: 4, transferred: 5, acknowledged: 6 }[it.status] ?? 0;
+  return { scheduled: 0, deferred: 1, cancelled: 1, pending: 2, snoozed: 2, failed: 2, sent: 3, delivered: 4, transferred: 5, acknowledged: 6 }[it.status] ?? 0;
 }
 
 export function mergeOutbox(serverList, clientList, tombstones = null) {
@@ -847,11 +1292,12 @@ export function mergeOutbox(serverList, clientList, tombstones = null) {
     byNotify.set(o.notifyId, {
       ...ex, ...o,
       attempts: Math.max(ex.attempts || 0, o.attempts || 0),
+      seq: Math.min(Number.isFinite(ex.seq) ? ex.seq : 0, Number.isFinite(o.seq) ? o.seq : Infinity),
       enqueuedAt: Math.min(ex.enqueuedAt || 0, o.enqueuedAt || 0),
       nextAttemptAt: minPresent(ex.nextAttemptAt, o.nextAttemptAt),
     });
   }
-  return [...byNotify.values()].sort((a, b) => (a.enqueuedAt - b.enqueuedAt) || (a.id < b.id ? -1 : 1));
+  return [...byNotify.values()].sort(compareOutbox);
 }
 
 function minPresent(a, b) {
@@ -925,10 +1371,11 @@ export function assessServerNotifyConflict(serverDoc, clientDoc) {
 /* ============================== 时间线报告 ============================== */
 
 /**
- * 按会话构建完整通知时间线报告：规则与修订、每个事件派生出的通知项、
- * 队列 / 重试 / 失败原因、确认记录、最终送达结果。键名稳定、可附校验和导出。
+ * 按会话构建完整通知时间线报告：规则与修订（含工作时段 / 静音窗口）、每个事件派生出的
+ * 通知项（含延迟原因 / 可发送时刻）、队列 / 重试 / 失败原因、确认记录、最终送达结果、
+ * 批量处理结果（成功 / 冲突 / 草稿）。键名稳定、可附校验和导出。
  */
-export function buildNotifyReport(sessionId, { rules, events, items, outbox, sessions = [], generatedAt = null } = {}) {
+export function buildNotifyReport(sessionId, { rules, events, items, outbox, sessions = [], batches = [], drafts = [], generatedAt = null } = {}) {
   const session = (Array.isArray(sessions) ? sessions : []).find((s) => s.id === sessionId) || null;
   const sr = (Array.isArray(rules) ? rules : []).filter((r) => r.sessionId === sessionId);
   const ev = (Array.isArray(events) ? events : []).filter((e) => e.sessionId === sessionId).sort(compareEvents);
@@ -946,6 +1393,11 @@ export function buildNotifyReport(sessionId, { rules, events, items, outbox, ses
     triggers: { ...r.triggers },
     createdAt: r.createdAt, updatedAt: r.updatedAt, revisedAt: r.revisedAt, createdBy: r.createdBy,
     levels: (r.levels || []).map((l) => ({ level: l.level, delayMin: l.delayMin, recipients: [...l.recipients] })),
+    schedule: r.schedule ? {
+      workHours: (r.schedule.workHours || []).map((x) => ({ ...x })),
+      quietWeekly: (r.schedule.quietWeekly || []).map((x) => ({ ...x })),
+      quietWindows: (r.schedule.quietWindows || []).map((x) => ({ ...x })),
+    } : { workHours: [], quietWeekly: [], quietWindows: [] },
   }));
 
   const timeline = ev.map((e) => ({
@@ -958,8 +1410,9 @@ export function buildNotifyReport(sessionId, { rules, events, items, outbox, ses
       return {
         id: it.id, ruleId: it.ruleId, ruleRev: it.ruleRev, level: it.level,
         recipient: it.recipient, status: it.status, summary: it.summary,
-        dueAt: it.dueAt, sentAt: it.sentAt, deliveredAt: it.deliveredAt,
+        dueAt: it.dueAt, readyAt: it.readyAt ?? it.dueAt, sentAt: it.sentAt, deliveredAt: it.deliveredAt,
         ackedAt: it.ackedAt, ackedBy: it.ackedBy, snoozeUntil: it.snoozeUntil,
+        deferred: it.status === 'deferred' || (it.readyAt ?? it.dueAt) > it.dueAt,
         transferredTo: it.transferredTo || null, transferOf: it.transferOf || null,
         attempts: it.attempts, lastError: it.lastError,
         queued: !!ob, queueAttempts: ob?.attempts ?? 0, nextAttemptAt: ob?.nextAttemptAt ?? null,
@@ -974,6 +1427,7 @@ export function buildNotifyReport(sessionId, { rules, events, items, outbox, ses
     delivered: flatItems.filter((n) => n.status === 'delivered' || n.status === 'sent').length,
     acknowledged: flatItems.filter((n) => n.status === 'acknowledged').length,
     pending: flatItems.filter((n) => ['pending', 'scheduled', 'snoozed'].includes(n.status)).length,
+    deferred: flatItems.filter((n) => n.status === 'deferred').length,
     transferred: flatItems.filter((n) => n.status === 'transferred').length,
     cancelled: flatItems.filter((n) => n.status === 'cancelled').length,
     failed: flatItems.filter((n) => n.status === 'failed').length,
@@ -984,14 +1438,26 @@ export function buildNotifyReport(sessionId, { rules, events, items, outbox, ses
     })),
   };
 
+  // 批量处理结果（该会话）；失败项同时给出是否仍有本地草稿
+  const draftIds = new Set((Array.isArray(drafts) ? drafts : []).map((d) => d.notifyId));
+  const batchReports = (Array.isArray(batches) ? batches : [])
+    .filter((b) => (b.sessionId || null) === sessionId)
+    .map((b) => ({
+      id: b.id, action: b.action, by: b.by, at: b.at, isoTime: b.at ? new Date(b.at).toISOString() : null,
+      requested: b.requested, success: b.success, failed: b.failed, payload: { ...(b.payload || {}) },
+      results: (b.results || []).map((r) => ({ ...r, draftKept: !r.ok && draftIds.has(r.id) })),
+    }));
+
   return {
     format: 'rect-constraints/notify-report',
-    formatVersion: 1,
+    formatVersion: 2,
     generatedAt: generatedAt || new Date().toISOString(),
     session: session ? { id: session.id, name: session.name, status: session.status, completedAt: session.completedAt, rev: session.rev } : { id: sessionId },
     rules: ruleReports,
     eventCount: timeline.length,
     timeline,
+    batches: batchReports,
+    batchCount: batchReports.length,
     delivery,
   };
 }

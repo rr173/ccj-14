@@ -49,6 +49,8 @@ import {
   mergeRules, mergeNotifyEvents, mergeNotifications, mergeOutbox,
   assessServerNotifyConflict, buildNotifyReport, pendingInbox, notificationCounters,
   notifyEventId, MAX_ATTEMPTS,
+  applyBatchNotifications, makeBatchRecord, batchId, sanitizeBatches, mergeBatches,
+  makeDraft, sanitizeDrafts, mergeDrafts, scheduleIsOpenAt, scheduleClosedReason,
 } from './notifications.js';
 
 const LS_KEY = 'rect-constraints-doc-v2';
@@ -90,13 +92,15 @@ export class Store extends EventTarget {
 
     // 审阅通知与升级中心
     this.notifyEvents = [];        // append-only 通知事件（决定/签署/冲突/完成），按 id 幂等并集
-    this.notifyRules = [];         // 每会话多级升级规则（rev 乐观并发）
-    this.notifications = [];       // 物化通知项（事件 × 级别 × 接收人，幂等 id）
+    this.notifyRules = [];         // 每会话多级升级规则（rev 乐观并发，含工作时段/静音窗口 schedule）
+    this.notifications = [];       // 物化通知项（事件 × 级别 × 接收人，幂等 id；deferred=静音延迟）
     this.notifyOutbox = [];        // FIFO 发送队列（稳定 id，断网保留、恢复后按序重试）
+    this.notifyBatches = [];       // append-only 批量处理结果（按会话批量确认/稍后/转交；成功项与冲突失败项）
+    this.notifyDrafts = [];        // 持久化本地草稿：批量部分版本冲突时为失败项保留（刷新/重启后仍可重试/放弃）
     this._notifyRuleSyncedRevs = {};  // ruleId -> 已与服务端确认的规则 rev（规则乐观锁）
     this._notifyItemBase = new Map();  // notifyId -> 上次同步时的 {status, ackedAt}（通知项乐观锁）
-    this._notifyRuleDrafts = new Map(); // ruleId -> 本地未提交规则编辑（规则冲突后保留）
-    this._notifyItemDrafts = new Map(); // notifyId -> [动作描述符]（同一通知被两窗口处理后保留）
+    this._notifyRuleDrafts = new Map(); // ruleId -> 本地未提交规则编辑（规则冲突后保留，内存态）
+    this._notifyItemDrafts = new Map(); // notifyId -> [动作描述符]（同一通知被两窗口处理后保留；重启从 notifyDrafts 重建）
     this._notifyPendingItemActions = new Map(); // notifyId -> 最近一次乐观动作（待服务端确认；409 时转为 draft）
     this._notifyOptimisticLog = new Map();     // notifyId -> 最近一次乐观动作（跨保存链保留到服务端确认 / 409）
     this._notifyServerKnownItems = new Set();  // 已随某次保存被服务端确认的通知项 id
@@ -273,10 +277,12 @@ export class Store extends EventTarget {
     const synced = syncNotifyEvents(prevEvents, this.reviewSessions, { now });
     this.notifyEvents = synced.events;
     this.notifyRules = sanitizeRules(doc.notifyRules, { now });
+    this.notifyBatches = sanitizeBatches(doc.notifyBatches);
+    this.notifyDrafts = sanitizeDrafts(doc.notifyDrafts);
     const cleanItems = sanitizeNotifications(doc.notifications, { now });
     const mat = materializeNotifications(cleanItems, this.notifyRules, this.notifyEvents, { now });
     const cleanOutbox = sanitizeOutbox(doc.notifyOutbox, { now });
-    const pumped = pumpNotifications(mat.items, cleanOutbox, { now, backoffMs: this.notifyBackoffMs });
+    const pumped = pumpNotifications(mat.items, cleanOutbox, { now, backoffMs: this.notifyBackoffMs, schedules: this._notifySchedules() });
     this.notifications = pumped.items;
     this.notifyOutbox = pumped.outbox;
 
@@ -298,6 +304,15 @@ export class Store extends EventTarget {
     this._notifyAuthoredRuleRevs = new Map();
     if (!this._notifyRuleDrafts) this._notifyRuleDrafts = new Map();
     if (!this._notifyItemDrafts) this._notifyItemDrafts = new Map();
+    // 持久化草稿（批量部分冲突）→ 重建内存草稿映射；通知项已消失的草稿丢弃
+    this._notifyItemDrafts = new Map();
+    for (const d of this.notifyDrafts) {
+      if (!liveIds.has(d.notifyId)) continue;
+      const list = this._notifyItemDrafts.get(d.notifyId) || [];
+      const desc = { kind: 'item', notifyId: d.notifyId, action: d.action, payload: d.payload || {}, at: d.at, by: d.by, draftId: d.id, reason: d.reason || '', persisted: true };
+      if (!list.some((x) => x.draftId === d.id)) list.push(desc);
+      this._notifyItemDrafts.set(d.notifyId, list);
+    }
     // 冲突锁 / 本地未提交操作只由 409 流程显式清理；合流重载时保留（调用方负责传入）。
     this._notifyLockedRules = this._notifyLockedRules || new Set();
     this._notifyLockedItems = this._notifyLockedItems || new Set();
@@ -310,6 +325,22 @@ export class Store extends EventTarget {
     if (!this._notifyLockedRules.size && !this._notifyLockedItems.size) this.notifyConflict = null;
     if (seed) this._notifyNeedsPersist = synced.newEvents.length > 0 || mat.added.length > 0 || pumped.enqueued > 0 || pumped.changed;
     this._startNotifyTicker();
+  }
+
+  /** ruleId -> 规则（含 schedule），供 pump 计算工作时段 / 静音窗口。 */
+  _notifySchedules() {
+    const m = new Map();
+    for (const r of this.notifyRules) m.set(r.id, r);
+    return m;
+  }
+
+  /** 某条通知当前是否处于规则静音 / 非工作时段（UI 横幅 / 卡片用）。 */
+  notifyScheduleState(item, now = Date.now()) {
+    const rule = this.notifyRuleById(item?.ruleId);
+    const sch = rule?.schedule;
+    if (!sch) return { closed: false, reason: '' };
+    const closed = !scheduleIsOpenAt(sch, now);
+    return { closed, reason: closed ? scheduleClosedReason(sch, now) : '' };
   }
 
   /** 测试 / 装配时注入发送通道：{ async send(item) -> {ok, error?, detail?}, isOnline() }。 */
@@ -338,7 +369,7 @@ export class Store extends EventTarget {
     this.notifyEvents = synced.events;
     const mat = materializeNotifications(this.notifications, this.notifyRules, this.notifyEvents, { now });
     this.notifications = mat.items;
-    const pumped = pumpNotifications(this.notifications, this.notifyOutbox, { now, backoffMs: this.notifyBackoffMs });
+    const pumped = pumpNotifications(this.notifications, this.notifyOutbox, { now, backoffMs: this.notifyBackoffMs, schedules: this._notifySchedules() });
     this.notifications = pumped.items;
     this.notifyOutbox = pumped.outbox;
     // 有未解决版本冲突的锁定项不参与发送：其本地动作保留为草稿（横幅里重试 / 放弃）。
@@ -390,6 +421,8 @@ export class Store extends EventTarget {
       notifyRules: this.notifyRules,
       notifications: this.notifications,
       notifyOutbox: this.notifyOutbox,
+      notifyBatches: this.notifyBatches,
+      notifyDrafts: this.notifyDrafts,
       actor: this.actor,
     };
   }
@@ -451,6 +484,11 @@ export class Store extends EventTarget {
       const prevOutbox = (Array.isArray(prev?.notifyOutbox) ? prev.notifyOutbox : [])
         .filter((o) => !this._notifyOutboxTombstones.has(o.id));
       finalDoc.notifyOutbox = mergeOutbox(prevOutbox, finalDoc.notifyOutbox || []);
+      // 批量结果 append-only 并集；本地草稿按稳定 id 并集（失败项在刷新 / 多页签后仍保留）
+      finalDoc.notifyBatches = mergeBatches(
+        Array.isArray(prev?.notifyBatches) ? prev.notifyBatches : [], finalDoc.notifyBatches || []);
+      finalDoc.notifyDrafts = mergeDrafts(
+        Array.isArray(prev?.notifyDrafts) ? prev.notifyDrafts : [], finalDoc.notifyDrafts || []);
       finalDoc.activeReviewId = finalDoc.reviewSessions.some((x) => x.id === finalDoc.activeReviewId)
         ? finalDoc.activeReviewId
         : (payload.activeReviewId && finalDoc.reviewSessions.some((x) => x.id === payload.activeReviewId) ? payload.activeReviewId : null);
@@ -1718,11 +1756,12 @@ export class Store extends EventTarget {
     return notificationCounters(this.notifications, recipient);
   }
 
-  /** 会话的完整通知时间线报告。 */
+  /** 会话的完整通知时间线报告（含工作时段 / 静音延迟与批量处理结果）。 */
   notifyReport(sessionId, { generatedAt = null } = {}) {
     return buildNotifyReport(sessionId, {
       rules: this.notifyRules, events: this.notifyEvents, items: this.notifications,
-      outbox: this.notifyOutbox, sessions: this.reviewSessions, generatedAt,
+      outbox: this.notifyOutbox, sessions: this.reviewSessions,
+      batches: this.notifyBatches, drafts: this.notifyDrafts, generatedAt,
     });
   }
 
@@ -1753,6 +1792,7 @@ export class Store extends EventTarget {
     try {
       rule = createRule({
         sessionId, name: spec.name, triggers: spec.triggers, levels: spec.levels,
+        schedule: spec.schedule || null,
         actor: this.actor || '未署名', now,
       });
     } catch (e) { return { ok: false, error: e.message }; }
@@ -1800,8 +1840,14 @@ export class Store extends EventTarget {
     let res;
     if (action === 'ack') res = acknowledgeNotification(before, id, { by, now, note: payload.note || '' });
     else if (action === 'snooze') res = snoozeNotification(before, id, payload.snoozeMin, { by, now });
-    else if (action === 'transfer') res = transferNotification(before, id, payload.to, { by, now, reason: payload.reason || '' });
-    else if (action === 'retry') res = retryNotification(before, id, { by, now });
+    else if (action === 'transfer') {
+      const rule = this.notifyRuleById(before.find((x) => x.id === id)?.ruleId);
+      res = transferNotification(before, id, payload.to, { by, now, reason: payload.reason || '', schedule: rule?.schedule || null });
+    }
+    else if (action === 'retry') {
+      const rule = this.notifyRuleById(before.find((x) => x.id === id)?.ruleId);
+      res = retryNotification(before, id, { by, now, schedule: rule?.schedule || null });
+    }
     else return { ok: false, status: 400, reason: 'unknown-action' };
 
     if (res.status === 404) return { ok: false, status: 404, reason: 'notification-missing' };
@@ -1841,6 +1887,81 @@ export class Store extends EventTarget {
   transferNotification(id, to, reason = '') { return this._applyNotifyItemAction(id, 'transfer', { to, reason }); }
   retryNotification(id) { return this._applyNotifyItemAction(id, 'retry'); }
 
+  /* ---------- 批量：按会话批量确认 / 稍后 / 转交（部分版本冲突保留草稿） ---------- */
+
+  /**
+   * 对一批通知项应用同一动作。逐项隔离：成功项照常乐观提交并随权威保存落定；
+   * 失败项（缺失 / 不可操作 / 非法参数）不提交，并【保留本地草稿】（notifyDrafts，
+   * 随文档持久化，刷新 / 重启后仍可重试或放弃）。返回批量结果与 append-only 记录。
+   */
+  batchNotify(ids, action, payload = {}, { sessionId = null } = {}) {
+    if (this.saveConflict) return { ok: false, error: '版本冲突未解决，请先重新加载' };
+    const now = Date.now();
+    const by = this.actor || '未署名';
+    const uniq = [];
+    for (const id of Array.isArray(ids) ? ids : []) if (id && !uniq.includes(id)) uniq.push(id);
+    const res = applyBatchNotifications(this.notifications, uniq, action, {
+      ...payload, by, now, schedules: this._notifySchedules(),
+    });
+    this.notifications = res.items;
+    // 成功项：注册乐观动作（确认 / 转交的出队、OCC 与单项路径完全一致）
+    for (const r of res.results) {
+      if (!r.ok) continue;
+      const pendingRec = { action, payload, newId: r.newId || null, at: now, by, batch: true };
+      this._notifyPendingItemActions.set(r.id, pendingRec);
+      this._notifyOptimisticLog.set(r.id, pendingRec);
+      if (r.newId) {
+        this._notifyPendingItemActions.set(r.newId, { ...pendingRec, newId: null, spawnedBy: r.id });
+        this._notifyOptimisticLog.set(r.newId, { ...pendingRec, newId: null, spawnedBy: r.id });
+      }
+    }
+    // 失败项：保留本地草稿（持久化）；已存在同身份草稿则幂等
+    let draftAdded = 0;
+    for (const r of res.results) {
+      if (r.ok) continue;
+      const d = makeDraft({ notifyId: r.id, action, payload, by, at: now, reason: r.reason || '版本冲突 / 不可操作' });
+      if (this.notifyDrafts.some((x) => x.id === d.id)) continue;
+      this.notifyDrafts = mergeDrafts(this.notifyDrafts, [d]);
+      draftAdded++;
+    }
+    // append-only 批量结果（成功 / 失败清单与原因），重启后时间线报告仍一致
+    const id2 = batchId();
+    const record = makeBatchRecord({ id: id2, sessionId, action, ids: uniq, results: res.results, by, now, payload });
+    this.notifyBatches = mergeBatches(this.notifyBatches, [record]);
+
+    for (const n of this.notifications) this._markAuthoredItem(n.id, n.status);
+    this._pruneNotifyOutbox();
+    this.pumpNotify({ now });
+    this._dirty = true;
+    this.persist();
+    this.flushOutbox().catch(() => {});
+    this._emit('notify', { type: 'batch', id: id2, action, success: res.success, failed: res.failed, draftAdded });
+    return { ok: true, batchId: id2, record, results: res.results, success: res.success, failed: res.failed };
+  }
+
+  /** 当前接收人在指定会话（或全部）收件箱中可批量操作的通知项。 */
+  batchableInbox(recipient, { sessionId = null } = {}) {
+    return this.notifyInbox(recipient)
+      .filter((it) => !sessionId || it.sessionId === sessionId)
+      .filter((it) => !this._notifyLockedItems.has(it.id));
+  }
+
+  notifyDraftsFor(id) { return this.notifyDrafts.filter((d) => d.notifyId === id); }
+
+  /** 删除一条持久化本地草稿（重试成功或用户放弃后）。 */
+  discardNotifyDraftId(draftId) {
+    this.notifyDrafts = this.notifyDrafts.filter((d) => d.id !== draftId);
+    const list = this._notifyItemDrafts;
+    for (const [nid, arr] of list) {
+      const rest = arr.filter((d) => d.draftId !== draftId);
+      if (rest.length) list.set(nid, rest); else list.delete(nid);
+    }
+    this._dirty = true;
+    this.persist();
+    this._emit('notify', { type: 'draft-discard' });
+    return { ok: true };
+  }
+
   /* ---------- 409：版本冲突与本地未提交操作保留 ---------- */
 
   _stashNotifyDraft(id, draft) {
@@ -1851,6 +1972,19 @@ export class Store extends EventTarget {
       const key = `${draft.action}|${draft.payload?.to || ''}|${draft.payload?.snoozeMin || ''}|${draft.payload?.note || ''}`;
       if (!list.some((d) => `${d.action}|${d.payload?.to || ''}|${d.payload?.snoozeMin || ''}|${d.payload?.note || ''}` === key)) list.push(draft);
       this._notifyItemDrafts.set(id, list);
+      // 通知项草稿（批量部分版本冲突时保留）同时写入持久化 notifyDrafts：
+      // 刷新 / 重启后从权威文档重建内存映射（见 _adoptNotify）。
+      if (draft.action === 'ack' || draft.action === 'snooze' || draft.action === 'transfer') {
+        const d = makeDraft({
+          notifyId: id, action: draft.action, payload: draft.payload || {},
+          by: draft.by || this.actor, at: draft.at || Date.now(), reason: draft.reason || '版本冲突，本地操作保留',
+        });
+        const enriched = { ...draft, draftId: d.id, persisted: true };
+        const list2 = this._notifyItemDrafts.get(id) || [];
+        const idx = list2.findIndex((x) => x === draft);
+        if (idx >= 0) list2[idx] = enriched;
+        if (!this.notifyDrafts.some((x) => x.id === d.id)) this.notifyDrafts = mergeDrafts(this.notifyDrafts, [d]);
+      }
     }
     this._emit('notify', { type: 'draft', id });
   }
@@ -1887,6 +2021,10 @@ export class Store extends EventTarget {
     if (res.ok) {
       const list = (this._notifyItemDrafts.get(id) || []).filter((d) => d !== draft);
       if (list.length) this._notifyItemDrafts.set(id, list); else this._notifyItemDrafts.delete(id);
+      // 应用成功：移除持久化草稿（成功项已随权威保存提交，失败项不再保留）
+      if (draft.draftId) this.notifyDrafts = this.notifyDrafts.filter((d) => d.id !== draft.draftId);
+      this._dirty = true;
+      this.persist();
     }
     return res;
   }
@@ -1894,8 +2032,11 @@ export class Store extends EventTarget {
   discardNotifyItemDraft(id, draft) {
     const list = (this._notifyItemDrafts.get(id) || []).filter((d) => d !== draft);
     if (list.length) this._notifyItemDrafts.set(id, list); else this._notifyItemDrafts.delete(id);
+    if (draft?.draftId) this.notifyDrafts = this.notifyDrafts.filter((d) => d.id !== draft.draftId);
     this._notifyLockedItems.delete(id);
     if (!this._hasNotifyLocks()) this.notifyConflict = null;
+    this._dirty = true;
+    this.persist();
     this._emit('notify', { type: 'draft-discard', id });
     return { ok: true };
   }
@@ -2066,8 +2207,10 @@ export class Store extends EventTarget {
     try {
       let guard = 0;
       while (guard++ < 10000) {
-        // 严格 FIFO：按 enqueuedAt 排序，队头决定阻塞。
-        const ordered = [...this.notifyOutbox].sort((a, b) => (a.enqueuedAt - b.enqueuedAt) || (a.id < b.id ? -1 : 1));
+        // 严格 FIFO：按 (enqueuedAt, seq, id) 排序，队头决定阻塞。
+        // seq 是物化原顺序：静音窗口结束同一拍释放的多条通知据此保持原顺序。
+        const ordered = [...this.notifyOutbox].sort((a, b) =>
+          (a.enqueuedAt - b.enqueuedAt) || ((a.seq ?? 0) - (b.seq ?? 0)) || (a.id < b.id ? -1 : 1));
         // 丢弃引用已终态 / 已不存在通知项的陈旧条目（确认 / 转交 / 取消后不再发送）
         const stale = new Set();
         for (const o of ordered) {
@@ -2493,6 +2636,13 @@ function ruleSpecOf(rule) {
     name: rule.name,
     triggers: { ...rule.triggers },
     levels: (rule.levels || []).map((l) => ({ delayMin: l.delayMin, recipients: [...l.recipients] })),
+    schedule: rule.schedule
+      ? {
+          workHours: (rule.schedule.workHours || []).map((r) => ({ ...r })),
+          quietWeekly: (rule.schedule.quietWeekly || []).map((r) => ({ ...r })),
+          quietWindows: (rule.schedule.quietWindows || []).map((w) => ({ ...w })),
+        }
+      : null,
   };
 }
 

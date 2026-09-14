@@ -638,3 +638,26 @@ button.mini.ok { color: var(--ok); border-color: #bfe6cd; }
 .ntf-delay { width: 80px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; }
 .ntf-form-note { color: var(--danger); font-size: 11px; font-weight: 400; }
 .ntf-form-warn { color: var(--warn); font-size: 11px; font-weight: 400; line-height: 1.6; }
+
+/* 工作时段 / 静音窗口 */
+.ntf-banner.quiet { background: #ece8fb; color: #5a49c4; border: 1px solid #cfc6f5; }
+.ntf-state.s-deferred { background: #ece8fb; color: #5a49c4; }
+.ntf-item.st-deferred { border-left-color: #8b76e0; background: #faf9ff; }
+.ntf-defer { color: #5a49c4; font-weight: 700; }
+.ntf-deferred-note { font-size: 11px; color: #5a49c4; margin: 3px 0; }
+.ntf-r-schedule { font-size: 11px; color: var(--muted); margin: 3px 0; line-height: 1.6; }
+.ntf-sched-note { font-size: 11px; color: var(--muted); font-weight: 400; line-height: 1.6; margin-bottom: 4px; }
+.ntf-sched-sec { border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px; margin-bottom: 6px; }
+.ntf-sched-h { font-size: 12px; margin-bottom: 5px; }
+.ntf-sched-list { display: flex; flex-direction: column; gap: 5px; margin-bottom: 6px; }
+.ntf-range-row, .ntf-window-row { display: flex; align-items: center; gap: 5px; font-weight: 400; flex-wrap: wrap; }
+.ntf-range-row select, .ntf-window-row input { padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; }
+.ntf-win-label { flex: 1; min-width: 120px; }
+
+/* 批量处理 */
+.ntf-batchbar { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: #f7f9fc; margin-bottom: 8px; flex-wrap: wrap; position: sticky; top: 0; z-index: 2; }
+.ntf-batch-n b { color: var(--accent); }
+.ntf-pick { display: inline-flex; align-items: center; gap: 4px; font-weight: 400; font-size: 12px; white-space: nowrap; }
+.ntf-draft-note { font-size: 11px; color: var(--warn); background: var(--warn-soft); border-radius: 6px; padding: 4px 7px; margin: 4px 0; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ntf-q-item.deferred { border-left: 3px solid #8b76e0; }
+.ntf-q-item.batch { border-left: 3px solid var(--accent); background: #f7f9fc; }

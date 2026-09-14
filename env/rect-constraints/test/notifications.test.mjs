@@ -36,7 +36,11 @@ const {
   transferNotification, retryNotification, sanitizeNotifyEvents, sanitizeRules,
   sanitizeNotifications, sanitizeOutbox, mergeRules, mergeNotifyEvents, mergeNotifications,
   mergeOutbox, assessServerNotifyConflict, buildNotifyReport, notifyItemId, outboxItemId,
+  mergeBatches, mergeDrafts,
   MAX_ATTEMPTS,
+  normalizeSchedule, nextOpenAt, readyAtFor, scheduleIsOpenAt, minuteOfWeek,
+  applyBatchNotifications, makeBatchRecord, sanitizeBatches, makeDraft, sanitizeDrafts,
+  WEEK_MIN,
 } = N;
 const { stableStringify, exportChecksum, filterNodes } = await import('../web/js/geom/auditbench.js');
 const { mergeDocs } = await import('../web/js/geom/audit.js');
@@ -77,6 +81,8 @@ function makeServer() {
         merged.notifyRules = mergeRules(serverDoc.notifyRules || [], body.notifyRules || []);
         merged.notifications = mergeNotifications(serverDoc.notifications || [], body.notifications || []);
         merged.notifyOutbox = mergeOutbox(serverDoc.notifyOutbox || [], body.notifyOutbox || [], tombs);
+        merged.notifyBatches = mergeBatches(serverDoc.notifyBatches || [], body.notifyBatches || []);
+        merged.notifyDrafts = mergeDrafts(serverDoc.notifyDrafts || [], body.notifyDrafts || []);
         merged.rev = curRev + 1;
         for (const k of ['baseRev', 'baseHeads', 'baseReviewRevs', 'baseNotifyRuleRevs', 'baseNotifyItemRevs', 'notifyOutboxTombstones']) delete merged[k];
         serverDoc = merged;
