@@ -23,7 +23,7 @@ import { validate, normalize, seedModel, uid } from './model.js';
 import { snapshotVersion, compareVersions } from './versions.js';
 import {
   MAIN_BRANCH, makeRootEvent, makeEvent, makeForkRootEvent, makeExperimentForkRootEvent,
-  makeMigrationForkRootEvent, migrationBranchId,
+  makeMigrationForkRootEvent, migrationBranchId, makeMergeEvent,
   sanitizeAudit, migrateLegacy, timelineFor, localSeqOf, isAncestor,
   mergeDocs, assessConflict, freeze,
 } from './audit.js';
@@ -64,6 +64,11 @@ import {
   cancelBatchState, sanitizeMigrations, mergeMigrations,
   migrationDiff, buildMigrationReport, sourceFingerprint,
 } from './migration.js';
+import {
+  buildMergePlan, assembleMergeModel, finalizeMergeModel,
+  buildMergeReport, makeMergeDraft, mergeDraftId, findMergeBase,
+  choicesToMap, itemKey, mergeMergeDrafts,
+} from './merge.js';
 
 const LS_KEY = 'rect-constraints-doc-v2';
 const LS_KEY_LEGACY = 'rect-constraints-doc-v1';
@@ -106,6 +111,11 @@ export class Store extends EventTarget {
     this.migrations = [];                 // 迁移批次（含每文件预览/终态结果/原始输入/导入记录）
     this.migrationWarnings = [];
     this._migrationRunners = new Map();   // batchId -> {token}（进行中的批次运行器）
+
+    // 编辑分支三方合并草案（可反复打开；共同祖先 / 冲突选择 / 来源关系 / 合并报告随文档持久化）
+    this.mergeDrafts = [];                // merge draft[]（open / completed / abandoned）
+    this.activeMergeDraftId = null;       // 当前打开的草案 id（随文档持久化）
+    this.mergeConflict = null;            // null | { draftId, reason, targetHeadId, targetHeadSeq, serverRev }
 
     // 审阅通知与升级中心
     this.notifyEvents = [];        // append-only 通知事件（决定/签署/冲突/完成），按 id 幂等并集
@@ -313,6 +323,12 @@ export class Store extends EventTarget {
     this._releaseProposals = savedReleaseProposals;
     this._releasePendingApprovals = savedPendingApprovals;
     if (!keepReviewConflict) this.releaseConflict = null;
+
+    // 编辑分支三方合并草案：草案 / 共同祖先 / 冲突选择 / 来源关系 / 合并报告随文档持久化。
+    // 加载时做确定性结构清洗（plan 在需要时由当前事件重建；选择按 key 保留，可逐项重新确认）。
+    this.mergeDrafts = sanitizeMergeDrafts(doc.mergeDrafts);
+    this.activeMergeDraftId = this.mergeDrafts.some((d) => d.id === doc.activeMergeDraftId) ? doc.activeMergeDraftId : null;
+    this.mergeConflict = null;
   }
 
   /**
@@ -478,6 +494,8 @@ export class Store extends EventTarget {
       notifyDrafts: this.notifyDrafts,
       releases: this.releases,
       activeReleaseId: this.activeReleaseId,
+      mergeDrafts: this.mergeDrafts,
+      activeMergeDraftId: this.activeMergeDraftId,
       actor: this.actor,
     };
   }
@@ -563,6 +581,13 @@ export class Store extends EventTarget {
       finalDoc.activeReviewId = finalDoc.reviewSessions.some((x) => x.id === finalDoc.activeReviewId)
         ? finalDoc.activeReviewId
         : (payload.activeReviewId && finalDoc.reviewSessions.some((x) => x.id === payload.activeReviewId) ? payload.activeReviewId : null);
+      // 合并草案按 id 合流（完成状态不降级、open 选择按键并集），刷新/多页签后草案与报告一致
+      finalDoc.mergeDrafts = mergeMergeDrafts(
+        Array.isArray(prev?.mergeDrafts) ? prev.mergeDrafts : (finalDoc.mergeDrafts || []),
+        payload.mergeDrafts || []);
+      finalDoc.activeMergeDraftId = finalDoc.mergeDrafts.some((x) => x.id === finalDoc.activeMergeDraftId)
+        ? finalDoc.activeMergeDraftId
+        : (payload.activeMergeDraftId && finalDoc.mergeDrafts.some((x) => x.id === payload.activeMergeDraftId) ? payload.activeMergeDraftId : null);
       localStorage.setItem(LS_KEY, JSON.stringify(finalDoc));
       // 记录本页自己写入过的会话 rev：防抖窗口内重读 localStorage 不把自己的写入误判成外来推进
       for (const rs of payload.reviewSessions || []) {
@@ -942,6 +967,9 @@ export class Store extends EventTarget {
             this._notifyLockedItems = myNotifyLocks.items;
             this.notifyConflict = myNotifyLocks.conflict;
           }
+          // 合流文档已含本页载荷的全部分支：把它们的 head 登记为已同步基线，
+          // 否则从新分支切回原分支后首个提交会携带 fork 前的旧 head，被误判 branch-advanced。
+          for (const b of this.branches) this._syncedHeads[b.id] = b.headEventId;
           this._dirty = false;
           this._emit('load');
           this._emit('saved', { rev: this.rev, merged: true });
@@ -949,6 +977,11 @@ export class Store extends EventTarget {
         }
         if (Number.isFinite(data?.rev)) this.rev = data.rev;
         this._syncedHeads[this.currentBranchId] = this.branch.headEventId;
+        // 直存时客户端文档即权威：载荷中其他分支的 head 也已随本次保存原子确认，
+        // 同步它们的乐观基线（否则切回原分支后首个提交携带 fork 前旧 head 会被误判 branch-advanced）。
+        for (const b of this.branches) {
+          if (b.id !== this.currentBranchId) this._syncedHeads[b.id] = b.headEventId;
+        }
         // 审阅基线只前进到服务端确认接受的 rev：同 rev 直存时服务端文档 == 本页载荷，
         // 载荷中每个会话都是权威值；合流路径（data.merged）在 _carryReviewProposals 中
         // 严格按服务端文档重算，绝不在此把本地未确认的 rev 当作已同步基线。
@@ -1292,6 +1325,11 @@ export class Store extends EventTarget {
     this.replayEventId = null;
     this.replaySnapshot = null;
     this._syncedHeads[id] = root.id;
+    // 当前分支从原分支切走：其余已知分支的 head 都来自已装载的权威文档，补齐其乐观基线，
+    // 否则以后切回原分支提交时 baseHeads 仍是 fork 前的旧值，会被误判 branch-advanced。
+    for (const b of this.branches) {
+      if (b.id !== id && this._syncedHeads[b.id] === undefined) this._syncedHeads[b.id] = b.headEventId;
+    }
     this._dirty = true;
     this.persist();
     this._emit('branch', { type: 'fork', id, sourceEventId: eventId });
@@ -1306,6 +1344,9 @@ export class Store extends EventTarget {
     this.replayEventId = null;
     this.replaySnapshot = null;
     this.dragPreview = null;
+    // 切换到的分支 head 来自已装载的权威文档：登记为乐观基线，
+    // 否则切分支后的首个提交 baseHeads 缺该分支，会被误判为 branch-advanced。
+    if (this._syncedHeads[id] === undefined) this._syncedHeads[id] = b.headEventId;
     this._dirty = true; // 记住用户最后停留的分支
     this.persist();
     this._emit('branch', { type: 'switch', id });
@@ -1329,6 +1370,451 @@ export class Store extends EventTarget {
     this._dirty = true;
     this.persist();
     this._emit('branch', { type: 'compare' });
+  }
+
+  /* ==================== 编辑分支三方合并 ==================== */
+
+  get activeMergeDraft() {
+    return this.mergeDrafts.find((d) => d.id === this.activeMergeDraftId) || null;
+  }
+
+  mergeDraftById(id) { return this.mergeDrafts.find((d) => d.id === id) || null; }
+
+  /** 取分支 head 事件；损坏 / 缺失返回 null。 */
+  _branchHeadEvent(branchId) {
+    const b = this.branches.find((x) => x.id === branchId);
+    if (!b) return null;
+    const ev = this.eventsById.get(b.headEventId);
+    return ev && !ev.corrupt && ev.model ? ev : null;
+  }
+
+  /** 两分支当前 head 的共同祖先事件（无则 null）。 */
+  mergeBaseFor(targetBranchId, sourceBranchId) {
+    const t = this._branchHeadEvent(targetBranchId);
+    const s = this._branchHeadEvent(sourceBranchId);
+    if (!t || !s) return null;
+    return findMergeBase(t, s, this.eventsById);
+  }
+
+  /**
+   * 为一对分支重建确定性合并计划（不落盘）。
+   * 可选 headId 覆盖（更新到最新 head / 重开草案时用）。
+   */
+  buildMergeView(targetBranchId, sourceBranchId, { targetHeadId = null, sourceHeadId = null } = {}) {
+    const tb = this.branches.find((x) => x.id === targetBranchId);
+    const sb = this.branches.find((x) => x.id === sourceBranchId);
+    if (!tb || !sb) return { ok: false, reason: 'branch-missing', message: '分支不存在或已被删除' };
+    if (tb.id === sb.id) return { ok: false, reason: 'same-branch', message: '来源分支与目标分支不能相同' };
+    const te0 = this.eventsById.get(targetHeadId || tb.headEventId);
+    const se0 = this.eventsById.get(sourceHeadId || sb.headEventId);
+    const te = te0 && !te0.corrupt && te0.model ? te0 : null;
+    const se = se0 && !se0.corrupt && se0.model ? se0 : null;
+    if (!te || !se) return { ok: false, reason: 'head-corrupt', message: '分支 head 事件损坏或缺失，无法合并' };
+    const plan = buildMergePlan({
+      targetEvent: te, sourceEvent: se, targetBranch: tb, sourceBranch: sb, byId: this.eventsById,
+    });
+    if (!plan.ok) return { ok: false, reason: plan.reason, message: plan.message };
+    const models = { base: this.eventsById.get(plan.baseEventId)?.model, target: te.model, source: se.model };
+    return { ok: true, plan, models, targetEvent: te, sourceEvent: se };
+  }
+
+  /**
+   * 打开（或复用）一个合并草案：同对 head 派生确定性 id，重复打开不产生重复草案。
+   * 已存在的 open 草案保留其冲突选择；completed 草案直接返回（可查看报告）。
+   */
+  openMergeDraft(targetBranchId, sourceBranchId) {
+    if (this.replaying) return { ok: false, error: '回放模式为只读，请先退出回放' };
+    const view = this.buildMergeView(targetBranchId, sourceBranchId);
+    if (!view.ok) return { ok: false, error: view.message };
+    const { plan } = view;
+    const id = mergeDraftId(plan);
+    let draft = this.mergeDrafts.find((d) => d.id === id);
+    if (!draft) {
+      draft = makeMergeDraft(plan, { actor: this.actor || '未署名' });
+      this.mergeDrafts = [...this.mergeDrafts, draft];
+    } else if (draft.status !== 'open') {
+      return { ok: false, idempotent: true, draft, plan: view.plan, models: view.models,
+        error: '该合并草案已完成，请直接查看合并事件与报告' };
+    }
+    this.activeMergeDraftId = id;
+    this.mergeConflict = null;
+    this._dirty = true;
+    this.persist();
+    this._emit('merge', { type: 'open', id });
+    return { ok: true, draft, plan: view.plan, models: view.models,
+      targetEvent: view.targetEvent, sourceEvent: view.sourceEvent };
+  }
+
+  selectMergeDraft(id) {
+    if (id && !this.mergeDrafts.some((d) => d.id === id)) return { ok: false };
+    this.activeMergeDraftId = id || null;
+    this._dirty = true;
+    this.persist();
+    this._emit('merge', { type: 'select', id });
+    return { ok: true };
+  }
+
+  /** 重建一个已持久化草案对应的计划（共同祖先 / 自动项 / 冲突项随当前事件重新计算）。 */
+  viewForDraft(draft) {
+    if (!draft) return { ok: false, reason: 'missing', message: '合并草案不存在' };
+    return this.buildMergeView(draft.targetBranchId, draft.sourceBranchId, {
+      targetHeadId: draft.targetHeadId, sourceHeadId: draft.sourceHeadId,
+    });
+  }
+
+  /** 草案对应计划与冲突选择 map（自动项不在草案里，由 plan 确定性推出）。 */
+  mergeDraftView(id = this.activeMergeDraftId) {
+    const draft = this.mergeDraftById(id);
+    if (!draft) return null;
+    const view = this.viewForDraft(draft);
+    if (!view.ok) return { draft, ok: false, reason: view.reason, message: view.message };
+    return { draft, ok: true, ...view, choices: choicesToMap(draft.choices) };
+  }
+
+  /** 目标分支是否已在草案打开后前进（仅本地视图）。 */
+  mergeTargetAdvanced(draft) {
+    const tb = this.branches.find((b) => b.id === draft.targetBranchId);
+    return !!(tb && draft.status === 'open' && tb.headEventId !== draft.targetHeadId);
+  }
+
+  /**
+   * 合并提交前核对目标分支 head：本地视图前进优先返回；否则向服务端拉取权威文档核对。
+   * 服务端不可达（离线）时退回本地判断；返回 null 表示可以提交。
+   */
+  async _checkMergeTargetAdvanced(draft) {
+    const tb0 = this.branches.find((b) => b.id === draft.targetBranchId);
+    if (!tb0) return { targetBranchId: draft.targetBranchId, targetHeadId: null, targetHeadSeq: null };
+    if (this.mergeTargetAdvanced(draft)) {
+      const head = this.eventsById.get(tb0.headEventId);
+      return { targetBranchId: tb0.id, targetHeadId: tb0.headEventId, targetHeadSeq: head?.seq ?? null };
+    }
+    const sb0 = this.branches.find((b) => b.id === draft.sourceBranchId);
+    if (sb0 && sb0.headEventId !== draft.sourceHeadId) {
+      const head = this.eventsById.get(sb0.headEventId);
+      return {
+        sourceAdvanced: true,
+        targetBranchId: draft.targetBranchId, targetHeadId: tb0.headEventId,
+        targetHeadSeq: this.eventsById.get(tb0.headEventId)?.seq ?? null,
+        sourceBranchId: sb0.id, sourceHeadId: sb0.headEventId, sourceHeadSeq: head?.seq ?? null,
+      };
+    }
+    let serverDoc = null;
+    try { serverDoc = await this._fetchDoc(); } catch { serverDoc = null; }
+    if (!serverDoc) return null; // 离线 / 后端不可用：本地 OCC（保存时仍有分支头检查）兜底
+    const srv = (Array.isArray(serverDoc.branches) ? serverDoc.branches : [])
+      .find((b) => b && b.id === draft.targetBranchId);
+    if (srv && srv.headEventId && srv.headEventId !== draft.targetHeadId) {
+      const ev = (Array.isArray(serverDoc.events) ? serverDoc.events : [])
+        .find((e) => e && e.id === srv.headEventId);
+      return {
+        targetBranchId: srv.id, targetHeadId: srv.headEventId,
+        targetHeadSeq: ev?.seq ?? null, serverRev: Number.isFinite(serverDoc.rev) ? serverDoc.rev : null,
+      };
+    }
+    const srvS = (Array.isArray(serverDoc.branches) ? serverDoc.branches : [])
+      .find((b) => b && b.id === draft.sourceBranchId);
+    if (srvS && srvS.headEventId && srvS.headEventId !== draft.sourceHeadId) {
+      const evS = (Array.isArray(serverDoc.events) ? serverDoc.events : [])
+        .find((e) => e && e.id === srvS.headEventId);
+      return {
+        sourceAdvanced: true,
+        targetBranchId: draft.targetBranchId, targetHeadId: tb0.headEventId,
+        sourceBranchId: srvS.id, sourceHeadId: srvS.headEventId, sourceHeadSeq: evS?.seq ?? null,
+        serverRev: Number.isFinite(serverDoc.rev) ? serverDoc.rev : null,
+      };
+    }
+    return null;
+  }
+
+  /** 更新一项冲突选择（保留目标 / 采用来源 / 手动填写结果；manual=null 表示手动选择删除）。 */
+  setMergeResolution(draftId, key, resolution, manual = null) {
+    const draft = this.mergeDraftById(draftId);
+    if (!draft) return { ok: false, error: '合并草案不存在' };
+    if (draft.status !== 'open') return { ok: false, error: '该草案已结束，不能修改选择' };
+    const view = this.viewForDraft(draft);
+    if (!view.ok) return { ok: false, error: view.message };
+    const item = [...view.plan.rects.conflicts, ...view.plan.constraints.conflicts].find((x) => itemKey(x) === key);
+    if (!item) return { ok: false, error: '该冲突项不属于当前合并计划（共同祖先可能已变化）' };
+    if (!['target', 'source', 'manual'].includes(resolution)) return { ok: false, error: '非法选择' };
+
+    let manualNorm = null;
+    if (resolution === 'manual') {
+      const chk = this._checkManualMergeValue(item, manual, view.models);
+      if (!chk.ok) return { ok: false, error: chk.error };
+      manualNorm = chk.value;
+    }
+    const choices = draft.choices.filter((c) => c.key !== key);
+    choices.push({ key, resolution, ...(resolution === 'manual' ? { manual: manualNorm } : {}) });
+    choices.sort((a, b) => (a.key < b.key ? -1 : 1));
+    this._replaceMergeDraft({ ...draft, choices, updatedAt: Date.now() });
+    this._dirty = true;
+    this.persist();
+    this._emit('merge', { type: 'resolution', id: draftId, key });
+    return { ok: true };
+  }
+
+  /** 手动结果值校验：矩形要形状合法；约束要结构合法且引用存在的矩形（否则阻止完成）。 */
+  _checkManualMergeValue(item, value, models) {
+    if (value === null || value === undefined) return { ok: true, value: null }; // 手动删除
+    if (item.kind === 'rect') {
+      const r = value;
+      if (!r || typeof r !== 'object' || typeof r.id !== 'string') return { ok: false, error: '手动矩形缺少 id' };
+      if (![r.x, r.y, r.w, r.h].every((v) => Number.isFinite(v))) return { ok: false, error: '矩形坐标/尺寸必须是数字' };
+      if (!(r.w > 0) || !(r.h > 0)) return { ok: false, error: '矩形宽高必须为正数' };
+      return { ok: true, value: {
+        id: r.id, name: String(r.name || ''),
+        x: r.x, y: r.y, w: r.w, h: r.h,
+      } };
+    }
+    const c = value;
+    if (!c || typeof c !== 'object' || typeof c.id !== 'string') return { ok: false, error: '手动约束缺少 id' };
+    // 用一次完整合并模型 + validate 校验结构与引用；这里先做字段级兜底
+    const known = new Set([...models.target.rects, ...models.source.rects].map((r) => r.id));
+    if (!known.has(c.rect)) return { ok: false, error: '手动约束的跟随矩形不存在（会产生悬空引用）' };
+    if ((c.kind === 'snap' || c.kind === 'minGap') && !known.has(c.other)) {
+      return { ok: false, error: '手动约束引用的锚点矩形不存在（会产生悬空引用）' };
+    }
+    return { ok: true, value: structuredClone(c) };
+  }
+
+  /**
+   * 合并预览：应用当前选择后的模型、求解报告、未解决冲突、阻止项。
+   * 不写任何审计事件。choices 缺省时取草案已保存的选择。
+   */
+  previewMerge(draftId, extraChoices = null) {
+    const draft = this.mergeDraftById(draftId);
+    if (!draft) return { ok: false, errors: [{ code: 'missing', message: '合并草案不存在' }] };
+    const view = this.viewForDraft(draft);
+    if (!view.ok) return { ok: false, errors: [{ code: view.reason, message: view.message }] };
+    const { plan, models } = view;
+    const choices = extraChoices || choicesToMap(draft.choices);
+
+    const assembled = assembleMergeModel(plan, choices, models);
+    if (!assembled.ok) {
+      return {
+        ok: false, plan, models, choices,
+        unresolved: assembled.unresolved,
+        errors: assembled.unresolved.map((k) => ({ code: 'unresolved', message: `冲突项尚未选择处理方式：${k}` })),
+      };
+    }
+    const fin = finalizeMergeModel(assembled.model);
+    return {
+      ok: fin.ok, plan, models, choices,
+      model: fin.model || assembled.model,
+      report: fin.report || null,
+      errors: fin.errors,
+      cycle: fin.cycle,
+      unresolved: [],
+    };
+  }
+
+  /**
+   * 更新草案到最新的目标 / 来源 head（用户“更新到最新分支头”）。
+   * 已有冲突选择按 key 保留；新计划中不再是双方冲突的选择被忽略，
+   * 新出现 / 仍存在的冲突需要逐项重新确认（选择不自动套用）。
+   */
+  refreshMergeDraftHeads(draftId, { targetHeadId = null, sourceHeadId = null } = {}) {
+    const draft = this.mergeDraftById(draftId);
+    if (!draft) return { ok: false, error: '合并草案不存在' };
+    if (draft.status !== 'open') return { ok: false, error: '该草案已结束' };
+    const tb = this.branches.find((b) => b.id === draft.targetBranchId);
+    const sb = this.branches.find((b) => b.id === draft.sourceBranchId);
+    const newTargetHead = targetHeadId || tb?.headEventId;
+    const newSourceHead = sourceHeadId || sb?.headEventId;
+    const view = this.buildMergeView(draft.targetBranchId, draft.sourceBranchId, {
+      targetHeadId: newTargetHead, sourceHeadId: newSourceHead,
+    });
+    if (!view.ok) return { ok: false, error: view.message };
+    const newId = mergeDraftId(view.plan);
+    // 在新计划的冲突项里保留仍适用的旧选择；其余（自动项 / 消失项）丢弃
+    const newKeys = new Set([...view.plan.rects.conflicts, ...view.plan.constraints.conflicts].map(itemKey));
+    const carried = draft.choices.filter((c) => newKeys.has(c.key));
+
+    if (newId === draft.id) {
+      // head 未变（可能只是来源前进）：原地更新选择即可
+      this._replaceMergeDraft({ ...draft, choices: carried, updatedAt: Date.now() });
+    } else {
+      // head 变化：旧 open 草案标记 superseded（保留记录与来源关系），新建草案并复用 carried 选择
+      const old = { ...draft, status: 'superseded', supersededBy: newId, updatedAt: Date.now() };
+      const nd0 = makeMergeDraft(view.plan, { actor: draft.actor || this.actor || '未署名' });
+      const nd = freeze({ ...nd0, choices: carried });
+      this.mergeDrafts = this.mergeDrafts.map((d) => (d.id === old.id ? freeze({ ...old }) : d));
+      if (!this.mergeDrafts.some((d) => d.id === nd.id)) this.mergeDrafts = [...this.mergeDrafts, nd];
+      this.activeMergeDraftId = nd.id;
+    }
+    this.mergeConflict = null;
+    this._dirty = true;
+    this.persist();
+    this._emit('merge', { type: 'refresh-heads', id: this.activeMergeDraftId });
+    return { ok: true, id: this.activeMergeDraftId, carried: carried.length };
+  }
+
+  /** 放弃草案（不影响任何事件）。 */
+  abandonMergeDraft(draftId) {
+    const draft = this.mergeDraftById(draftId);
+    if (!draft) return { ok: false, error: '合并草案不存在' };
+    if (draft.status === 'open') {
+      this._replaceMergeDraft({ ...draft, status: 'abandoned', updatedAt: Date.now() });
+      this._dirty = true;
+      this.persist();
+    }
+    if (this.activeMergeDraftId === draftId) this.activeMergeDraftId = null;
+    this._emit('merge', { type: 'abandon', id: draftId });
+    return { ok: true };
+  }
+
+  /**
+   * 提交合并：校验全部冲突已解决且结果通过结构 / 悬空 / 环 / 越界检查后，
+   * 在【目标分支】head 之后追加一条 kind='merge' 的审计事件。
+   * 原分支事件、来源分支与历史一律不改写。
+   *
+   * 幂等：同草案同结果重复提交直接返回既有 merge 事件，绝不产生重复事件。
+   * 合并期间目标分支已前进（另一页面提交，本地或服务端 head 不再是草案基线）
+   * -> status 409 merge-target-advanced，不追加任何事件，本地选择原样保留，
+   * 用户更新到最新分支头后可逐项重新确认。
+   */
+  async commitMerge(draftId, { label = '' } = {}) {
+    if (this.saveConflict) return { ok: false, status: 409, reason: 'branch-advanced', error: '版本冲突未解决，请先重新加载' };
+    const draft = this.mergeDraftById(draftId);
+    if (!draft) return { ok: false, status: 404, error: '合并草案不存在' };
+    if (draft.status === 'completed' && draft.mergeEventId) {
+      const existing = this.eventsById.get(draft.mergeEventId);
+      if (existing) return { ok: true, idempotent: true, event: existing, draft };
+    }
+    if (draft.status !== 'open') return { ok: false, error: '该合并草案已结束' };
+
+    // 合并期间目标 / 来源分支前进：本地已知（localStorage 多页签合流）或服务端权威 head 已变 => 409
+    const advancedInfo = await this._checkMergeTargetAdvanced(draft);
+    if (advancedInfo) {
+      const reason = advancedInfo.sourceAdvanced ? 'merge-source-advanced' : 'merge-target-advanced';
+      this.mergeConflict = { draftId, reason, ...advancedInfo, at: Date.now() };
+      this._emit('merge', { type: 'conflict', id: draftId });
+      return {
+        ok: false, status: 409, reason,
+        error: advancedInfo.sourceAdvanced
+          ? `合并期间来源分支已前进到 #${advancedInfo.sourceHeadSeq ?? '?'}，请更新到最新分支头后逐项重新确认`
+          : `合并期间目标分支已前进到 #${advancedInfo.targetHeadSeq ?? '?'}，请更新到最新分支头后逐项重新确认`,
+        ...advancedInfo, conflict: this.mergeConflict,
+      };
+    }
+
+    const view = this.previewMerge(draftId);
+    if (!view.ok) {
+      const first = view.unresolved?.length
+        ? `还有 ${view.unresolved.length} 个冲突未选择处理方式`
+        : (view.errors?.[0]?.message || '合并结果未通过校验');
+      return { ok: false, reason: 'merge-blocked', error: first, errors: view.errors, unresolved: view.unresolved, cycle: view.cycle };
+    }
+
+    const targetEvent = this._branchHeadEvent(draft.targetBranchId);
+    const sourceEvent = this._branchHeadEvent(draft.sourceBranchId) || this.eventsById.get(draft.sourceHeadId);
+    const tb = this.branches.find((b) => b.id === draft.targetBranchId);
+    const sb = this.branches.find((b) => b.id === draft.sourceBranchId);
+    const choices = choicesToMap(draft.choices);
+
+    // 二次幂等：同结果指纹的合并事件已在目标分支上 -> 直接复用
+    const resultHash = view.report.hash;
+    const already = this._findMergeEvent(tb, draft.id, resultHash);
+    if (already) {
+      this._markDraftCompleted(draft, already, view, choices, tb, sb, targetEvent, sourceEvent, { idempotent: true });
+      return { ok: true, idempotent: true, event: already, draft: this.mergeDraftById(draftId) };
+    }
+
+    const resolutions = [...choices.entries()].map(([key, ch]) => ({
+      key, resolution: ch.resolution, ...(ch.manual ? { manual: true } : {}),
+    })).sort((a, b) => (a.key < b.key ? -1 : 1));
+
+    const plan = view.plan;
+    const mergeMeta = {
+      baseEventId: plan.baseEventId,
+      sourceBranchId: plan.sourceBranchId,
+      sourceHeadId: plan.sourceHeadId,
+      sourceHeadSeq: plan.sourceHeadSeq,
+      draftId: draft.id,
+      auto: plan.counts.auto,
+      conflicts: plan.counts.conflicts,
+      resolutions,
+      report: null, // 完成后回填完整报告（见下）
+    };
+    const mergeLabel = label || `合并来源「${sb.name}」#${sourceEvent?.seq ?? plan.sourceHeadSeq} 到「${tb.name}」`;
+    const ev = makeMergeEvent(targetEvent, tb.id, view.model, view.report, {
+      actor: this.actor || '未署名', label: mergeLabel, t: Date.now(), merge: mergeMeta,
+    });
+
+    this.events = [...this.events, ev];
+    this.eventsById.set(ev.id, ev);
+    this._replaceBranch({
+      ...tb,
+      headEventId: ev.id,
+      redoTipId: null,
+    });
+    // 合并不是对“当前编辑分支”的提交：完成后切到目标分支，保证保存时它作为 currentBranch
+    // 随保存链确认（否则跨分支合流会保留服务端 head，丢掉刚追加的合并事件）。
+    const wasCurrent = this.currentBranchId === tb.id;
+    this.currentBranchId = tb.id;
+    this.replayEventId = null;
+    this.replaySnapshot = null;
+
+    // 回填完整合并报告（合并前后差异 + 逐项裁决）到事件与草案
+    const report = buildMergeReport({
+      plan, choices, targetEvent, outcome: { model: view.model, report: view.report },
+      mergeEventId: ev.id, completedAt: ev.t,
+    });
+    const evWithReport = freeze({ ...ev, merge: { ...ev.merge, report } });
+    this.events = this.events.map((x) => (x.id === ev.id ? evWithReport : x));
+    this.eventsById.set(ev.id, evWithReport);
+
+    this._markDraftCompleted(draft, evWithReport, view, choices, tb, sb, targetEvent, sourceEvent, { report });
+    this._syncedHeads[tb.id] = draft.targetHeadId; // 乐观基线=合并前 head；保存确认后在 _sendLatest 推进到 ev
+    this._dirty = true;
+    this.persist();
+    this._emit('merge', { type: 'commit', id: draftId, eventId: ev.id });
+    this._emit('branch', { type: 'merge-commit', id: tb.id });
+    this._emit('change', { label: 'merge' });
+    return { ok: true, idempotent: false, event: evWithReport, draft: this.mergeDraftById(draftId), report };
+  }
+
+  _findMergeEvent(tb, draftId, resultHash) {
+    // 沿目标分支当前链找带同 draftId（或同结果指纹）的 merge 事件
+    let cur = this.eventsById.get(tb.headEventId);
+    let guard = 0;
+    while (cur && guard++ < 100000) {
+      if (cur.kind === 'merge' && cur.merge && (cur.merge.draftId === draftId || cur.hash === resultHash)) return cur;
+      cur = cur.parentId ? this.eventsById.get(cur.parentId) : null;
+    }
+    return null;
+  }
+
+  _markDraftCompleted(draft, ev, view, choices, tb, sb, targetEvent, sourceEvent, { report = null, idempotent = false } = {}) {
+    const fullReport = report || (ev.merge?.report && ev.merge.report.mergeEventId === ev.id
+      ? ev.merge.report
+      : buildMergeReport({
+        plan: view.plan, choices, targetEvent,
+        outcome: { model: ev.model, report: ev.report }, mergeEventId: ev.id, completedAt: ev.t,
+      }));
+    const completed = freeze({
+      ...draft,
+      status: 'completed',
+      completedAt: ev.t,
+      mergeEventId: ev.id,
+      resultHash: ev.hash,
+      targetHeadId: ev.id,
+      report: fullReport,
+      updatedAt: Date.now(),
+    });
+    this.mergeDrafts = this.mergeDrafts.map((d) => (d.id === draft.id ? completed : d));
+    if (this.activeMergeDraftId === draft.id) this.activeMergeDraftId = draft.id;
+    if (!idempotent) this._dirty = true;
+  }
+
+  _replaceMergeDraft(next) {
+    this.mergeDrafts = this.mergeDrafts.map((d) => (d.id === next.id ? freeze(next) : d));
+  }
+
+  /** 查看合并事件的完整合并报告（前后差异 + 逐项裁决）；非合并事件返回 null。 */
+  mergeReportForEvent(eventId) {
+    const ev = this.eventsById.get(eventId);
+    return ev?.kind === 'merge' ? (ev.merge?.report || null) : null;
   }
 
   /* ---------- 实验审计工作台（视图状态持久化） ---------- */
@@ -3543,7 +4029,8 @@ function ruleSpecOf(rule) {
 }
 
 /** 载入时清洗版本列表：结构不完整的一律丢弃，published 归一为布尔。 */
-function sanitizeVersions(list) {  if (!Array.isArray(list)) return [];
+function sanitizeVersions(list) {
+  if (!Array.isArray(list)) return [];
   const seen = new Set();
   const out = [];
   for (const v of list) {
@@ -3559,6 +4046,65 @@ function sanitizeVersions(list) {  if (!Array.isArray(list)) return [];
       model: v.model,
       report: v.report && typeof v.report === 'object' ? v.report : null,
       hash: typeof v.hash === 'string' ? v.hash : (v.report?.hash ?? ''),
+    });
+  }
+  return out;
+}
+
+/* ---------------- 合并草案：清洗 / 合流 ---------------- */
+
+const MERGE_DRAFT_STATUSES = new Set(['open', 'completed', 'abandoned', 'superseded']);
+
+/**
+ * 载入时清洗合并草案（确定性、幂等、不重算几何）：
+ * - 丢弃结构不完整 / 重复 id（保留第一条）的草案；
+ * - choices 只保留 {key,resolution,manual?} 且 resolution 合法；
+ * - completed 必须带 mergeEventId/resultHash，否则回退 open（事件可能尚未合流到本页）。
+ */
+export function sanitizeMergeDrafts(list) {
+  if (!Array.isArray(list)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const d0 of list) {
+    if (!d0 || typeof d0 !== 'object' || typeof d0.id !== 'string') continue;
+    if (seen.has(d0.id)) continue;
+    for (const k of ['targetBranchId', 'sourceBranchId', 'targetHeadId', 'sourceHeadId', 'baseEventId']) {
+      if (typeof d0[k] !== 'string') { d0.malformed = true; break; }
+    }
+    if (d0.malformed) continue;
+    seen.add(d0.id);
+    let status = MERGE_DRAFT_STATUSES.has(d0.status) ? d0.status : 'open';
+    if (status === 'completed' && (typeof d0.mergeEventId !== 'string' || typeof d0.resultHash !== 'string')) {
+      status = 'open';
+    }
+    const choices = (Array.isArray(d0.choices) ? d0.choices : [])
+      .filter((c) => c && typeof c.key === 'string' && ['target', 'source', 'manual'].includes(c.resolution))
+      .map((c) => ({
+        key: c.key,
+        resolution: c.resolution,
+        ...(c.resolution === 'manual' && c.manual && typeof c.manual === 'object' ? { manual: c.manual } : {}),
+      }));
+    out.push({
+      id: d0.id,
+      createdAt: Number.isFinite(d0.createdAt) ? d0.createdAt : 0,
+      updatedAt: Number.isFinite(d0.updatedAt) ? d0.updatedAt : (Number.isFinite(d0.createdAt) ? d0.createdAt : 0),
+      actor: typeof d0.actor === 'string' ? d0.actor : '',
+      status,
+      targetBranchId: d0.targetBranchId,
+      sourceBranchId: d0.sourceBranchId,
+      targetHeadId: d0.targetHeadId,
+      sourceHeadId: d0.sourceHeadId,
+      baseEventId: d0.baseEventId,
+      baseHash: typeof d0.baseHash === 'string' ? d0.baseHash : '',
+      targetHeadHash: typeof d0.targetHeadHash === 'string' ? d0.targetHeadHash : '',
+      sourceHeadHash: typeof d0.sourceHeadHash === 'string' ? d0.sourceHeadHash : '',
+      choices,
+      completedAt: Number.isFinite(d0.completedAt) ? d0.completedAt : null,
+      mergeEventId: typeof d0.mergeEventId === 'string' ? d0.mergeEventId : null,
+      resultHash: typeof d0.resultHash === 'string' ? d0.resultHash : null,
+      report: d0.report && typeof d0.report === 'object' ? d0.report : null,
+      conflictStale: d0.conflictStale && typeof d0.conflictStale === 'object' ? d0.conflictStale : null,
+      ...(typeof d0.supersededBy === 'string' ? { supersededBy: d0.supersededBy } : {}),
     });
   }
   return out;

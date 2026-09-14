@@ -11,6 +11,8 @@
  *     changes,                      // compareVersions 式结构化变更（root 为 null）
  *     conflicts,                    // 提交后的冲突结果快照（含冲突链）
  *     provenance?: { branchId, eventId, seq } // fork-root 才有：来源关系
+ *     merge?: { baseEventId, sourceBranchId, sourceHeadId, draftId,
+ *               auto, conflicts, resolutions:[...], report } // kind='merge' 才有
  *   }
  *
  * 分支 branch：
@@ -28,6 +30,7 @@ import { solve } from './solver.js';
 import { validate, normalize, seedModel, uid } from './model.js';
 import { compareVersions } from './versions.js';
 import { mergeExperiments } from './experiments.js';
+import { mergeMergeDrafts } from './merge.js';
 
 export const MAIN_BRANCH = 'main';
 
@@ -158,6 +161,32 @@ export function makeMigrationForkRootEvent(result, meta, { actor, t = Date.now()
       quarantinedCount: Array.isArray(result.quarantined) ? result.quarantined.length : 0,
     },
   });
+}
+
+/* ---------------- 三方合并事件 ---------------- */
+
+/**
+ * 由一次已接受的三方合并构造审计事件（调用方须先完成 finalizeMergeModel 校验）。
+ * 合并事件挂在【目标分支】当前 head 之后；原分支事件、来源分支事件与历史一律不改写。
+ * @param parent 目标分支当前 head
+ * @param branch 目标分支 id
+ * @param model/report 合并并固化后的结果
+ * @param meta { actor, label, t, merge: { baseEventId, sourceBranchId, sourceHeadId,
+ *          draftId, auto, conflicts, resolutions, report } }
+ */
+export function makeMergeEvent(parent, branch, model, report, meta) {
+  const changes = parent ? compareVersions(like(parent), { model, report, hash: report.hash }) : null;
+  const ev = {
+    id: uid('e'), branch, parentId: parent ? parent.id : null,
+    kind: 'merge', seq: parent ? parent.seq + 1 : 1,
+    t: meta.t ?? Date.now(), actor: String(meta.actor || '未署名'),
+    label: String(meta.label || '合并分支'),
+    model: structuredClone(model), report: structuredClone(report), hash: report.hash,
+    hashBefore: parent ? parent.hash : null,
+    changes, conflicts: structuredClone(report.conflicts),
+    merge: structuredClone(meta.merge),
+  };
+  return freeze(ev);
 }
 
 /* ---------------- 时间线浏览 ---------------- */
@@ -377,7 +406,7 @@ function sanitizeEvent(raw, warnings) {
     id: raw.id,
     branch: typeof raw.branch === 'string' ? raw.branch : MAIN_BRANCH,
     parentId: typeof raw.parentId === 'string' ? raw.parentId : null,
-    kind: ['root', 'edit', 'fork-root'].includes(raw.kind) ? raw.kind : 'edit',
+    kind: ['root', 'edit', 'fork-root', 'merge'].includes(raw.kind) ? raw.kind : 'edit',
     seq: Number.isFinite(raw.seq) && raw.seq > 0 ? Math.floor(raw.seq) : 0,
     t: Number.isFinite(raw.t) ? raw.t : 0,
     actor: typeof raw.actor === 'string' ? raw.actor : '未知操作者',
@@ -436,6 +465,7 @@ function sanitizeEvent(raw, warnings) {
       ? raw.conflicts
       : structuredClone(rep.conflicts),
     ...(raw.provenance && typeof raw.provenance === 'object' ? { provenance: raw.provenance } : {}),
+    ...(raw.merge && typeof raw.merge === 'object' ? { merge: raw.merge } : {}),
   });
 }
 
@@ -533,12 +563,19 @@ export function mergeDocs(serverDoc, clientDoc) {
     Array.isArray(clientDoc.experiments) ? clientDoc.experiments : [],
   );
 
+  // 合并草案按 id 合流：完成状态不被 open 旧副本降级，open 选择按键并集
+  const mergeDrafts = mergeMergeDrafts(
+    Array.isArray(serverDoc.mergeDrafts) ? serverDoc.mergeDrafts : [],
+    Array.isArray(clientDoc.mergeDrafts) ? clientDoc.mergeDrafts : [],
+  );
+
   return {
     ...serverDoc,
     events: [...evs.values()],
     branches: outBranches,
     versions: [...vs.values()],
     experiments,
+    mergeDrafts,
     currentVersionId: serverDoc.currentVersionId ?? null,
     compare: serverDoc.compare || { a: null, b: null },
     branchCompare: serverDoc.branchCompare || { a: null, b: null },

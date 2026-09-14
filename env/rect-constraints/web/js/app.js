@@ -3,6 +3,7 @@ import { View } from './geom/view.js';
 import { ConstraintDialog } from './geom/dialog.js';
 import { VersionPanel } from './geom/versionpanel.js';
 import { AuditPanel } from './geom/auditpanel.js';
+import { MergePanel } from './geom/mergepanel.js';
 import { ExperimentPanel } from './geom/experimentpanel.js';
 import { WorkbenchPanel } from './geom/workbenchpanel.js';
 import { ReleasePanel } from './geom/releasepanel.js';
@@ -62,6 +63,7 @@ dialog.hooks = { onCycle: (cyc) => view.setCycleHighlight(cyc) };
 
 const versionPanel = new VersionPanel(store, { toast });
 const auditPanel = new AuditPanel(store, { toast });
+const mergePanel = new MergePanel(store, { toast });
 const experimentPanel = new ExperimentPanel(store, { toast });
 const workbenchPanel = new WorkbenchPanel(store, { toast });
 const releasePanel = new ReleasePanel(store, { toast });
@@ -216,6 +218,7 @@ function renderPanels() {
   renderConflicts();
   versionPanel.render();
   auditPanel.render();
+  mergePanel.render();
   experimentPanel.render();
   workbenchPanel.render();
   migrationPanel.render();

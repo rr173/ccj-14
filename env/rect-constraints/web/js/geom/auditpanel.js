@@ -10,7 +10,7 @@
 
 import { diffHtml } from './diff.js';
 
-const KIND_LABEL = { root: '初始', edit: '编辑', 'fork-root': '分支起点' };
+const KIND_LABEL = { root: '初始', edit: '编辑', 'fork-root': '分支起点', merge: '合并' };
 
 export class AuditPanel {
   constructor(store, hooks) {
@@ -20,6 +20,7 @@ export class AuditPanel {
     this.$branchSel = document.querySelector('#audit-branch');
     this.$list = document.querySelector('#audit-timeline');
     this.$newBranch = document.querySelector('#btn-new-branch');
+    this.$mergeBranch = document.querySelector('#btn-merge-branch');
     this.$warnings = document.querySelector('#audit-warnings');
     this.$cmpA = document.querySelector('#bcmp-a');
     this.$cmpB = document.querySelector('#bcmp-b');
@@ -38,6 +39,7 @@ export class AuditPanel {
       if (!res.ok) this.render();
     });
     this.$newBranch.onclick = () => this._forkFromHead();
+    this.$mergeBranch.onclick = () => this._mergeIntoCurrent();
     this.$cmpA.onchange = () => store.setBranchCompare(this.$cmpA.value || null, this.$cmpB.value || null);
     this.$cmpB.onchange = () => store.setBranchCompare(this.$cmpA.value || null, this.$cmpB.value || null);
   }
@@ -52,6 +54,26 @@ export class AuditPanel {
     const res = this.store.forkFromEvent(baseEventId, name);
     if (!res.ok) { this.hooks.toast(res.error, 'warn'); return; }
     this.hooks.toast(`已从${this.store.replaying ? '回放事件' : '当前布局'}另存为新分支「${name}」，原分支未被改写`);
+  }
+
+  _mergeIntoCurrent() {
+    const targetId = this.store.currentBranchId;
+    const others = [...this.store.branches]
+      .filter((b) => b.id !== targetId)
+      .sort((a, b) => (a.createdAt - b.createdAt) || (a.id < b.id ? -1 : 1));
+    if (!others.length) { this.hooks.toast('还没有其他分支可以合并', 'warn'); return; }
+    const list = others.map((b, i) => `${i + 1}. ${b.name}`).join('\n');
+    const ans = prompt(`把哪个来源分支合并到「${this.store.branch.name}」？\n${list}\n\n输入序号：`, '1');
+    if (ans === null) return;
+    const idx = Number(ans) - 1;
+    const src = others[idx];
+    if (!src) { this.hooks.toast('无效的序号', 'warn'); return; }
+    const res = this.store.openMergeDraft(targetId, src.id);
+    if (!res.ok) { this.hooks.toast(res.error, 'warn'); return; }
+    // 切到“合并”页继续解决冲突 / 完成
+    const tab = document.querySelector('.tab[data-tab="merge"]');
+    if (tab) tab.click();
+    this.hooks.toast(`已打开合并草案：${src.name} → ${this.store.branch.name}（共同祖先 #${res.plan.baseSeq}）`);
   }
 
   render() {
@@ -135,6 +157,8 @@ export class AuditPanel {
     const hashB = ev.hashBefore ? ev.hashBefore.slice(0, 8) : '—';
     const prov = ev.provenance
       ? `<div class="tl-prov">来源：${escapeHtml(this.store.branches.find((b) => b.id === ev.provenance.branchId)?.name || ev.provenance.branchId)} #${ev.provenance.seq}</div>` : '';
+    const mergeInfo = ev.kind === 'merge' && ev.merge
+      ? `<div class="tl-prov">三方合并来源：${escapeHtml(this.store.branches.find((b) => b.id === ev.merge.sourceBranchId)?.name || ev.merge.sourceBranchId)} #${ev.merge.sourceHeadSeq ?? '?'}（共同祖先 #${this._baseSeq(ev.merge.baseEventId)}）· 自动 ${ev.merge.auto ?? 0} 项 / 冲突 ${ev.merge.conflicts ?? 0} 项</div>` : '';
     const changeSum = ev.changes && !ev.changes.identical ? this._changeSummary(ev.changes) : '';
     if (r.corrupt) {
       return `<div class="${cls}" data-eid="${ev.id}" data-clickable="0">
@@ -161,7 +185,7 @@ export class AuditPanel {
         矩形 ${nRect} · 约束 ${nCons} · 冲突 ${nConf}
       </div>
       <div class="tl-hash">指纹 ${hashB} → <b>${ev.hash.slice(0, 8)}</b>${changeSum ? ' · ' + changeSum : ''}</div>
-      ${prov}
+      ${prov}${mergeInfo}
       <div class="tl-actions">
         <button class="mini" data-act="replay">▶ 重放到此</button>
         <button class="mini" data-act="fork" title="把这一刻的完整布局另存为新的编辑分支（原事件与原分支不改写）">⎇ 另存为分支</button>
@@ -169,8 +193,12 @@ export class AuditPanel {
     </div>`;
   }
 
-  _changeSummary(d) {
-    const parts = [];
+  _baseSeq(baseEventId) {
+    const ev = this.store.eventsById.get(baseEventId);
+    return ev?.seq ?? '?';
+  }
+
+  _changeSummary(d) {    const parts = [];
     const r = d.rects.added.length + d.rects.removed.length + d.rects.moved.length + d.rects.resized.length;
     const c = d.constraints.added.length + d.constraints.removed.length + d.constraints.changed.length;
     if (r) parts.push(`矩形 ${r}`);

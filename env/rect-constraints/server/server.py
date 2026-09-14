@@ -93,6 +93,8 @@ def _valid_shape(doc):
             m = e.get("model")
             if not isinstance(m, dict) or not isinstance(m.get("rects"), list) or not isinstance(m.get("constraints"), list):
                 return False
+            if e.get("kind") not in (None, "root", "edit", "fork-root", "merge"):
+                return False
         for b in branches:
             if not isinstance(b, dict) or not isinstance(b.get("id"), str) or not isinstance(b.get("name"), str):
                 return False
@@ -163,6 +165,32 @@ def _valid_shape(doc):
     # 旧版布局批量迁移（可为空）：轻量结构校验，格式识别 / 指纹对账在浏览器纯函数里
     if not _valid_migration_shape(doc):
         return False
+    # 编辑分支三方合并草案（可为空）：轻量结构校验，共同祖先 / 环 / 越界对账在浏览器纯函数里
+    if not _valid_merge_draft_shape(doc):
+        return False
+    return True
+
+
+def _valid_merge_draft_shape(doc):
+    drafts = doc.get("mergeDrafts", [])
+    if not isinstance(drafts, list):
+        return False
+    for d in drafts:
+        if not isinstance(d, dict) or not isinstance(d.get("id"), str):
+            return False
+        if d.get("status") not in (None, "open", "completed", "abandoned", "superseded"):
+            return False
+        for k in ("targetBranchId", "sourceBranchId", "targetHeadId", "sourceHeadId", "baseEventId"):
+            if not isinstance(d.get(k), str):
+                return False
+        choices = d.get("choices", [])
+        if not isinstance(choices, list):
+            return False
+        for c in choices:
+            if not isinstance(c, dict) or not isinstance(c.get("key"), str):
+                return False
+            if c.get("resolution") not in ("target", "source", "manual"):
+                return False
     return True
 
 
@@ -295,6 +323,28 @@ def _assess_conflict(cur, doc):
         src_id = prov.get("eventId") if isinstance(prov, dict) else None
         if nb and src_id and src_id in cur_events:
             return True, None
+        # fork 后立即提交、防抖保存把 fork-root 与其子事件合并在同一次请求里：
+        # 当前 head 可能已不是 fork-root；沿 parentId（含跨分支 provenance）回溯，
+        # 只要链上某事件是服务端已有事件即合法（事件不可变，新增链只追加不改写）。
+        if nb and src_id:
+            client_events = {e["id"]: e for e in doc.get("events", []) if isinstance(e, dict) and isinstance(e.get("id"), str)}
+            head = client_events.get(nb.get("headEventId"))
+            guard = 0
+            while head and guard < 100000:
+                guard += 1
+                if head.get("id") in cur_events:
+                    return True, None
+                pid = head.get("parentId")
+                if pid:
+                    head = client_events.get(pid)
+                    continue
+                hp = head.get("provenance") if isinstance(head.get("provenance"), dict) else None
+                if hp and hp.get("eventId") and hp.get("kind") != "migration":
+                    if hp["eventId"] in cur_events:
+                        return True, None
+                    head = client_events.get(hp["eventId"])
+                    continue
+                break
         return False, {"reason": "branch-missing", "branchId": cur_id}
     if base_heads.get(cur_id) != sb.get("headEventId"):
         head = cur_events.get(sb.get("headEventId"), {})
@@ -1046,6 +1096,47 @@ def _merge_releases(server_list, client_list):
     return out
 
 
+def _merge_merge_drafts(server_list, client_list):
+    """合并草案按 id 合流（与 web/js/geom/merge.js mergeMergeDrafts 同构）。"""
+    rank = {"open": 0, "abandoned": 1, "superseded": 2, "completed": 3}
+    by_id, order = {}, []
+    for d in list(server_list or []) + list(client_list or []):
+        if not isinstance(d, dict) or not isinstance(d.get("id"), str):
+            continue
+        did = d["id"]
+        ex = by_id.get(did)
+        if ex is None:
+            by_id[did] = d
+            order.append(did)
+            continue
+        rs, re_ = rank.get(d.get("status", "open"), 0), rank.get(ex.get("status", "open"), 0)
+        win = d if (rs != re_ and rs > re_) or (rs == re_ and int(d.get("updatedAt") or 0) >= int(ex.get("updatedAt") or 0)) else ex
+        merged = dict(ex)
+        merged.update(win)
+        if ex.get("status") == "open" and d.get("status") == "open":
+            chm = {}
+            newer = int(d.get("updatedAt") or 0) >= int(ex.get("updatedAt") or 0)
+            first, second = (ex, d) if newer else (d, ex)
+            for c in (first.get("choices") or []):
+                if isinstance(c, dict) and isinstance(c.get("key"), str):
+                    chm[c["key"]] = c
+            for c in (second.get("choices") or []):
+                if isinstance(c, dict) and isinstance(c.get("key"), str):
+                    chm[c["key"]] = c
+            merged["choices"] = sorted(chm.values(), key=lambda c: c["key"])
+            merged["status"] = "open"
+        done = ex if ex.get("status") == "completed" else (d if d.get("status") == "completed" else None)
+        if done:
+            merged["status"] = "completed"
+            merged["mergeEventId"] = done.get("mergeEventId")
+            merged["resultHash"] = done.get("resultHash")
+            merged["report"] = done.get("report") or merged.get("report")
+            merged["completedAt"] = done.get("completedAt")
+            merged["targetHeadId"] = done.get("targetHeadId")
+        by_id[did] = merged
+    return [by_id[i] for i in order]
+
+
 def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
     """跨分支并发合流。与 web/js/geom/audit.js mergeDocs 同构。"""
     evs = {e["id"]: e for e in server_doc.get("events", []) if isinstance(e, dict)}
@@ -1082,6 +1173,7 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
     notify_drafts = _merge_drafts(server_doc.get("notifyDrafts", []), client_doc.get("notifyDrafts", []))
     releases = _merge_releases(server_doc.get("releases", []), client_doc.get("releases", []))
     migrations = _merge_migrations(server_doc.get("migrations", []), client_doc.get("migrations", []))
+    merge_drafts = _merge_merge_drafts(server_doc.get("mergeDrafts", []), client_doc.get("mergeDrafts", []))
 
     merged = dict(server_doc)
     merged.update({
@@ -1098,6 +1190,10 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
         "notifyDrafts": notify_drafts,
         "releases": releases,
         "migrations": migrations,
+        "mergeDrafts": merge_drafts,
+        "activeMergeDraftId": server_doc.get("activeMergeDraftId")
+            if any(d.get("id") == server_doc.get("activeMergeDraftId") for d in merge_drafts)
+            else (client_doc.get("activeMergeDraftId") if any(d.get("id") == client_doc.get("activeMergeDraftId") for d in merge_drafts) else None),
         "activeReleaseId": server_doc.get("activeReleaseId")
             or (client_doc.get("activeReleaseId") if any(r.get("id") == client_doc.get("activeReleaseId") for r in releases) else None),
         "activeReviewId": server_doc.get("activeReviewId")
