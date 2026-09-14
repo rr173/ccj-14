@@ -22,7 +22,7 @@
  *     detected: format|null,
  *     confidence,
  *     preview: ConversionResult|null,  // 导入时的 dry-run 转换（预览），与正式迁移同管线、确定
- *     error: {code,message,line,column,suggestion}|null,
+ *     error: {code,message,line,column,offset,suggestion}|null,
  *     result: null | { model, report, hash, mapping, quarantined, warnings, name }, // done 冻结
  *     imported: null | { at, branchId, branchName, eventId, diff, by },
  *     attempts, startedAt, finishedAt,
@@ -97,7 +97,19 @@ export function detectFormat(rawText) {
   try {
     data = JSON.parse(trimmed);
   } catch (e) {
-    const pos = jsonErrorPosition(text, e);
+    // V8 解析的是 trimmed 文本；扫描器同样定位 trimmed，再映射回原始文本
+    // （保证行列号对应用户看到的源文件，含前导空行）。
+    const pos = jsonErrorPosition(trimmed, e);
+    if (pos.offset !== null && trimmed) {
+      const lead = text.indexOf(trimmed);
+      if (lead >= 0 && pos.offset + lead <= text.length) {
+        const off = pos.offset + lead;
+        const before = text.slice(0, off);
+        pos.offset = off;
+        pos.line = before.split('\n').length;
+        pos.column = before.slice(before.lastIndexOf('\n') + 1).length + 1;
+      }
+    }
     return {
       format: 'unknown', confidence: 0, parsed: null,
       reason: '不是合法 JSON（历史格式均为 JSON）',
@@ -181,26 +193,183 @@ function matchTables(d) {
   return null;
 }
 
-/** 定位 JSON 解析错误的行列（用于失败文件的“错误位置”）。 */
+/**
+ * 定位 JSON 解析错误的行列与偏移（用于失败文件的“错误位置”）。
+ *
+ * 现代 V8（Chrome/Node 18+）的 SyntaxError 文案已不再包含旧版的
+ * "position N"（新版为 "Unexpected token ..."），无法可靠从报错文本反推位置；
+ * 这里用一个与 JSON 语法严格对齐的扫描器自行定位——不依赖运行时错误文案，
+ * 因此各引擎/各版本行为一致。位置约定与 V8 相同：UTF-16 码元偏移（0 基）、
+ * 行列均从 1 起算，列按“行首到出错字符”的码元数 +1。
+ * 返回 { offset, line, column }；无法定位（理论上不应发生）时各字段为 null。
+ */
 function jsonErrorPosition(text, e) {
-  const m = /position (\d+)/i.exec(e.message || '');
-  let line = 0, column = 0, offset = null;
-  if (m) {
-    offset = Number(m[1]);
-    const before = text.slice(0, offset);
-    const parts = before.split('\n');
-    line = parts.length;
-    column = parts[parts.length - 1].length + 1;
+  let offset = locateJsonErrorOffset(String(text ?? ''));
+  // 扫描器兜底：若未定位到（与运行时解析器判定不一致），再尝试从报错文本解析
+  // （兼容旧 V8 "… at position N" 文案）。
+  if (offset === null) {
+    const m = /position (\d+)/i.exec(e?.message || '');
+    if (m) offset = Number(m[1]);
   }
-  return { line: line || null, column: column || null, offset };
+  if (offset === null || !Number.isInteger(offset) || offset < 0 || offset > text.length) {
+    return { line: null, column: null, offset: null };
+  }
+  const before = text.slice(0, offset);
+  const line = before.split('\n').length;
+  const column = before.slice(before.lastIndexOf('\n') + 1).length + 1;
+  return { line, column, offset };
+}
+
+const JSON_WS = new Set([' ', '\t', '\n', '\r']); // JSON 语法仅接受这四种空白
+
+/**
+ * 严格 JSON 扫描器：返回首个语法错误的偏移（0 基 UTF-16 码元下标）。
+ * 输入合法（等价于 JSON.parse 成功）时返回 null。只做语法判定、不构造值，
+ * 以便对大文件也保持线性开销。
+ */
+function locateJsonErrorOffset(text) {
+  const n = text.length;
+  let i = 0;
+  const skipWs = () => { while (i < n && JSON_WS.has(text[i])) i++; };
+
+  const fail = (pos) => { throw { __jsonOffset: pos }; };
+  const here = () => (i < n ? i : n); // 期望 token 却到结尾：指向末尾之后
+
+  function scanValue() {
+    skipWs();
+    if (i >= n) fail(n);
+    const c = text[i];
+    if (c === '{') scanObject();
+    else if (c === '[') scanArray();
+    else if (c === '"') scanString();
+    else if (c === '-' || (c >= '0' && c <= '9')) scanNumber();
+    else if (c === 't' || c === 'f' || c === 'n') scanKeyword();
+    else fail(i);
+  }
+  function scanObject() {
+    i++; // {
+    skipWs();
+    if (i < n && text[i] === '}') { i++; return; }
+    for (;;) {
+      skipWs();
+      if (i >= n) fail(n);
+      if (text[i] !== '"') fail(i);
+      scanString();
+      skipWs();
+      if (i >= n || text[i] !== ':') fail(here());
+      i++;
+      scanValue();
+      skipWs();
+      if (i >= n) fail(n);
+      if (text[i] === ',') { i++; continue; }
+      if (text[i] === '}') { i++; return; }
+      fail(i);
+    }
+  }
+  function scanArray() {
+    i++; // [
+    skipWs();
+    if (i < n && text[i] === ']') { i++; return; }
+    for (;;) {
+      scanValue();
+      skipWs();
+      if (i >= n) fail(n);
+      if (text[i] === ',') { i++; continue; }
+      if (text[i] === ']') { i++; return; }
+      fail(i);
+    }
+  }
+  function scanString() {
+    i++; // 开引号
+    while (i < n) {
+      const c = text[i];
+      const code = text.charCodeAt(i);
+      if (c === '"') { i++; return; }
+      if (code === 0x5c) { // 反斜杠转义
+        i++;
+        if (i >= n) fail(n);
+        const e = text[i];
+        if ('"\\/bfnrt'.includes(e)) i++;
+        else if (e === 'u') {
+          i++;
+          for (let k = 0; k < 4; k++) {
+            if (i >= n) fail(n);
+            const h = text[i];
+            if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) fail(i);
+            i++;
+          }
+        } else fail(i);
+      } else if (code < 0x20) {
+        fail(i); // 未转义控制字符
+      } else {
+        i++;
+      }
+    }
+    fail(n); // 未闭合
+  }
+  // 关键字逐字符对齐 V8：首个不同字符即报错位置；完整匹配后紧跟
+  // 标识符起始字符（字母/$/_）时，错误指向该后续字符；途中到结尾报 n。
+  function scanKeyword() {
+    const word = text[i] === 't' ? 'true' : text[i] === 'f' ? 'false' : 'null';
+    for (let k = 0; k < word.length; k++) {
+      if (i >= n) fail(n);
+      if (text[i] !== word[k]) fail(i);
+      i++;
+    }
+    if (i < n && /[A-Za-z_$]/.test(text[i])) fail(i);
+  }
+  function scanNumber() {
+    if (text[i] === '-') i++;
+    if (i >= n) fail(n);
+    if (text[i] === '0') {
+      i++; // 整数零
+      // V8: 前导 0 后紧跟数字 -> 错误指向后一个数字
+      if (i < n && text[i] >= '0' && text[i] <= '9') fail(i);
+    } else if (text[i] >= '1' && text[i] <= '9') {
+      while (i < n && text[i] >= '0' && text[i] <= '9') i++;
+    } else {
+      fail(i);
+    }
+    if (i < n && text[i] === '.') {
+      i++;
+      if (i >= n) fail(n);
+      if (!(text[i] >= '0' && text[i] <= '9')) fail(i);
+      while (i < n && text[i] >= '0' && text[i] <= '9') i++;
+    }
+    if (i < n && (text[i] === 'e' || text[i] === 'E')) {
+      const ePos = i;
+      i++;
+      if (i < n && (text[i] === '+' || text[i] === '-')) i++;
+      if (i >= n) fail(n);
+      if (!(text[i] >= '0' && text[i] <= '9')) fail(i);
+      while (i < n && text[i] >= '0' && text[i] <= '9') i++;
+      // 如 12ex：V8 在 e 处报“指数缺数字”（而非后续字符）
+      if (i < n && /[A-Za-z_$]/.test(text[i])) fail(ePos);
+    }
+    // 完整数字后紧跟标识符起始字符（123abc / 0x1 / nullx 式粘连）：
+    // 错误指向该后续字符（V8: 顶层报 non-whitespace；容器内报分隔符缺失，位置相同）。
+    if (i < n && /[A-Za-z_$]/.test(text[i])) fail(i);
+  }
+
+  try {
+    skipWs();
+    if (i >= n) return n; // 空输入（detectFormat 已先挡空串，双保险）
+    scanValue();
+    skipWs();
+    if (i < n) return i;  // 顶层值之后有杂散字符
+    return null;          // 合法 JSON
+  } catch (t) {
+    if (t && typeof t === 'object' && Number.isInteger(t.__jsonOffset)) return t.__jsonOffset;
+    throw t;
+  }
 }
 
 /* =====================================================================
  * 转换结果类型
  * ===================================================================== */
 
-function conversionError(code, message, { line = null, column = null, suggestion = '' } = {}) {
-  return { code, message, line, column, suggestion };
+function conversionError(code, message, { line = null, column = null, offset = null, suggestion = '' } = {}) {
+  return { code, message, line, column, offset, suggestion };
 }
 
 /**
@@ -219,7 +388,8 @@ export function convertSource(rawText, { sourceName = '' } = {}) {
       ok: false, format: null, confidence: 0, name: sourceName,
       model: null, report: null, hash: null, mapping: emptyMapping(), quarantined: [], warnings: [],
       error: conversionError('unrecognized-format', det.reason, {
-        line: det.parseError?.line, column: det.parseError?.column, suggestion: sug,
+        line: det.parseError?.line, column: det.parseError?.column,
+        offset: det.parseError?.offset, suggestion: sug,
       }),
     };
   }
@@ -938,6 +1108,7 @@ export function buildMigrationReport(batch, { generatedAt = Date.now(), branches
       error: f.error ? {
         code: f.error.code, message: f.error.message,
         line: f.error.line ?? null, column: f.error.column ?? null,
+        offset: f.error.offset ?? null,
         suggestion: f.error.suggestion || '',
       } : null,
       result: r ? {
@@ -1087,7 +1258,7 @@ export function sanitizeMigrations(raw, warnings = []) {
         const checked = checkMigrationResult(f0.result, f, tag, warnings);
         if (checked.corrupt) {
           f.status = 'failed';
-          f.error = { code: 'result-corrupt', message: checked.reason, line: null, column: null, suggestion: '持久化结果校验失败；原始输入保留，可重新提交迁移。' };
+          f.error = { code: 'result-corrupt', message: checked.reason, line: null, column: null, offset: null, suggestion: '持久化结果校验失败；原始输入保留，可重新提交迁移。' };
           f.result = null;
         } else {
           f.result = checked.result;

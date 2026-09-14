@@ -139,7 +139,7 @@ export class MigrationPanel {
       return `<div class="mp-file bad">
         <span class="mf-badge bad">无法识别</span>
         <span class="mf-name">${escapeHtml(d.name)}</span>
-        <span class="mf-note">✗ ${escapeHtml(p.error?.message || '无法识别格式')}${p.error?.line ? `（第 ${p.error.line} 行第 ${p.error.column} 列）` : ''}</span>
+        <span class="mf-note">✗ ${escapeHtml(p.error?.message || '无法识别格式')}${fmtPos(p.error)}</span>
         <div class="mf-suggest">💡 ${escapeHtml(p.error?.suggestion || '')}</div>
       </div>`;
     }
@@ -300,7 +300,7 @@ export class MigrationPanel {
       ${f.status === 'failed' && f.error ? `
         <div class="mcf-err">
           ✗ ${escapeHtml(f.error.message || '迁移失败')}
-          ${f.error.line ? `（第 ${f.error.line} 行第 ${f.error.column} 列）` : ''}
+          ${fmtPos(f.error)}
           <div class="q-suggest">💡 ${escapeHtml(f.error.suggestion || '')}</div>
         </div>` : ''}
       <div class="mcf-actions">
@@ -378,6 +378,18 @@ export class MigrationPanel {
 }
 
 /* ---------------- 工具 ---------------- */
+
+/** 格式化解析错误位置：第 L 行第 C 列（偏移 O）；三者皆缺时返回空串。 */
+function fmtPos(err) {
+  if (!err) return '';
+  const hasLC = Number.isFinite(err.line) && Number.isFinite(err.column);
+  const hasOff = Number.isFinite(err.offset);
+  if (!hasLC && !hasOff) return '';
+  let s = '（';
+  if (hasLC) s += `第 ${err.line} 行第 ${err.column} 列`;
+  if (hasOff) s += `${hasLC ? '，' : ''}字符偏移 ${err.offset}`;
+  return s + '）';
+}
 
 function downloadJson(filename, obj) {
   const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });

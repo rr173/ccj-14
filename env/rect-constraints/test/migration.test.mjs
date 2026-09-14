@@ -102,6 +102,64 @@ test('非法 JSON 给出行列位置，无法识别', () => {
   assert.ok(d.parseError.line >= 1);
 });
 
+test('非法 JSON 给出准确的行号/列号/偏移（不依赖运行时报错文案）', () => {
+  // 现代 V8 的 SyntaxError 文案不再含 "position N"，位置由内置扫描器定位。
+  // 多行：出错逗号在第 3 行第 8 列，偏移 19
+  const multi = '{\n  "a": 1,\n  "b": ,\n}';
+  const d = detectFormat(multi);
+  assert.equal(d.format, 'unknown');
+  assert.deepEqual(
+    { line: d.parseError.line, column: d.parseError.column, offset: d.parseError.offset },
+    { line: 3, column: 8, offset: 19 },
+  );
+  // 指向具体出错字符（偏移处正是 V8 报错的那个 token）
+  assert.equal(multi[d.parseError.offset], ',');
+
+  // 顶层非法标识符：'not json' 的 'o'（偏移 1）
+  const top = detectFormat('not json');
+  assert.deepEqual(
+    { line: top.parseError.line, column: top.parseError.column, offset: top.parseError.offset },
+    { line: 1, column: 2, offset: 1 },
+  );
+
+  // 前导空行/空白：行列映射回原始文本（而非 trim 后的文本）
+  const lead = detectFormat('\n\n  { "a": 1, ');
+  assert.equal(lead.parseError.line, 3);
+  assert.ok(Number.isInteger(lead.parseError.offset) && lead.parseError.offset > 0);
+
+  // convertSource 把位置透传到文件级错误
+  const conv = convertSource(multi, { sourceName: 'bad.json' });
+  assert.equal(conv.ok, false);
+  assert.equal(conv.error.code, 'unrecognized-format');
+  assert.equal(conv.error.line, 3);
+  assert.equal(conv.error.column, 8);
+  assert.equal(conv.error.offset, 19);
+  assert.ok(conv.error.suggestion.length > 0, '仍保留修复建议');
+
+  // ingestFile 草稿同样携带位置（页面预览使用）
+  const f = ingestFile(multi, { name: 'bad.json' });
+  assert.equal(f.error.offset, 19);
+  assert.equal(f.error.line, 3);
+  assert.equal(f.error.column, 8);
+});
+
+test('非法 JSON 失败：迁移报告携带行列偏移，原始输入与建议保留', () => {
+  const raw = '{\n  "a": 1,\n  "b": ,\n}';
+  const f = ingestFile(raw, { name: 'bad.json' });
+  const batch = makeBatch({ name: '批次', files: [f] });
+  const ex = executeFile(batch, f.id, { now: 1000 });
+  assert.equal(ex.status, 'failed');
+  const ff = batch.files[0];
+  assert.equal(ff.raw, raw, '失败文件保留完整原始输入（不截断）');
+  const report = buildMigrationReport(batch, { generatedAt: 1000 });
+  const err = report.files[0].error;
+  assert.equal(err.line, 3);
+  assert.equal(err.column, 8);
+  assert.equal(err.offset, 19);
+  assert.ok(err.suggestion.includes('修正 JSON 语法'));
+  assert.equal(report.files[0].result, null);
+});
+
 test('合法但未知结构 -> unknown', () => {
   assert.equal(detectFormat(JSON.stringify({ hello: 'world' })).format, 'unknown');
 });

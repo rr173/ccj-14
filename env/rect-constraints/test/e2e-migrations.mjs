@@ -40,7 +40,7 @@ await store.load();
 const cr = store.createMigrationBatch([
   { name: 'a.json', text: legacy2017('布局A') },
   { name: 'b.json', text: legacy2015 },
-  { name: 'bad.json', text: '{ broken' },
+  { name: 'bad.json', text: '{\n  "ok": 1,\n  "bad": ,\n}' },
 ], { name: 'HTTP 迁移批次' });
 ok(cr.ok, '建立迁移批次');
 const bid = cr.batch.id;
@@ -50,7 +50,9 @@ const batch = store.migrationById(bid);
 ok(batch.files.filter((f) => f.status === 'done').length === 2, '两份文件成功');
 ok(batch.files.find((f) => f.name === 'bad.json').status === 'failed', '非法 JSON 文件独立失败');
 const failed = batch.files.find((f) => f.status === 'failed');
-ok(!!failed.error.suggestion && failed.raw.includes('{ broken'), '失败文件保留原始输入与修复建议');
+ok(!!failed.error.suggestion && failed.raw.includes('"bad": ,'), '失败文件保留原始输入与修复建议');
+ok(failed.error.line === 3 && failed.error.column === 10 && failed.error.offset === 22,
+  `失败错误带准确行列偏移（line=${failed.error.line},col=${failed.error.column},off=${failed.error.offset}）`);
 
 // 2) 成功结果干净：无悬空 / 无环 / 约束引用正确
 const aFile = batch.files.find((f) => f.name === 'a.json');
@@ -145,7 +147,10 @@ ok(!!report.checksum && /^[0-9a-f]{8}$/.test(report.checksum), '报告带 FNV �
 ok(report.summary.succeeded === 2 && report.summary.failed === 1, '报告汇总成功/失败计数');
 const rf = report.files.find((f) => f.name === 'a.json');
 ok(rf.imported && rf.imported.branchId === branchId && rf.result.mapping.rects.length, '报告含最终分支标识与映射表');
-ok(report.files.find((f) => f.name === 'bad.json').error, '报告含失败文件错误');
+const badReportErr = report.files.find((f) => f.name === 'bad.json').error;
+ok(badReportErr, '报告含失败文件错误');
+ok(badReportErr && badReportErr.line === 3 && badReportErr.column === 10 && badReportErr.offset === 22
+  && !!badReportErr.suggestion, '报告错误含准确行号/列号/偏移与修复建议');
 ok(rf.result.quarantined.length === 0 || Array.isArray(rf.result.quarantined), '报告含隔离项字段');
 
 // 10) 取消批次：用全新 store 先挂 gate 再建批，确定性地在文件之间取消
