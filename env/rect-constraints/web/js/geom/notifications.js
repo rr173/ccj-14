@@ -834,10 +834,14 @@ function itemRank(it) {
   return { scheduled: 0, cancelled: 1, pending: 2, snoozed: 2, failed: 2, sent: 3, delivered: 4, transferred: 5, acknowledged: 6 }[it.status] ?? 0;
 }
 
-export function mergeOutbox(serverList, clientList) {
+export function mergeOutbox(serverList, clientList, tombstones = null) {
+  // tombstones：客户端已终结（送达/确认/转交/陈旧清理）的 outbox 条目 id，
+  // 即使服务端旧副本仍持有也必须删除（与 server.py _merge_outbox 同构）。
+  const dead = new Set(Array.isArray(tombstones) ? tombstones : []);
   const byNotify = new Map();
   for (const o of [...(Array.isArray(serverList) ? serverList : []), ...(Array.isArray(clientList) ? clientList : [])]) {
     if (!o || typeof o.notifyId !== 'string') continue;
+    if (dead.has(o.id)) { byNotify.delete(o.notifyId); continue; }
     const ex = byNotify.get(o.notifyId);
     if (!ex) { byNotify.set(o.notifyId, o); continue; }
     byNotify.set(o.notifyId, {
@@ -871,13 +875,17 @@ export function assessServerNotifyConflict(serverDoc, clientDoc) {
   const baseItemRevs = clientDoc?.baseNotifyItemRevs;
   if (!baseRuleRevs && !baseItemRevs) return null;
   const serverSessions = new Set((serverDoc?.reviewSessions || []).map((s) => s.id));
+  // 有效会话 = 服务端已有会话 ∪ 本次提交自带的新会话（同一次保存里新建会话与其
+  // 通知事件 / 规则原子出现，不能误判为孤儿引用，与 server.py 同构）。
+  const effectiveSessions = new Set(serverSessions);
+  for (const s of clientDoc?.reviewSessions || []) if (s?.id) effectiveSessions.add(s.id);
   const serverRules = new Map((serverDoc?.notifyRules || []).map((r) => [r.id, r]));
   const serverItems = new Map((serverDoc?.notifications || []).map((n) => [n.id, n]));
 
   // 规则级冲突
   for (const r of clientDoc?.notifyRules || []) {
     if (!r?.id) continue;
-    if (!serverSessions.has(r.sessionId)) return { reason: 'notify-session-missing', ruleId: r.id, sessionId: r.sessionId };
+    if (!effectiveSessions.has(r.sessionId)) return { reason: 'notify-session-missing', ruleId: r.id, sessionId: r.sessionId };
     const base = (baseRuleRevs || {})[r.id];
     if (!Number.isInteger(base)) continue;
     const srv = serverRules.get(r.id);
@@ -905,11 +913,11 @@ export function assessServerNotifyConflict(serverDoc, clientDoc) {
     }
   }
 
-  // 追加事件的孤儿引用（事件 append-only，只校验会话存在）
+  // 追加事件的孤儿引用（事件 append-only，只校验会话存在，含本次提交自带的新会话）
   const serverEvents = new Set((serverDoc?.notifyEvents || []).map((e) => e.id));
   for (const e of clientDoc?.notifyEvents || []) {
     if (!e?.id || serverEvents.has(e.id)) continue;
-    if (!serverSessions.has(e.sessionId)) return { reason: 'notify-event-orphan', eventId: e.id, sessionId: e.sessionId };
+    if (!effectiveSessions.has(e.sessionId)) return { reason: 'notify-event-orphan', eventId: e.id, sessionId: e.sessionId };
   }
   return null;
 }

@@ -247,6 +247,11 @@ await store.flushed();
     wpPkg.restore();
     wp.setNotifyTransport({ isOnline: () => wpOnline, send: async () => ({ ok: false, error: '离线' }) });
     wp.setActor('E2E甲');
+    // 前面其他窗口可能在主分支追加了几何提交，使审阅筛选基线漂移：按 UI 流程先刷新基线
+    // （保留全部决定与历史，未漂移节点仍可决定），再选择待处理节点。
+    const view = wp.reviewView(sid);
+    if (view?.baselineChanged) wp.rebaseReview(sid);
+    await wp.flushed();
     pendingNode = nodes.find((n) => wp.reviewSessionById(sid).nodes.every((x) => x.key !== n.key || x.decision === 'pending'));
     if (!pendingNode) break;
     decision = wp.submitReviewDecision(sid, pendingNode.key, 'review', '待复核');
@@ -365,12 +370,14 @@ ok(t1 === stableStringify(JSON.parse(JSON.stringify(report))) && /^[0-9a-f]{8}$/
 /* ================= 服务端 409：孤儿事件 / 缺失会话 ================= */
 
 {
+  await sleep(500); // 等前面各窗口的后台重试保存全部落定，避免与本快照竞争同一文档 rev
   const fresh = await getDoc();
   const body = {
     ...fresh,
     baseRev: fresh.rev,
     baseHeads: Object.fromEntries(fresh.branches.map((b) => [b.id, b.headEventId])),
     baseNotifyRuleRevs: Object.fromEntries((fresh.notifyRules || []).map((r) => [r.id, Math.max(r.rev || 0, r.deleteRev || 0)])),
+    // 本用例只验证孤儿事件：通知项基线与服务端当前状态逐字节对齐，避免被 item 检查抢先
     baseNotifyItemRevs: Object.fromEntries((fresh.notifications || []).map((n) => [n.id, { status: n.status, ackedAt: n.ackedAt ?? null }])),
     baseReviewRevs: Object.fromEntries((fresh.reviewSessions || []).map((x) => [x.id, x.rev])),
     notifyEvents: [...(fresh.notifyEvents || []), { id: 'ne_orphan', sessionId: 'rv_none', type: 'decision', at: 1 }],

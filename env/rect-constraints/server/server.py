@@ -602,11 +602,27 @@ def _merge_notifications(server_list, client_list):
     return out
 
 
-def _merge_outbox(server_list, client_list):
-    """发送队列按 notifyId 并集：入队时间取早、attempts 取大、下次尝试取早，保持 FIFO。"""
+def _tombstone_set(doc):
+    """客户端已终结（送达/确认/转交/陈旧清理）的 outbox 条目 id。"""
+    t = doc.get("notifyOutboxTombstones")
+    if not isinstance(t, list):
+        return set()
+    return {x for x in t if isinstance(x, str)}
+
+
+def _merge_outbox(server_list, client_list, tombstones=None):
+    """
+    发送队列按 notifyId 并集：入队时间取早、attempts 取大、下次尝试取早，保持 FIFO。
+    tombstones 中是客户端已终结的 outbox 条目 id：即使服务端旧副本仍持有也必须删除，
+    否则跨 rev 合并会把已送达 / 已确认项的旧队列条目复活。
+    """
+    dead = set(tombstones or ())
     by_notify = {}
     for o in list(server_list or []) + list(client_list or []):
         if not isinstance(o, dict) or not isinstance(o.get("notifyId"), str):
+            continue
+        if isinstance(o.get("id"), str) and o["id"] in dead:
+            by_notify.pop(o["notifyId"], None)
             continue
         nid = o["notifyId"]
         ex = by_notify.get(nid)
@@ -643,7 +659,10 @@ def _assess_notify_conflict(cur, doc):
         return None
     if not isinstance(cur, dict):
         cur = {}
+    # 有效会话 = 服务端已有会话 ∪ 本次提交自带的新会话：同一次保存里新建的会话与其
+    # 通知事件 / 规则是原子出现的，不能误判为孤儿引用。
     sessions = {s.get("id") for s in cur.get("reviewSessions", []) if isinstance(s, dict)}
+    sessions |= {s.get("id") for s in doc.get("reviewSessions", []) or [] if isinstance(s, dict) and s.get("id")}
     server_rules = {r.get("id"): r for r in cur.get("notifyRules", []) if isinstance(r, dict)}
     server_items = {n.get("id"): n for n in cur.get("notifications", []) if isinstance(n, dict)}
 
@@ -695,7 +714,7 @@ def _assess_notify_conflict(cur, doc):
     return None
 
 
-def _merge_docs(server_doc, client_doc):
+def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
     """跨分支并发合流。与 web/js/geom/audit.js mergeDocs 同构。"""
     evs = {e["id"]: e for e in server_doc.get("events", []) if isinstance(e, dict)}
     for e in client_doc.get("events", []):
@@ -724,7 +743,8 @@ def _merge_docs(server_doc, client_doc):
     notify_events = _merge_notify_events(server_doc.get("notifyEvents", []), client_doc.get("notifyEvents", []))
     notify_rules = _merge_notify_rules(server_doc.get("notifyRules", []), client_doc.get("notifyRules", []))
     notifications = _merge_notifications(server_doc.get("notifications", []), client_doc.get("notifications", []))
-    notify_outbox = _merge_outbox(server_doc.get("notifyOutbox", []), client_doc.get("notifyOutbox", []))
+    notify_outbox = _merge_outbox(
+        server_doc.get("notifyOutbox", []), client_doc.get("notifyOutbox", []), outbox_tombstones)
 
     merged = dict(server_doc)
     merged.update({
@@ -817,6 +837,8 @@ class Handler(BaseHTTPRequestHandler):
             cur_rev = cur.get("rev", 0) if isinstance(cur, dict) else 0
             if not isinstance(cur_rev, int) or isinstance(cur_rev, bool):
                 cur_rev = 0
+            # 本页已终结（送达/确认/转交/陈旧清理）的 outbox 条目：直存 / 合并都不得保留
+            outbox_tombstones = _tombstone_set(doc)
             # 审阅会话乐观并发：会话 rev 前进 / 节点指纹变化 / 节点缺失 / 分支推进
             # → 409（即使文档 rev 相同、或该保存本来可以按分支合流，审阅冲突也优先拒绝）
             review_conflict = _assess_review_conflict(cur, doc)
@@ -839,12 +861,13 @@ class Handler(BaseHTTPRequestHandler):
                     })
                     return
                 if isinstance(cur, dict):
-                    merged = _merge_docs(cur, doc)
+                    merged = _merge_docs(cur, doc, outbox_tombstones)
                     merged.pop("baseRev", None)
                     merged.pop("baseHeads", None)
                     merged.pop("baseReviewRevs", None)
                     merged.pop("baseNotifyRuleRevs", None)
                     merged.pop("baseNotifyItemRevs", None)
+                    merged.pop("notifyOutboxTombstones", None)
                     merged["rev"] = cur_rev + 1
                     _save_doc(merged)
                     self._send_json(200, {"ok": True, "rev": merged["rev"], "merged": True, "doc": merged})
@@ -855,6 +878,7 @@ class Handler(BaseHTTPRequestHandler):
                 doc.pop("baseReviewRevs", None)
                 doc.pop("baseNotifyRuleRevs", None)
                 doc.pop("baseNotifyItemRevs", None)
+                doc.pop("notifyOutboxTombstones", None)
                 doc["rev"] = 1
                 _save_doc(doc)
                 self._send_json(200, {"ok": True, "rev": 1})
@@ -869,6 +893,13 @@ class Handler(BaseHTTPRequestHandler):
             doc.pop("baseReviewRevs", None)
             doc.pop("baseNotifyRuleRevs", None)
             doc.pop("baseNotifyItemRevs", None)
+            doc.pop("notifyOutboxTombstones", None)
+            # 直存：客户端文档即权威；仅按其墓碑兜底过滤可能残留的已终结队列条目
+            if outbox_tombstones and isinstance(doc.get("notifyOutbox"), list):
+                doc["notifyOutbox"] = [
+                    o for o in doc["notifyOutbox"]
+                    if not (isinstance(o, dict) and o.get("id") in outbox_tombstones)
+                ]
             doc["rev"] = cur_rev + 1
             _save_doc(doc)
             self._send_json(200, {"ok": True, "rev": doc["rev"], "entries": len(doc.get("events", [])), "events": len(doc.get("events", []))})

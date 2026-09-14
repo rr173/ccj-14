@@ -109,6 +109,7 @@ export class Store extends EventTarget {
     this.online = true;                 // 最近一次网络结果（断网时发送留在队列）
     this._transport = null;             // 可注入的发送通道（测试）；默认 in-app 持久化即送达
     this._flushing = false;             // outbox 单飞刷新
+    this._notifyOutboxTombstones = new Set(); // 本页已终结（送达/确认/转交/陈旧移除）的 outbox 条目 id：合流时防磁盘旧值复活
     this._notifyTimer = null;           // 心跳定时器（到期物化 / 升级 / 重试）
     this.notifyTickMs = 1000;
     this.notifyBackoffMs = 30_000;
@@ -340,6 +341,19 @@ export class Store extends EventTarget {
     const pumped = pumpNotifications(this.notifications, this.notifyOutbox, { now, backoffMs: this.notifyBackoffMs });
     this.notifications = pumped.items;
     this.notifyOutbox = pumped.outbox;
+    // 有未解决版本冲突的锁定项不参与发送：其本地动作保留为草稿（横幅里重试 / 放弃）。
+    // pump 可能把仍是 pending 的锁定项重新入队，这里移出（不立墓碑——解锁后重试 /
+    // 重新应用草稿时应能再次入队）；墓碑条目（本页已终结）则连旧副本一并挡住。
+    if (this._notifyLockedItems.size || this._notifyOutboxTombstones.size) {
+      const locked = [];
+      const dead = [];
+      for (const o of this.notifyOutbox) {
+        if (this._notifyLockedItems.has(o.notifyId)) locked.push(o.id);
+        else if (this._notifyOutboxTombstones.has(o.id)) dead.push(o.id);
+      }
+      if (locked.length) this.notifyOutbox = this.notifyOutbox.filter((o) => !locked.includes(o.id));
+      if (dead.length) this._removeOutboxEntries(dead);
+    }
     // pump 产生的状态推进（到期 pending / 稍后回 pending）标记为本页自写。
     // OCC 基线不在这里乐观前进，只在服务端确认保存后更新（避免超前基线对旧状态误判 409）。
     for (const n of this.notifications) this._markAuthoredItem(n.id, n.status);
@@ -383,6 +397,7 @@ export class Store extends EventTarget {
   _saveTimer = null;
   _saveChain = Promise.resolve();
   _saveVersion = 0;
+  _pendingSaves = new Map(); // 防抖保存版本号 -> 该次 PUT 的 promise（送达落定等待用）
   persist() {
     if (this._disposed) return; // dispose() 后一切迟到的防抖保存都是 no-op
     if (this.saveConflict) return; // 几何编辑冲突未解决：不再写任何存储
@@ -431,8 +446,11 @@ export class Store extends EventTarget {
         Array.isArray(prev?.notifyRules) ? prev.notifyRules : [], finalDoc.notifyRules || []);
       finalDoc.notifications = mergeNotifications(
         Array.isArray(prev?.notifications) ? prev.notifications : [], finalDoc.notifications || []);
-      finalDoc.notifyOutbox = mergeOutbox(
-        Array.isArray(prev?.notifyOutbox) ? prev.notifyOutbox : [], finalDoc.notifyOutbox || []);
+      // 队列 FIFO 并集，但先剔除本页已终结（送达/确认/转交/陈旧清理）的条目：
+      // 否则防抖窗口里磁盘仍是旧队列，并集会把刚发送出队的条目复活。
+      const prevOutbox = (Array.isArray(prev?.notifyOutbox) ? prev.notifyOutbox : [])
+        .filter((o) => !this._notifyOutboxTombstones.has(o.id));
+      finalDoc.notifyOutbox = mergeOutbox(prevOutbox, finalDoc.notifyOutbox || []);
       finalDoc.activeReviewId = finalDoc.reviewSessions.some((x) => x.id === finalDoc.activeReviewId)
         ? finalDoc.activeReviewId
         : (payload.activeReviewId && finalDoc.reviewSessions.some((x) => x.id === payload.activeReviewId) ? payload.activeReviewId : null);
@@ -450,7 +468,27 @@ export class Store extends EventTarget {
     this._emit('persist');
     ++this._saveVersion;
     clearTimeout(this._saveTimer);
-    this._saveTimer = setTimeout(() => this._sendLatest(), 120);
+    const version = this._saveVersion;
+    this._saveTimer = setTimeout(() => {
+      // 记录本次防抖保存对应的 promise：送达落定等待（_waitSaveSettled）等最新一次，
+      // 不能再调 _sendLatest()（会 bump 版本号，使外层 await 的链因版本守卫提前结束）。
+      const p = this._sendLatest();
+      this._pendingSaves.set(version, p);
+      p.finally(() => { if (this._pendingSaves.get(version) === p) this._pendingSaves.delete(version); }).catch(() => {});
+    }, 120);
+  }
+
+  /** 立即结算防抖保存并等待【最新一次】保存请求落定（不重新排队、不 bump 版本号）。 */
+  async _settlePendingSave() {
+    clearTimeout(this._saveTimer);
+    // 若防抖还没触发（_pendingSaves 尚无条目），立即发起一次并登记
+    const version = this._saveVersion;
+    if (!this._pendingSaves.has(version) && !this.saveConflict) {
+      const p = this._sendLatest();
+      this._pendingSaves.set(version, p);
+      p.finally(() => { if (this._pendingSaves.get(version) === p) this._pendingSaves.delete(version); }).catch(() => {});
+    }
+    await Promise.allSettled([...this._pendingSaves.values()]);
   }
 
   /**
@@ -611,43 +649,65 @@ export class Store extends EventTarget {
         baseReviewRevs: this._baseReviewRevs(),
         baseNotifyRuleRevs: this._baseNotifyRuleRevs(),
         baseNotifyItemRevs: this._baseNotifyItemRevs(),
+        // 已终结 outbox 条目的墓碑（瞬态字段，不持久化进文档）：服务端合并时删除其旧副本
+        notifyOutboxTombstones: [...this._notifyOutboxTombstones],
       };
+      // 本页已终结（送达 / 确认 / 转交 / 陈旧清理）的队列条目绝不出现在载荷里：
+      // 否则服务端跨 rev 合并（按 notifyId 并集）会把旧条目合回权威文档。
+      if (this._notifyOutboxTombstones.size) {
+        payload.notifyOutbox = (payload.notifyOutbox || [])
+          .filter((o) => !this._notifyOutboxTombstones.has(o.id));
+      }
       // 快照本次请求发出时的乐观动作：后续 409（可能在又一次保存清空 map 后才到达）
       // 用它恢复并保留本地未提交操作。
       const pendingSnapshot = new Map(this._notifyPendingItemActions);
       let body = JSON.stringify(payload);
-      // 审阅冲突未解决：该会话决定不再外发（本地决定已保留为提案，等逐项合并 / 放弃）。
-      // 几何保存（其他分支/文档字段）仍照常进行：载荷里剔除冲突会话，服务端按 id
-      // 并集时保留其权威副本，不会被本页过期内容覆盖。
+      // 审阅冲突未解决：该会话的【本地过期内容】不外发（本地决定已保留为提案，等逐项
+      // 合并 / 放弃）。但不能直接删除该会话——同 rev 直存时客户端文档即权威，删除会把
+      // 服务端权威会话一并清掉。改为携带服务端最新副本（拿不到时才剔除，交给合并并集）。
       if (this.reviewConflict) {
         const cid = this.reviewConflict.sessionId;
-        payload.reviewSessions = (payload.reviewSessions || []).filter((x) => x.id !== cid);
+        const serverDoc0 = await this._fetchDoc().catch(() => null);
+        const serverSession = (serverDoc0?.reviewSessions || []).find((x) => x.id === cid);
+        if (serverSession) {
+          payload.reviewSessions = (payload.reviewSessions || []).map((x) => (x.id === cid ? serverSession : x));
+        } else {
+          payload.reviewSessions = (payload.reviewSessions || []).filter((x) => x.id !== cid);
+        }
         delete payload.baseReviewRevs[cid];
         body = JSON.stringify(payload);
       }
-      // 通知中心冲突未解决：冲突规则 / 通知项不外发（本地未提交操作保留为 draft），
-      // 其余通知 / 几何保存照常。
+      // 通知中心冲突未解决：冲突规则 / 通知项的【本地过期内容】不外发（本地未提交操作
+      // 保留为 draft），其余通知 / 几何保存照常。携带服务端权威副本而非直接删除——
+      // 同 rev 直存时客户端文档即权威，删除会清掉服务端仍存在的规则 / 通知项。
       if (this._hasNotifyLocks()) {
+        const serverDoc0 = await this._fetchDoc().catch(() => null);
         if (this._notifyLockedRules.size) {
+          const serverRules = new Map((serverDoc0?.notifyRules || []).map((r) => [r.id, r]));
+          // 未锁定规则保留本地值；锁定规则替换为服务端权威副本（已在服务端删除则剔除）
           payload.notifyRules = (payload.notifyRules || []).filter((x) => !this._notifyLockedRules.has(x.id));
-          for (const rid of this._notifyLockedRules) delete payload.baseNotifyRuleRevs[rid];
+          for (const rid of this._notifyLockedRules) {
+            if (serverRules.has(rid)) payload.notifyRules.push(serverRules.get(rid));
+            delete payload.baseNotifyRuleRevs[rid];
+          }
         }
         if (this._notifyLockedItems.size) {
           const locked = this._notifyLockedItems;
-          const serverItems = await this._fetchDoc().catch(() => null);
-          const authoritative = new Map((serverItems?.notifications || []).map((n) => [n.id, n]));
-          // 剔除锁定项，以及其本地乐观转交产生的、服务端尚不存在的派生项
+          const authoritative = new Map((serverDoc0?.notifications || []).map((n) => [n.id, n]));
+          // 锁定项替换为服务端权威副本（拿不到 / 已删除则剔除）；其本地乐观转交派生项一并剔除
           const spawnedByLocked = new Set((payload.notifications || [])
             .filter((n) => n.transferOf && locked.has(n.transferOf)).map((n) => n.id));
-          payload.notifications = (payload.notifications || []).map((n) => authoritative.get(n.id) || n)
-            .filter((n) => (!locked.has(n.id) && !spawnedByLocked.has(n.id)) || authoritative.has(n.id));
+          payload.notifications = (payload.notifications || [])
+            .filter((n) => !locked.has(n.id) && !spawnedByLocked.has(n.id));
+          for (const nid of locked) {
+            if (authoritative.has(nid)) payload.notifications.push(authoritative.get(nid));
+            delete payload.baseNotifyItemRevs[nid];
+          }
           payload.notifyOutbox = (payload.notifyOutbox || []).filter((o) => {
-            const nid = o.notifyId;
-            if (locked.has(nid) || spawnedByLocked.has(nid)) return false;
-            const srv = authoritative.get(nid);
+            if (locked.has(o.notifyId) || spawnedByLocked.has(o.notifyId)) return false;
+            const srv = authoritative.get(o.notifyId);
             return !srv || (srv.status === 'pending' || srv.status === 'sent');
           });
-          for (const nid of locked) delete payload.baseNotifyItemRevs[nid];
         }
         body = JSON.stringify(payload);
       }
@@ -694,6 +754,12 @@ export class Store extends EventTarget {
           const myProposals = this._reviewProposals;
           const myNotifyLocks = { rules: new Set(this._notifyLockedRules), items: new Set(this._notifyLockedItems), conflict: this.notifyConflict };
           await this._adopt(data.doc, { seed: false, keepReviewConflict: true });
+          // 合流可能把本页已终结（送达/确认/转交）的旧队列条目从服务端并回：按墓碑剔除
+          if (this._notifyOutboxTombstones.size) {
+            this.notifyOutbox = this.notifyOutbox.filter((o) => !this._notifyOutboxTombstones.has(o.id));
+          }
+          // 权威队列已删除的墓碑收敛清除；仍残留的继续随后续 PUT 重发
+          this._reconcileOutboxTombstones(data.doc?.notifyOutbox || []);
           // 合流文档以服务端为准，但本页刚刚提交且未被服务端纳入的审阅决定要保留为待合并提案
           this._carryReviewProposals(myReview, myProposals, myActiveReview, data.doc);
           // 通知中心冲突锁在合流重载后继续保留（本地未提交操作不丢）
@@ -729,6 +795,8 @@ export class Store extends EventTarget {
           }
         }
         this._notifyBaseAppliedSeq = Math.max(this._notifyBaseAppliedSeq || 0, myNotifySeq);
+        // 直存即权威：载荷 outbox 已剔除墓碑条目，服务端接受后这些墓碑完成使命
+        this._notifyOutboxTombstones.clear();
         // 服务端确认后，载荷中的通知项都已成为已知项（下一次保存携带基线）
         for (const n of payload.notifications || []) this._notifyServerKnownItems.add(n.id);
         // 乐观日志保留到对应通知项被显式处理（确认/转交/放弃）或发生 409 后由 adopt 清理，
@@ -1606,6 +1674,41 @@ export class Store extends EventTarget {
     this._notifyAuthoredItemStates.set(id, set);
   }
 
+  /**
+   * 修剪队列：引用已不存在 / 已终态（送达·确认·转交·稍后·取消）通知项的条目移除并立墓碑。
+   * 确认 / 转交 / 心跳后调用，保证已处理项不再发送，且不会被本地合流的旧队列副本复活。
+   */
+  _pruneNotifyOutbox() {
+    const dead = [];
+    for (const o of this.notifyOutbox) {
+      const it = this.notifications.find((x) => x.id === o.notifyId);
+      if (!it || !['pending', 'sent'].includes(it.status)) dead.push(o.id);
+    }
+    if (dead.length) this._removeOutboxEntries(dead);
+  }
+
+  /**
+   * 从 FIFO 队列移除条目并记录墓碑：送达 / 确认 / 转交 / 陈旧清理都走这里。
+   * 墓碑保证随后 persist() 与 localStorage / 服务端旧值做并集合流时，
+   * 本页已终结的条目不会被磁盘上的旧副本「复活」（他页新增的新条目 id 不同，不受影响）。
+   */
+  _removeOutboxEntries(ids) {
+    const dead = new Set(Array.isArray(ids) ? ids : [ids]);
+    if (!dead.size) return;
+    for (const id of dead) this._notifyOutboxTombstones.add(id);
+    this.notifyOutbox = this.notifyOutbox.filter((o) => !dead.has(o.id));
+  }
+
+  /**
+   * 保存被服务端接受后收敛墓碑：只清除「权威文档确实不再持有」的条目墓碑；
+   * 仍残留在权威队列里的墓碑继续带给后续请求，直到服务端删除为止。
+   */
+  _reconcileOutboxTombstones(serverOutbox) {
+    if (!this._notifyOutboxTombstones.size) return;
+    const live = new Set((Array.isArray(serverOutbox) ? serverOutbox : []).map((o) => o.id));
+    for (const id of [...this._notifyOutboxTombstones]) if (!live.has(id)) this._notifyOutboxTombstones.delete(id);
+  }
+
   /** 当前操作者的待处理通知（页面内确认 / 稍后 / 转交）。 */
   notifyInbox(recipient = this.actor) {
     return pendingInbox(this.notifications, recipient, { now: Date.now() });
@@ -1716,11 +1819,8 @@ export class Store extends EventTarget {
     // 标记本页自写状态（用于本地多页签冲突检测）；OCC 基线【不】乐观前进，
     // 只在服务端确认保存后更新——否则确认/转交的首个 PUT 会用超前基线对旧服务端状态误判 409。
     for (const n of this.notifications) this._markAuthoredItem(n.id, n.status);
-    // 确认 / 转交后，已在队列中的旧通知项不再发送
-    this.notifyOutbox = this.notifyOutbox.filter((o) => {
-      const it = this.notifications.find((x) => x.id === o.notifyId);
-      return it && (it.status === 'pending' || it.status === 'sent');
-    });
+    // 确认 / 转交后，已在队列中的旧通知项不再发送（出队 + 墓碑）
+    this._pruneNotifyOutbox();
     this.pumpNotify({ now });
     // 若该通知项此前已收到过“服务端已被另一窗口处理”的 409（当时本地尚无动作而挂起），
     // 现在用刚记录的本地动作完成冲突处理：回滚权威状态并把本地动作保留为草稿。
@@ -1948,8 +2048,7 @@ export class Store extends EventTarget {
    * 供默认 in-app 发送通道确认“权威文档已保存”使用，避免 flushed() 的递归竞争。
    */
   async _waitSaveSettled() {
-    clearTimeout(this._saveTimer);
-    await this._sendLatest();
+    await this._settlePendingSave();
   }
 
   /**
@@ -1958,21 +2057,36 @@ export class Store extends EventTarget {
    * 可通过 setNotifyTransport 注入测试通道（可控在线 / 失败）。
    */
   async flushOutbox() {
-    if (this._flushing || this.saveConflict) return;
+    // 单飞：已有刷新在进行时复用其 promise（调用方 await 的是同一次完整 FIFO 刷新），
+    // 避免网络恢复时 notifyOnline 与显式调用竞争导致第二个调用立即空返回。
+    if (this._flushInFlight) return this._flushInFlight;
+    if (this.saveConflict) return;
     this._flushing = true;
+    this._flushInFlight = (async () => {
     try {
       let guard = 0;
       while (guard++ < 10000) {
-        if (this._hasNotifyLocks()) break;
-        // 队头：按 enqueuedAt 顺序；未到退避时刻的项阻塞其后续（严格顺序）
+        // 严格 FIFO：按 enqueuedAt 排序，队头决定阻塞。
         const ordered = [...this.notifyOutbox].sort((a, b) => (a.enqueuedAt - b.enqueuedAt) || (a.id < b.id ? -1 : 1));
-        const head = ordered[0];
+        // 丢弃引用已终态 / 已不存在通知项的陈旧条目（确认 / 转交 / 取消后不再发送）
+        const stale = new Set();
+        for (const o of ordered) {
+          const it = this.notifications.find((n) => n.id === o.notifyId);
+          if (!it || !['pending', 'sent'].includes(it.status)) stale.add(o.id);
+        }
+        if (stale.size) this._removeOutboxEntries([...stale]);
+        // 找到第一个【未锁定】项：它前面的锁定项（版本冲突未解决、本地动作保留为草稿）
+        // 保留在原位并跳过，且不阻塞后续无关待处理决定；未锁定队头若仍在退避 / 断网，
+        // 则严格顺序阻塞其后续项。
+        let head = null;
+        for (const o of ordered) {
+          if (stale.has(o.id)) continue;
+          if (this._notifyLockedItems.has(o.notifyId)) continue;
+          head = o;
+          break;
+        }
         if (!head) break;
         const item = this.notifications.find((n) => n.id === head.notifyId);
-        if (!item || !['pending', 'sent'].includes(item.status)) {
-          this.notifyOutbox = this.notifyOutbox.filter((o) => o.id !== head.id);
-          continue;
-        }
         if (head.nextAttemptAt != null && Date.now() < head.nextAttemptAt) break; // 严格顺序：等队头退避
         if (!this._isOnline()) break; // 断网：留在队列，恢复后重试
 
@@ -1989,23 +2103,51 @@ export class Store extends EventTarget {
           } catch (e) { result = { ok: false, error: e?.message || 'persist-failed' }; }
         }
 
+        // await 期间该项可能已被 409 流程锁定 / 回滚 / 转交：丢弃这次迟到的送达结果，
+        // 队列条目保持现状（锁定跳过 / 已终态则移除并立墓碑），绝不覆盖权威状态。
+        const after = this.notifications.find((n) => n.id === item.id);
+        if (this._notifyLockedItems.has(item.id)) continue;
+        if (!after || !['pending', 'sent'].includes(after.status)) {
+          this._removeOutboxEntries([head.id]);
+          continue;
+        }
+
         const now = Date.now();
+        const beforeOutboxIds = new Set(this.notifyOutbox.map((o) => o.id));
         const merged = recordDeliveryAttempt(this.notifications, this.notifyOutbox, item.id, result,
           { now, backoffMs: this.notifyBackoffMs });
         this.notifications = merged.items;
         this.notifyOutbox = merged.outbox;
+        // 送达成功 / 达到失败上限而出队的条目立墓碑，防止 persist 合流时被磁盘旧值复活
+        for (const oid of beforeOutboxIds) if (!merged.outbox.some((o) => o.id === oid)) this._notifyOutboxTombstones.add(oid);
         // 注意：这里【不】乐观推进 OCC 基线（_notifyItemBase）。基线只能在服务端确认保存后
         // 前进，否则“刚送达、尚未保存”的下一次 PUT 会带新基线对旧服务端状态而误判为 409。
         for (const n of this.notifications) this._markAuthoredItem(n.id, n.status);
         this._dirty = true;
         this.persist();
-        // in-app 通道：送达已随上面 persist 的保存确认，持久化基线在保存成功回调里前进
+        // 注入通道（真实邮件 / IM 发送器）与默认 in-app 通道一致：送达 / 失败结果必须
+        // 随权威保存一起落定，否则紧接着刷新 / 重启会把已发送项按旧状态重新物化、再次发送。
+        // flush 自身持有 _flushing 单飞锁，保存成功回调里嵌套的 flushOutbox 会立即返回，
+        // 由本循环回到顶部基于最新队列继续，保证严格 FIFO 连续发送。
+        if (result.ok) {
+          try { await this._waitSaveSettled(); } catch {}
+        }
         this._emit('notify', { type: result.ok ? 'delivered' : 'send-error', id: item.id });
         if (!result.ok) { this.online = false; break; } // 断网：停止，保留队列与顺序
         this.online = true;
+        // 回到循环顶部基于【最新】队列重新扫描：等待保存期间 pump / 嵌套 flush
+        // 可能已推进队列，绝不能用 await 前的旧快照决定下一个队头。
+        continue;
       }
     } finally {
       this._flushing = false;
+    }
+    })();
+    const flight = this._flushInFlight;
+    try {
+      await flight;
+    } finally {
+      if (this._flushInFlight === flight) this._flushInFlight = null;
     }
   }
 

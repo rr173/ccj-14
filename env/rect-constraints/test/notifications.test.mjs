@@ -67,22 +67,26 @@ function makeServer() {
       if (body.baseRev !== curRev) {
         if (!serverDoc) {
           const doc = { ...body, rev: 1 };
-          for (const k of ['baseRev', 'baseHeads', 'baseReviewRevs', 'baseNotifyRuleRevs', 'baseNotifyItemRevs']) delete doc[k];
+          for (const k of ['baseRev', 'baseHeads', 'baseReviewRevs', 'baseNotifyRuleRevs', 'baseNotifyItemRevs', 'notifyOutboxTombstones']) delete doc[k];
           serverDoc = doc; return Promise.resolve(jsonOk({ ok: true, rev: 1 }));
         }
+        const tombs = Array.isArray(body.notifyOutboxTombstones) ? body.notifyOutboxTombstones : [];
         const merged = mergeDocs(serverDoc, body);
         merged.reviewSessions = reviewsMod.mergeReviewSessions(serverDoc.reviewSessions || [], body.reviewSessions || []);
         merged.notifyEvents = mergeNotifyEvents(serverDoc.notifyEvents || [], body.notifyEvents || []);
         merged.notifyRules = mergeRules(serverDoc.notifyRules || [], body.notifyRules || []);
         merged.notifications = mergeNotifications(serverDoc.notifications || [], body.notifications || []);
-        merged.notifyOutbox = mergeOutbox(serverDoc.notifyOutbox || [], body.notifyOutbox || []);
+        merged.notifyOutbox = mergeOutbox(serverDoc.notifyOutbox || [], body.notifyOutbox || [], tombs);
         merged.rev = curRev + 1;
-        for (const k of ['baseRev', 'baseHeads', 'baseReviewRevs', 'baseNotifyRuleRevs', 'baseNotifyItemRevs']) delete merged[k];
+        for (const k of ['baseRev', 'baseHeads', 'baseReviewRevs', 'baseNotifyRuleRevs', 'baseNotifyItemRevs', 'notifyOutboxTombstones']) delete merged[k];
         serverDoc = merged;
         return Promise.resolve(jsonOk({ ok: true, rev: merged.rev, merged: true, doc: merged }));
       }
       const doc = { ...body, rev: curRev + 1 };
-      for (const k of ['baseRev', 'baseHeads', 'baseReviewRevs', 'baseNotifyRuleRevs', 'baseNotifyItemRevs']) delete doc[k];
+      for (const k of ['baseRev', 'baseHeads', 'baseReviewRevs', 'baseNotifyRuleRevs', 'baseNotifyItemRevs', 'notifyOutboxTombstones']) delete doc[k];
+      // 直存：客户端即权威，仅按其墓碑兜底过滤
+      const tombs = new Set(Array.isArray(body.notifyOutboxTombstones) ? body.notifyOutboxTombstones : []);
+      if (tombs.size && Array.isArray(doc.notifyOutbox)) doc.notifyOutbox = doc.notifyOutbox.filter((o) => !tombs.has(o.id));
       serverDoc = doc;
       return Promise.resolve(jsonOk({ ok: true, rev: doc.rev }));
     }
@@ -434,6 +438,68 @@ test('Store：注入断网通道时通知留在队列；恢复后按原顺序发
   // 再 flush：已送达项不重复发送
   await s.flushOutbox();
   assert.equal(sent.length, 1);
+});
+
+test('Store：通知项版本冲突锁不阻塞无关队列项，恢复后按 FIFO 继续发送', async () => {
+  const { s, sid } = await fixture();
+  let online = false; // 装载 transport 即离线，避免规则保存时提前送达
+  const sent = [];
+  s.online = false;
+  s.setNotifyTransport({
+    isOnline: () => online,
+    send: async (item) => { sent.push(item.id); return { ok: true, detail: 'sent' }; },
+  });
+  s.saveNotifyRule(sid, { name: '规则', triggers: { decision: true }, levels: [{ delayMin: 0, recipients: ['甲'] }] });
+  // 断网状态下为多个节点产生待处理决定：全部留在队列、无一被提前送达
+  for (const n0 of s.activeReview.nodes) s.submitReviewDecision(sid, n0.key, 'pass', '');
+  await s.flushOutbox();
+  const queued = [...s.notifyOutbox].sort((a, b) => (a.enqueuedAt - b.enqueuedAt) || (a.id < b.id ? -1 : 1));
+  assert.ok(queued.length >= 2, `至少两项待发送（实际 ${queued.length}）`);
+  // 任意一个队中项在另一窗口被处理 → 本窗口 409 锁定该项（本地动作保留为草稿）。
+  // 选 FIFO 队头（enqueuedAt 相同按 outbox id 确定序），它被冻结不发送，其余项按序照常发送。
+  const lockedId = queued[0].notifyId;
+  const rest = queued.slice(1).map((o) => o.notifyId);
+  s._notifyLockedItems.add(lockedId);
+  s.pumpNotify({}); // 锁定项移出队列（保留 pending 状态，等冲突解决后重试）
+  assert.ok(!s.notifyOutbox.some((o) => o.notifyId === lockedId), '锁定项不在发送队列');
+  // 恢复网络：锁定项冻结在队头，后续无关待处理决定必须照常按序发出
+  online = true; s.notifyOnline();
+  await s.flushOutbox();
+  assert.deepEqual(sent, rest, '无关的待处理决定不被冲突锁阻塞，保持 FIFO 顺序');
+  assert.ok(sent.every((id) => id !== lockedId), '锁定项未发送');
+  assert.ok(!s.notifications.find((n) => n.id === lockedId && n.status === 'delivered'), '锁定项未被标记送达');
+  // 冲突解决（解锁）后重新 pump：锁定项重新入队并按 FIFO 补发；已送达项不重复
+  s._notifyLockedItems.delete(lockedId);
+  s.pumpNotify({});
+  await s.flushOutbox();
+  assert.deepEqual(sent, [...rest, lockedId], '解锁后重新入队并按原 FIFO 顺序补发');
+  assert.equal(s.notifyOutbox.length, 0);
+});
+
+test('Store：送达结果迟到时该项已被 409 锁定/终态 → 丢弃迟到结果，不覆盖权威状态', async () => {
+  const { s, sid } = await fixture();
+  let releaseSend;
+  const sent = [];
+  s.setNotifyTransport({
+    isOnline: () => true,
+    send: (item) => { sent.push(item.id); return new Promise((resolve) => { releaseSend = () => resolve({ ok: true }); }); },
+  });
+  s.saveNotifyRule(sid, { name: '规则', triggers: { decision: true }, levels: [{ delayMin: 0, recipients: ['甲'] }] });
+  const node = s.activeReview.nodes[0];
+  s.submitReviewDecision(sid, node.key, 'pass', '');
+  const flushP = s.flushOutbox();
+  await sleep(5);
+  const nid = s.notifications.find((n) => n.status === 'pending')?.id;
+  assert.ok(nid);
+  // 发送在飞期间，该项被 409 流程回滚为服务端权威 acknowledged 并锁定
+  s.notifications = s.notifications.map((n) => (n.id === nid
+    ? { ...n, status: 'acknowledged', ackedAt: Date.now(), ackedBy: '窗口2' } : n));
+  s._notifyLockedItems.add(nid);
+  releaseSend();
+  await flushP;
+  assert.equal(s.notificationById(nid).status, 'acknowledged', '迟到送达不覆盖权威状态');
+  assert.equal(s.notificationById(nid).ackedBy, '窗口2');
+  assert.equal(s.notifyOutbox.filter((o) => o.notifyId === nid).length, 0, '终态项队列条目被清理');
 });
 
 /* ---------- 刷新 / 重启一致性 ---------- */
