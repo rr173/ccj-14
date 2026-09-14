@@ -92,7 +92,18 @@ function replacer(_k, v) {
 export function detectFormat(rawText) {
   const text = String(rawText ?? '');
   const trimmed = text.trim();
-  if (!trimmed) return { format: 'unknown', confidence: 0, parsed: null, reason: '内容为空' };
+  if (!trimmed) {
+    // 空文件 / 纯空白：JSON 在“期望一个值”处即失败（跳过空白后到达末尾）。
+    // 位置指向原始文本末尾（空文件为第 1 行第 1 列、偏移 0），
+    // 保证失败卡片与迁移报告同样携带可定位的行号/列号/偏移。
+    const pos = jsonErrorPosition(text, null);
+    return {
+      format: 'unknown', confidence: 0, parsed: null,
+      reason: '内容为空或只含空白（历史格式均为 JSON）',
+      parseError: { message: '内容为空：期望一个 JSON 值', ...pos },
+      empty: true,
+    };
+  }
   let data;
   try {
     data = JSON.parse(trimmed);
@@ -110,10 +121,16 @@ export function detectFormat(rawText) {
         pos.column = before.slice(before.lastIndexOf('\n') + 1).length + 1;
       }
     }
+    // 扫描器判定语法合法、但运行时解析仍失败（如引擎递归解析器的嵌套深度限制）：
+    // 不是语法错误，按“嵌套过深”给出可解释原因（无单一出错位置，保持 null）。
+    const depthLimited = pos.offset === null;
     return {
       format: 'unknown', confidence: 0, parsed: null,
-      reason: '不是合法 JSON（历史格式均为 JSON）',
+      reason: depthLimited
+        ? 'JSON 语法合法，但嵌套层级超出解析限制（受支持的历史格式均为浅层结构）'
+        : '不是合法 JSON（历史格式均为 JSON）',
       parseError: { message: e.message, ...pos },
+      depthLimited,
     };
   }
   if (typeof data !== 'object' || data === null) {
@@ -226,6 +243,9 @@ const JSON_WS = new Set([' ', '\t', '\n', '\r']); // JSON 语法仅接受这四�
  * 严格 JSON 扫描器：返回首个语法错误的偏移（0 基 UTF-16 码元下标）。
  * 输入合法（等价于 JSON.parse 成功）时返回 null。只做语法判定、不构造值，
  * 以便对大文件也保持线性开销。
+ *
+ * 容器嵌套用显式栈推进（而非递归）：任意嵌套深度（如数千层嵌套的历史导出
+ * 在末尾损坏）都不会触发调用栈溢出，错误位置与递归定义完全一致。
  */
 function locateJsonErrorOffset(text) {
   const n = text.length;
@@ -235,50 +255,6 @@ function locateJsonErrorOffset(text) {
   const fail = (pos) => { throw { __jsonOffset: pos }; };
   const here = () => (i < n ? i : n); // 期望 token 却到结尾：指向末尾之后
 
-  function scanValue() {
-    skipWs();
-    if (i >= n) fail(n);
-    const c = text[i];
-    if (c === '{') scanObject();
-    else if (c === '[') scanArray();
-    else if (c === '"') scanString();
-    else if (c === '-' || (c >= '0' && c <= '9')) scanNumber();
-    else if (c === 't' || c === 'f' || c === 'n') scanKeyword();
-    else fail(i);
-  }
-  function scanObject() {
-    i++; // {
-    skipWs();
-    if (i < n && text[i] === '}') { i++; return; }
-    for (;;) {
-      skipWs();
-      if (i >= n) fail(n);
-      if (text[i] !== '"') fail(i);
-      scanString();
-      skipWs();
-      if (i >= n || text[i] !== ':') fail(here());
-      i++;
-      scanValue();
-      skipWs();
-      if (i >= n) fail(n);
-      if (text[i] === ',') { i++; continue; }
-      if (text[i] === '}') { i++; return; }
-      fail(i);
-    }
-  }
-  function scanArray() {
-    i++; // [
-    skipWs();
-    if (i < n && text[i] === ']') { i++; return; }
-    for (;;) {
-      scanValue();
-      skipWs();
-      if (i >= n) fail(n);
-      if (text[i] === ',') { i++; continue; }
-      if (text[i] === ']') { i++; return; }
-      fail(i);
-    }
-  }
   function scanString() {
     i++; // 开引号
     while (i < n) {
@@ -351,13 +327,63 @@ function locateJsonErrorOffset(text) {
     if (i < n && /[A-Za-z_$]/.test(text[i])) fail(i);
   }
 
+  // 状态机三态：VALUE 期望一个值（顶层 / 数组元素 / 对象键对应的值）；
+  // KEY 期望对象键；AFTER 一个值刚结束（期望 ','、容器闭合，或顶层收尾）。
+  // 显式栈记录未闭合容器期望的闭合符（'}' 或 ']'），替代递归调用帧。
+  const S_VALUE = 0, S_KEY = 1, S_AFTER = 2;
+  const stack = [];
+  let state = S_VALUE;
+
   try {
-    skipWs();
-    if (i >= n) return n; // 空输入（detectFormat 已先挡空串，双保险）
-    scanValue();
-    skipWs();
-    if (i < n) return i;  // 顶层值之后有杂散字符
-    return null;          // 合法 JSON
+    for (;;) {
+      if (state === S_VALUE) {
+        skipWs();
+        if (i >= n) fail(n); // 空输入 / 容器内缺值 / 顶层为空：指向末尾之后
+        const c = text[i];
+        if (c === '{') {
+          i++;
+          skipWs();
+          if (i < n && text[i] === '}') { i++; state = S_AFTER; }
+          else { stack.push('}'); state = S_KEY; }
+        } else if (c === '[') {
+          i++;
+          skipWs();
+          if (i < n && text[i] === ']') { i++; state = S_AFTER; }
+          else stack.push(']'); // 继续期望第一个元素（仍为 S_VALUE）
+        } else if (c === '"') { scanString(); state = S_AFTER; }
+        else if (c === '-' || (c >= '0' && c <= '9')) { scanNumber(); state = S_AFTER; }
+        else if (c === 't' || c === 'f' || c === 'n') { scanKeyword(); state = S_AFTER; }
+        else fail(i);
+      } else if (state === S_KEY) {
+        skipWs();
+        if (i >= n) fail(n);
+        if (text[i] !== '"') fail(i);
+        scanString();
+        skipWs();
+        if (i >= n || text[i] !== ':') fail(here());
+        i++;
+        state = S_VALUE;
+      } else { // S_AFTER
+        if (!stack.length) {
+          skipWs();
+          if (i < n) return i; // 顶层值之后有杂散字符
+          return null;         // 合法 JSON
+        }
+        skipWs();
+        if (i >= n) fail(n);
+        const close = stack[stack.length - 1];
+        if (text[i] === ',') {
+          i++;
+          state = close === '}' ? S_KEY : S_VALUE;
+        } else if (text[i] === close) {
+          i++;
+          stack.pop();
+          state = S_AFTER;
+        } else {
+          fail(i);
+        }
+      }
+    }
   } catch (t) {
     if (t && typeof t === 'object' && Number.isInteger(t.__jsonOffset)) return t.__jsonOffset;
     throw t;
@@ -381,9 +407,16 @@ function conversionError(code, message, { line = null, column = null, offset = n
 export function convertSource(rawText, { sourceName = '' } = {}) {
   const det = detectFormat(rawText);
   if (det.format === 'unknown') {
-    const sug = det.parseError
-      ? '修正 JSON 语法（报错位置已给出）后重新导入；或确认该文件确实来自受支持的历史版本。'
-      : '受支持的历史格式：当前规范模型、旧审计文档(entries/idx)、2017 boxes/links、2015 RC-TABLES。';
+    let sug;
+    if (det.empty) {
+      sug = '文件为空或只含空白：请确认选择了受支持的历史布局导出文件（当前规范模型 / 旧审计文档 entries/idx / 2017 boxes/links / 2015 RC-TABLES），或从源系统重新导出后再导入。';
+    } else if (det.depthLimited) {
+      sug = '受支持的历史格式均为浅层结构：请确认该文件确实来自受支持的历史版本，或拆分/扁平化后重新导入。';
+    } else if (det.parseError) {
+      sug = '修正 JSON 语法（报错位置已给出）后重新导入；或确认该文件确实来自受支持的历史版本。';
+    } else {
+      sug = '受支持的历史格式：当前规范模型、旧审计文档(entries/idx)、2017 boxes/links、2015 RC-TABLES。';
+    }
     return {
       ok: false, format: null, confidence: 0, name: sourceName,
       model: null, report: null, hash: null, mapping: emptyMapping(), quarantined: [], warnings: [],

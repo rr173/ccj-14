@@ -160,6 +160,91 @@ test('非法 JSON 失败：迁移报告携带行列偏移，原始输入与建�
   assert.equal(report.files[0].result, null);
 });
 
+test('空文件 / 纯空白文件：稳定失败并给出可定位的行列偏移，原始输入与建议保留', () => {
+  // 空文件：期望一个 JSON 值的位置即文件开头（第 1 行第 1 列、偏移 0）
+  const empty = ingestFile('', { name: 'empty.json' });
+  assert.equal(empty.preview.ok, false);
+  assert.deepEqual(
+    { line: empty.error.line, column: empty.error.column, offset: empty.error.offset },
+    { line: 1, column: 1, offset: 0 },
+  );
+  assert.ok(empty.error.suggestion.length > 0, '保留修复建议');
+
+  // 纯空白：位置指向原始文本末尾（跳过空白后“期望一个值”处）
+  const ws = '  \n\t  ';
+  const d = detectFormat(ws);
+  assert.equal(d.format, 'unknown');
+  assert.deepEqual(
+    { line: d.parseError.line, column: d.parseError.column, offset: d.parseError.offset },
+    { line: 2, column: 4, offset: 6 },
+  );
+
+  // 全链路：批次执行 -> 失败终态；迁移报告携带位置；原始输入完整保留
+  const f = ingestFile(ws, { name: 'blank.json' });
+  const batch = makeBatch({ name: '批次', files: [f] });
+  const ex = executeFile(batch, f.id, { now: 1000 });
+  assert.equal(ex.status, 'failed');
+  const ff = batch.files[0];
+  assert.equal(ff.raw, ws, '失败文件保留完整原始输入（不截断）');
+  assert.deepEqual(
+    { line: ff.error.line, column: ff.error.column, offset: ff.error.offset },
+    { line: 2, column: 4, offset: 6 },
+  );
+  const report = buildMigrationReport(batch, { generatedAt: 1000 });
+  const err = report.files[0].error;
+  assert.deepEqual(
+    { line: err.line, column: err.column, offset: err.offset },
+    { line: 2, column: 4, offset: 6 },
+  );
+  assert.ok(err.suggestion.length > 0, '迁移报告保留修复建议');
+  assert.equal(report.files[0].result, null);
+});
+
+test('几千层嵌套且末尾损坏：不抛调用栈溢出，稳定失败并给出可定位位置', () => {
+  const DEPTH = 5000;
+  const raw = '['.repeat(DEPTH) + '1,' + 'x'; // 末尾损坏：x 为非法 token
+  const badAt = raw.length - 1;
+
+  // 识别 / 转换 / 预览全链路不抛异常
+  const d = detectFormat(raw);
+  assert.equal(d.format, 'unknown');
+  assert.deepEqual(
+    { line: d.parseError.line, column: d.parseError.column, offset: d.parseError.offset },
+    { line: 1, column: badAt + 1, offset: badAt },
+  );
+  const conv = convertSource(raw, { sourceName: 'deep.json' });
+  assert.equal(conv.ok, false);
+  assert.equal(conv.error.offset, badAt);
+  assert.ok(conv.error.suggestion.length > 0, '保留修复建议');
+
+  // 批次执行：失败终态 + 原始输入完整保留 + 迁移报告携带位置
+  const f = ingestFile(raw, { name: 'deep.json' });
+  const batch = makeBatch({ name: '深嵌套', files: [f] });
+  const ex = executeFile(batch, f.id, { now: 1000 });
+  assert.equal(ex.status, 'failed');
+  assert.equal(batch.files[0].raw, raw, '失败文件保留完整原始输入（不截断）');
+  const report = buildMigrationReport(batch, { generatedAt: 1000 });
+  const err = report.files[0].error;
+  assert.deepEqual(
+    { line: err.line, column: err.column, offset: err.offset },
+    { line: 1, column: badAt + 1, offset: badAt },
+  );
+  assert.ok(err.suggestion.length > 0, '迁移报告保留修复建议');
+
+  // 更深的嵌套（20 万层）末尾损坏：同样稳定定位，不溢出
+  const huge = '['.repeat(200000) + 'x';
+  const dh = detectFormat(huge);
+  assert.equal(dh.parseError.offset, huge.length - 1);
+
+  // 深嵌套但语法合法：稳定 unknown（结构未知），全流程不崩溃
+  const valid = '['.repeat(DEPTH) + '1' + ']'.repeat(DEPTH);
+  assert.equal(detectFormat(valid).format, 'unknown');
+  const fv = ingestFile(valid, { name: 'deep-valid.json' });
+  assert.equal(fv.preview.ok, false);
+  const vb = makeBatch({ name: '深合法', files: [fv] });
+  assert.equal(executeFile(vb, fv.id, { now: 1000 }).status, 'failed');
+});
+
 test('合法但未知结构 -> unknown', () => {
   assert.equal(detectFormat(JSON.stringify({ hello: 'world' })).format, 'unknown');
 });
