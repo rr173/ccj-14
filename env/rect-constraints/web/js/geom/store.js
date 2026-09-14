@@ -41,6 +41,15 @@ import {
   mergeReviewSessions, assessServerReviewConflict, findReviewNodeDrift,
   buildReviewReport, sessionProgress, activeSignatures, isAllowedSigner,
 } from './reviews.js';
+import {
+  TRIGGER_TYPES, createRule, editRule, deleteRule,
+  syncNotifyEvents, materializeNotifications, pumpNotifications, recordDeliveryAttempt,
+  acknowledgeNotification, snoozeNotification, transferNotification, retryNotification,
+  sanitizeNotifyEvents, sanitizeRules, sanitizeNotifications, sanitizeOutbox,
+  mergeRules, mergeNotifyEvents, mergeNotifications, mergeOutbox,
+  assessServerNotifyConflict, buildNotifyReport, pendingInbox, notificationCounters,
+  notifyEventId, MAX_ATTEMPTS,
+} from './notifications.js';
 
 const LS_KEY = 'rect-constraints-doc-v2';
 const LS_KEY_LEGACY = 'rect-constraints-doc-v1';
@@ -79,6 +88,31 @@ export class Store extends EventTarget {
     this.experimentWarnings = [];
     this._runners = new Map();   // experimentId -> {token}（进行中的批量运行）
 
+    // 审阅通知与升级中心
+    this.notifyEvents = [];        // append-only 通知事件（决定/签署/冲突/完成），按 id 幂等并集
+    this.notifyRules = [];         // 每会话多级升级规则（rev 乐观并发）
+    this.notifications = [];       // 物化通知项（事件 × 级别 × 接收人，幂等 id）
+    this.notifyOutbox = [];        // FIFO 发送队列（稳定 id，断网保留、恢复后按序重试）
+    this._notifyRuleSyncedRevs = {};  // ruleId -> 已与服务端确认的规则 rev（规则乐观锁）
+    this._notifyItemBase = new Map();  // notifyId -> 上次同步时的 {status, ackedAt}（通知项乐观锁）
+    this._notifyRuleDrafts = new Map(); // ruleId -> 本地未提交规则编辑（规则冲突后保留）
+    this._notifyItemDrafts = new Map(); // notifyId -> [动作描述符]（同一通知被两窗口处理后保留）
+    this._notifyPendingItemActions = new Map(); // notifyId -> 最近一次乐观动作（待服务端确认；409 时转为 draft）
+    this._notifyOptimisticLog = new Map();     // notifyId -> 最近一次乐观动作（跨保存链保留到服务端确认 / 409）
+    this._notifyServerKnownItems = new Set();  // 已随某次保存被服务端确认的通知项 id
+    this._notifyDeferredItemConflicts = new Map(); // notifyId -> 到达时本地尚无乐观动作的 item 409（挂起）
+    this._notifyAuthoredItemStates = new Map(); // notifyId -> Set(status)：本页自己产生过的状态（防抖窗口内不把磁盘旧值误判为外来推进）
+    this.notifyConflict = null;        // null | { kind:'rule'|'item', id, reason, serverRev/serverStatus }
+    this._notifyLockedRules = new Set();
+    this._notifyLockedItems = new Set();
+    this._notifyAuthoredRuleRevs = new Map(); // ruleId -> Set(rev)：本页自写 rev（localStorage 自检不判冲突）
+    this.online = true;                 // 最近一次网络结果（断网时发送留在队列）
+    this._transport = null;             // 可注入的发送通道（测试）；默认 in-app 持久化即送达
+    this._flushing = false;             // outbox 单飞刷新
+    this._notifyTimer = null;           // 心跳定时器（到期物化 / 升级 / 重试）
+    this.notifyTickMs = 1000;
+    this.notifyBackoffMs = 30_000;
+
     this.dragPreview = null;
     this.saveConflict = null;   // null | { reason, branchName, headSeq }
     this._dirty = false;
@@ -100,12 +134,15 @@ export class Store extends EventTarget {
     await this._adopt(doc, { seed: true });
     this._dirty = false;
     // 首次播种 / 迁移后立即回写并等待确认；正常加载不产生版本号竞争
-    if (this._needsInitialPersist) {
+    if (this._needsInitialPersist || this._notifyNeedsPersist) {
       this._needsInitialPersist = false;
+      this._notifyNeedsPersist = false;
       this._dirty = true;
       this.persist();
       await this.flushed();
     }
+    // 重启后把可能已到期 / 待发送的通知队列按序发送一次
+    this.flushOutbox().catch(() => {});
     this._emit('load');
   }
 
@@ -217,6 +254,102 @@ export class Store extends EventTarget {
       this._reviewProposals = new Map([...savedProposals]);
       this._reviewSyncedRevs[savedReviewConflict.sessionId] = this.reviewSessionById(savedReviewConflict.sessionId)?.rev ?? this._reviewSyncedRevs[savedReviewConflict.sessionId];
     }
+
+    this._adoptNotify(doc, { seed });
+  }
+
+  /**
+   * 装载通知中心状态（确定性、幂等）：
+   *  1. 清洗事件 / 规则 / 通知项 / 队列；
+   *  2. 从审阅会话【派生】缺失的通知事件（append-only 并集，id 幂等）；
+   *  3. 按规则物化通知项（规则修改水位保证旧事件不补发）；
+   *  4. 心跳推进到期 / 稍后 / 退避并补入 FIFO 队列。
+   * 刷新、重启后规则、队列、重试次数、升级状态、确认记录与送达结果由此重建。
+   */
+  _adoptNotify(doc, { seed = false } = {}) {
+    const now = Date.now();
+    const prevEvents = sanitizeNotifyEvents(doc.notifyEvents);
+    const synced = syncNotifyEvents(prevEvents, this.reviewSessions, { now });
+    this.notifyEvents = synced.events;
+    this.notifyRules = sanitizeRules(doc.notifyRules, { now });
+    const cleanItems = sanitizeNotifications(doc.notifications, { now });
+    const mat = materializeNotifications(cleanItems, this.notifyRules, this.notifyEvents, { now });
+    const cleanOutbox = sanitizeOutbox(doc.notifyOutbox, { now });
+    const pumped = pumpNotifications(mat.items, cleanOutbox, { now, backoffMs: this.notifyBackoffMs });
+    this.notifications = pumped.items;
+    this.notifyOutbox = pumped.outbox;
+
+    // 队列中引用已不存在 / 已终态通知项的陈旧条目移除（幂等）
+    const liveIds = new Set(this.notifications.map((n) => n.id));
+    this.notifyOutbox = this.notifyOutbox.filter((o) => {
+      if (!liveIds.has(o.notifyId)) return false;
+      const it = this.notifications.find((x) => x.id === o.notifyId);
+      return it && (it.status === 'pending' || it.status === 'sent');
+    });
+
+    this._notifyRuleSyncedRevs = {};
+    for (const r of this.notifyRules) {
+      this._notifyRuleSyncedRevs[r.id] = Math.max(r.rev || 0, r.deleteRev || 0);
+    }
+    this._notifyItemBase = new Map(this.notifications.map((n) => [n.id, { status: n.status, ackedAt: n.ackedAt ?? null }]));
+    // 装载到的通知项都来自已持久化的权威文档：标记为服务端已知；本次装载新物化的项除外
+    this._notifyServerKnownItems = new Set((Array.isArray(doc.notifications) ? doc.notifications : []).map((n) => n.id));
+    this._notifyAuthoredRuleRevs = new Map();
+    if (!this._notifyRuleDrafts) this._notifyRuleDrafts = new Map();
+    if (!this._notifyItemDrafts) this._notifyItemDrafts = new Map();
+    // 冲突锁 / 本地未提交操作只由 409 流程显式清理；合流重载时保留（调用方负责传入）。
+    this._notifyLockedRules = this._notifyLockedRules || new Set();
+    this._notifyLockedItems = this._notifyLockedItems || new Set();
+    this.notifyConflict = this.notifyConflict || null;
+    // 被锁定的规则 / 项若在新文档里消失，清理其锁
+    const ruleIds = new Set(this.notifyRules.map((r) => r.id));
+    for (const rid of [...this._notifyLockedRules]) if (!ruleIds.has(rid)) this._notifyLockedRules.delete(rid);
+    const itemIds = new Set(this.notifications.map((n) => n.id));
+    for (const nid of [...this._notifyLockedItems]) if (!itemIds.has(nid)) this._notifyLockedItems.delete(nid);
+    if (!this._notifyLockedRules.size && !this._notifyLockedItems.size) this.notifyConflict = null;
+    if (seed) this._notifyNeedsPersist = synced.newEvents.length > 0 || mat.added.length > 0 || pumped.enqueued > 0 || pumped.changed;
+    this._startNotifyTicker();
+  }
+
+  /** 测试 / 装配时注入发送通道：{ async send(item) -> {ok, error?, detail?}, isOnline() }。 */
+  setNotifyTransport(transport) { this._transport = transport; }
+
+  _isOnline() {
+    if (this._transport?.isOnline) return !!this._transport.isOnline();
+    return this.online;
+  }
+
+  _startNotifyTicker() {
+    if (this._notifyTimer || typeof setInterval !== 'function') return;
+    this._notifyTimer = setInterval(() => {
+      try { this.pumpNotify({ persist: true }); this.flushOutbox().catch(() => {}); } catch {}
+    }, this.notifyTickMs);
+    // 不阻止 Node 测试进程退出
+    if (this._notifyTimer?.unref) this._notifyTimer.unref?.();
+  }
+
+  /**
+   * 通知心跳：先从当前审阅会话派生新事件，再物化 / 推进 / 入队。
+   * 由审阅动作、定时 ticker、页面操作调用；纯函数 + 原地替换，结果确定。
+   */
+  pumpNotify({ persist = false, now = Date.now() } = {}) {
+    const synced = syncNotifyEvents(this.notifyEvents, this.reviewSessions, { now });
+    this.notifyEvents = synced.events;
+    const mat = materializeNotifications(this.notifications, this.notifyRules, this.notifyEvents, { now });
+    this.notifications = mat.items;
+    const pumped = pumpNotifications(this.notifications, this.notifyOutbox, { now, backoffMs: this.notifyBackoffMs });
+    this.notifications = pumped.items;
+    this.notifyOutbox = pumped.outbox;
+    // pump 产生的状态推进（到期 pending / 稍后回 pending）标记为本页自写。
+    // OCC 基线不在这里乐观前进，只在服务端确认保存后更新（避免超前基线对旧状态误判 409）。
+    for (const n of this.notifications) this._markAuthoredItem(n.id, n.status);
+    if (persist && (synced.newEvents.length || mat.added.length || pumped.changed)) {
+      this._dirty = true;
+      this.persist();
+    }
+    if (pumped.enqueued > 0) this.flushOutbox().catch(() => {});
+    this._emit('notify', { type: 'pump', newEvents: synced.newEvents.length, added: mat.added.length, enqueued: pumped.enqueued });
+    return { newEvents: synced.newEvents, added: mat.added, enqueued: pumped.enqueued };
   }
 
   async _fetchDoc() {
@@ -239,6 +372,10 @@ export class Store extends EventTarget {
       auditWorkbench: this.auditWorkbench,
       reviewSessions: this.reviewSessions,
       activeReviewId: this.activeReviewId,
+      notifyEvents: this.notifyEvents,
+      notifyRules: this.notifyRules,
+      notifications: this.notifications,
+      notifyOutbox: this.notifyOutbox,
       actor: this.actor,
     };
   }
@@ -272,6 +409,12 @@ export class Store extends EventTarget {
           this._onReviewConflict(reviewConflict);
           return;
         }
+        // 通知中心多页签乐观锁：规则被另一页签前进 / 删除、通知项被另一窗口处理
+        const notifyConflict = this._checkLocalNotifyConflict(prev, payload);
+        if (notifyConflict) {
+          this._onNotifyConflict(notifyConflict);
+          return;
+        }
       }
       // 本地多页签合流：merged 已含本页当前分支最新提交，直接落合并结果
       const finalDoc = merged || { ...payload, rev: this.rev };
@@ -281,6 +424,15 @@ export class Store extends EventTarget {
       finalDoc.reviewSessions = mergeReviewSessions(
         Array.isArray(prev?.reviewSessions) ? prev.reviewSessions : (finalDoc.reviewSessions || []),
         payload.reviewSessions || []);
+      // 通知中心：事件 append-only 并集；规则按 rev 墓碑；通知项走得更远者胜出 + 历史并集；队列 FIFO 并集
+      finalDoc.notifyEvents = mergeNotifyEvents(
+        Array.isArray(prev?.notifyEvents) ? prev.notifyEvents : [], finalDoc.notifyEvents || []);
+      finalDoc.notifyRules = mergeRules(
+        Array.isArray(prev?.notifyRules) ? prev.notifyRules : [], finalDoc.notifyRules || []);
+      finalDoc.notifications = mergeNotifications(
+        Array.isArray(prev?.notifications) ? prev.notifications : [], finalDoc.notifications || []);
+      finalDoc.notifyOutbox = mergeOutbox(
+        Array.isArray(prev?.notifyOutbox) ? prev.notifyOutbox : [], finalDoc.notifyOutbox || []);
       finalDoc.activeReviewId = finalDoc.reviewSessions.some((x) => x.id === finalDoc.activeReviewId)
         ? finalDoc.activeReviewId
         : (payload.activeReviewId && finalDoc.reviewSessions.some((x) => x.id === payload.activeReviewId) ? payload.activeReviewId : null);
@@ -289,6 +441,10 @@ export class Store extends EventTarget {
       for (const rs of payload.reviewSessions || []) {
         if (!this._reviewAuthoredRevs.has(rs.id)) this._reviewAuthoredRevs.set(rs.id, new Set());
         this._reviewAuthoredRevs.get(rs.id).add(rs.rev);
+      }
+      for (const r of payload.notifyRules || []) {
+        if (!this._notifyAuthoredRuleRevs.has(r.id)) this._notifyAuthoredRuleRevs.set(r.id, new Set());
+        this._notifyAuthoredRuleRevs.get(r.id).add(Math.max(r.rev || 0, r.deleteRev || 0));
       }
     } catch {}
     this._emit('persist');
@@ -399,10 +555,47 @@ export class Store extends EventTarget {
     return null;
   }
 
+  /**
+   * localStorage 多页签通知中心冲突检测（离线 / 服务端不可用时的协调）。
+   * 规则：本页自写 rev 不算外来推进；外来副本 rev 超过本页基线 → notify-rule-advanced。
+   * 通知项：本页待改项在磁盘上已被另一页签改了状态 → notify-item-advanced（本地动作保留）。
+   */
+  _checkLocalNotifyConflict(stored, payload) {
+    const storedRules = new Map((stored.notifyRules || []).map((r) => [r.id, r]));
+    for (const r of payload.notifyRules || []) {
+      const base = this._notifyRuleSyncedRevs[r.id] ?? 0;
+      const clientRev = Math.max(r.rev || 0, r.deleteRev || 0);
+      if (!(clientRev > base)) continue;
+      if (this._notifyAuthoredRuleRevs.get(r.id)?.has(clientRev)) continue;
+      const srv = storedRules.get(r.id);
+      const srvRev = srv ? Math.max(srv.rev || 0, srv.deleteRev || 0) : 0;
+      if (srvRev !== base && srvRev > base) {
+        return { kind: 'rule', reason: 'notify-rule-advanced', ruleId: r.id, serverRev: srvRev, rule: srv || null };
+      }
+    }
+    const storedItems = new Map((stored.notifications || []).map((n) => [n.id, n]));
+    for (const n of payload.notifications || []) {
+      const base = this._notifyItemBase.get(n.id);
+      if (!base) continue;
+      const srv = storedItems.get(n.id);
+      // 防抖窗口内本页乐观动作可能尚未写入 localStorage：磁盘缺该项不算冲突（交给服务端 409）
+      if (!srv) continue;
+      // 磁盘状态与基线一致：无外来推进
+      if (srv.status === base.status && (srv.ackedAt || null) === (base.ackedAt || null)) continue;
+      // 磁盘状态是本页在【上一轮】已写入过的状态（如刚送达 delivered、刚确认 acknowledged），
+      // 只是本次乐观动作又把本地推进到了更新状态：不是另一窗口的外来推进。
+      if (this._notifyAuthoredItemStates.get(n.id)?.has(srv.status)) continue;
+      return { kind: 'item', reason: 'notify-item-advanced', notifyId: n.id, serverStatus: srv.status, item: srv };
+    }
+    return null;
+  }
+
   _sendLatest() {
     if (this.saveConflict) return this._saveChain;
     const v = this._saveVersion;
     this._flushedVersion = v;
+    this._notifyBaseSeq = (this._notifyBaseSeq || 0) + 1;
+    const myNotifySeq = this._notifyBaseSeq;
     this._saveChain = this._saveChain.then(async () => {
       if (v !== this._saveVersion || this.saveConflict) return;
       // 在保存链真正轮到本次请求时再快照：前一次 409 响应可能已在此 await 期间
@@ -416,7 +609,12 @@ export class Store extends EventTarget {
       const payload = {
         ...this._payload(), baseRev: this.rev, baseHeads,
         baseReviewRevs: this._baseReviewRevs(),
+        baseNotifyRuleRevs: this._baseNotifyRuleRevs(),
+        baseNotifyItemRevs: this._baseNotifyItemRevs(),
       };
+      // 快照本次请求发出时的乐观动作：后续 409（可能在又一次保存清空 map 后才到达）
+      // 用它恢复并保留本地未提交操作。
+      const pendingSnapshot = new Map(this._notifyPendingItemActions);
       let body = JSON.stringify(payload);
       // 审阅冲突未解决：该会话决定不再外发（本地决定已保留为提案，等逐项合并 / 放弃）。
       // 几何保存（其他分支/文档字段）仍照常进行：载荷里剔除冲突会话，服务端按 id
@@ -427,7 +625,35 @@ export class Store extends EventTarget {
         delete payload.baseReviewRevs[cid];
         body = JSON.stringify(payload);
       }
+      // 通知中心冲突未解决：冲突规则 / 通知项不外发（本地未提交操作保留为 draft），
+      // 其余通知 / 几何保存照常。
+      if (this._hasNotifyLocks()) {
+        if (this._notifyLockedRules.size) {
+          payload.notifyRules = (payload.notifyRules || []).filter((x) => !this._notifyLockedRules.has(x.id));
+          for (const rid of this._notifyLockedRules) delete payload.baseNotifyRuleRevs[rid];
+        }
+        if (this._notifyLockedItems.size) {
+          const locked = this._notifyLockedItems;
+          const serverItems = await this._fetchDoc().catch(() => null);
+          const authoritative = new Map((serverItems?.notifications || []).map((n) => [n.id, n]));
+          // 剔除锁定项，以及其本地乐观转交产生的、服务端尚不存在的派生项
+          const spawnedByLocked = new Set((payload.notifications || [])
+            .filter((n) => n.transferOf && locked.has(n.transferOf)).map((n) => n.id));
+          payload.notifications = (payload.notifications || []).map((n) => authoritative.get(n.id) || n)
+            .filter((n) => (!locked.has(n.id) && !spawnedByLocked.has(n.id)) || authoritative.has(n.id));
+          payload.notifyOutbox = (payload.notifyOutbox || []).filter((o) => {
+            const nid = o.notifyId;
+            if (locked.has(nid) || spawnedByLocked.has(nid)) return false;
+            const srv = authoritative.get(nid);
+            return !srv || (srv.status === 'pending' || srv.status === 'sent');
+          });
+          for (const nid of locked) delete payload.baseNotifyItemRevs[nid];
+        }
+        body = JSON.stringify(payload);
+      }
       try {
+        // 发请求前再次快照乐观动作：调用方可能在该保存入队后、实际发出前才执行确认/转交。
+        const requestSnapshot = new Map([...pendingSnapshot, ...this._notifyPendingItemActions]);
         const res = await fetch(this.base + '/api/doc', {
           method: 'PUT', headers: { 'content-type': 'application/json' },
           body,
@@ -438,6 +664,15 @@ export class Store extends EventTarget {
             // 审阅冲突（会话 rev 前进 / 节点指纹变化 / 节点缺失 / 分支推进）：
             // 不锁定几何编辑，只锁定该会话；本地决定保留为 proposals，等待逐项合并
             this._onReviewConflict(data);
+            return;
+          }
+          if (String(data.reason || '').startsWith('notify-')) {
+            // 通知中心冲突：恢复请求快照里的乐观动作，再回滚权威状态并保留本地未提交操作
+            for (const [pid, p] of requestSnapshot) {
+              if (!this._notifyPendingItemActions.has(pid)) this._notifyPendingItemActions.set(pid, p);
+              if (!this._notifyOptimisticLog.has(pid)) this._notifyOptimisticLog.set(pid, p);
+            }
+            this._onNotifyConflict(data);
             return;
           }
           this._onSaveConflict(data, Number.isFinite(data?.rev) ? data.rev : null);
@@ -457,9 +692,16 @@ export class Store extends EventTarget {
           const myReview = this.reviewSessions;
           const myActiveReview = this.activeReviewId;
           const myProposals = this._reviewProposals;
+          const myNotifyLocks = { rules: new Set(this._notifyLockedRules), items: new Set(this._notifyLockedItems), conflict: this.notifyConflict };
           await this._adopt(data.doc, { seed: false, keepReviewConflict: true });
           // 合流文档以服务端为准，但本页刚刚提交且未被服务端纳入的审阅决定要保留为待合并提案
           this._carryReviewProposals(myReview, myProposals, myActiveReview, data.doc);
+          // 通知中心冲突锁在合流重载后继续保留（本地未提交操作不丢）
+          if (myNotifyLocks.conflict) {
+            this._notifyLockedRules = myNotifyLocks.rules;
+            this._notifyLockedItems = myNotifyLocks.items;
+            this.notifyConflict = myNotifyLocks.conflict;
+          }
           this._dirty = false;
           this._emit('load');
           this._emit('saved', { rev: this.rev, merged: true });
@@ -474,9 +716,29 @@ export class Store extends EventTarget {
           this._reviewSyncedRevs[s.id] = s.rev;
           this._reviewAuthoredRevs.get(s.id)?.add(s.rev);
         }
+        // 通知中心基线前进到服务端确认值（规则 rev / 通知项状态）
+        for (const r of this.notifyRules) {
+          this._notifyRuleSyncedRevs[r.id] = Math.max(r.rev || 0, r.deleteRev || 0);
+          this._notifyAuthoredRuleRevs.get(r.id)?.add(Math.max(r.rev || 0, r.deleteRev || 0));
+        }
+        for (const n of payload.notifications || []) {
+          // 只接受最新一次保存确认的通知项基线，避免旧请求（如送达）的晚到回调把基线
+          // 从更新状态（如已确认）回退，导致下一次 PUT 误判 409。
+          if (myNotifySeq >= (this._notifyBaseAppliedSeq || 0)) {
+            this._notifyItemBase.set(n.id, { status: n.status, ackedAt: n.ackedAt ?? null });
+          }
+        }
+        this._notifyBaseAppliedSeq = Math.max(this._notifyBaseAppliedSeq || 0, myNotifySeq);
+        // 服务端确认后，载荷中的通知项都已成为已知项（下一次保存携带基线）
+        for (const n of payload.notifications || []) this._notifyServerKnownItems.add(n.id);
+        // 乐观日志保留到对应通知项被显式处理（确认/转交/放弃）或发生 409 后由 adopt 清理，
+        // 不能在保存成功时就清空：in-app 送达的“成功保存”可能先于后续冲突响应到达。
+        this.online = true;
         this._emit('saved', { rev: this.rev });
+        this.flushOutbox().catch(() => {});
       } catch (e) {
         console.warn('保存失败（已写入 localStorage）:', e.message);
+        this.online = false;
         this._emit('saveerror', {});
       }
     });
@@ -929,6 +1191,7 @@ export class Store extends EventTarget {
     this._reviewSyncedRevs[session.id] = 0; // HTTP 首次保存：服务端尚无此会话（base=0）
     if (!this._reviewAuthoredRevs.has(session.id)) this._reviewAuthoredRevs.set(session.id, new Set());
     this._reviewAuthoredRevs.get(session.id).add(session.rev); // 本地自创会话：自己的 rev1 不是外来推进
+    this.pumpNotify({});
     if (setActive) this.activeReviewId = session.id;
     this._dirty = true;
     this.persist();
@@ -1131,8 +1394,16 @@ export class Store extends EventTarget {
   reopenReview(id) {
     const session = this.reviewSessions.find((x) => x.id === id);
     if (!session) return { ok: false, error: '会话不存在' };
-    const res = reopenReview(session);
+    const now = Date.now();
+    const res = reopenReview(session, { now });
     this._replaceReview(res.session);
+    // 重开无法从最终状态稳定派生：显式注入一次 session-reopened 事件（id 幂等）
+    this._appendNotifyEvent({
+      id: notifyEventId([id, 'session-reopened', now]),
+      sessionId: id, nodeKey: null, type: 'session-reopened',
+      at: now, actor: this.actor || '未署名', title: res.session.name || id,
+    });
+    this.pumpNotify({ now });
     this._dirty = true;
     this.persist();
     this._emit('reviews', { type: 'reopen', id });
@@ -1148,6 +1419,14 @@ export class Store extends EventTarget {
 
   _replaceReview(session) {
     this.reviewSessions = this.reviewSessions.map((x) => (x.id === session.id ? session : x));
+    // 审阅决定 / 签名 / 冲突对账可能产生新通知事件：派生并物化（纯函数，幂等）
+    this.pumpNotify({});
+  }
+
+  /** 追加一条显式通知事件（如会话重开，无法从最终状态稳定派生），按 id 幂等。 */
+  _appendNotifyEvent(ev) {
+    if (this.notifyEvents.some((x) => x.id === ev.id)) return;
+    this.notifyEvents = [...this.notifyEvents, ev].sort((a, b) => (a.at - b.at) || (a.id < b.id ? -1 : 1));
   }
 
   _clearReviewConflictIfResolved(id, { forceBaseline = false } = {}) {
@@ -1294,7 +1573,449 @@ export class Store extends EventTarget {
     if (myActiveId && this.reviewSessions.some((x) => x.id === myActiveId)) this.activeReviewId = myActiveId;
   }
 
+  /* ==================== 审阅通知与升级中心 ==================== */
 
+  _baseNotifyRuleRevs() {
+    const out = {};
+    for (const r of this.notifyRules) out[r.id] = this._notifyRuleSyncedRevs[r.id] ?? 0;
+    return out;
+  }
+
+  _baseNotifyItemRevs() {
+    // 只为服务端已知（已随某次保存确认）的通知项携带基线；全新物化的项不带 base，
+    // 否则服务端会把“基线有、服务端无”的新项误判为 notify-item-missing。
+    const out = {};
+    for (const n of this.notifications) {
+      const base = this._notifyItemBase.get(n.id);
+      if (base && this._notifyServerKnownItems.has(n.id)) out[n.id] = base;
+    }
+    return out;
+  }
+
+  _hasNotifyLocks() {
+    return (this._notifyLockedRules?.size || 0) > 0 || (this._notifyLockedItems?.size || 0) > 0;
+  }
+
+  notifyRuleById(id) { return this.notifyRules.find((r) => r.id === id) || null; }
+  notificationById(id) { return this.notifications.find((n) => n.id === id) || null; }
+
+  _markAuthoredItem(id, status) {
+    if (!id || !status) return;
+    const set = this._notifyAuthoredItemStates.get(id) || new Set();
+    set.add(status);
+    this._notifyAuthoredItemStates.set(id, set);
+  }
+
+  /** 当前操作者的待处理通知（页面内确认 / 稍后 / 转交）。 */
+  notifyInbox(recipient = this.actor) {
+    return pendingInbox(this.notifications, recipient, { now: Date.now() });
+  }
+
+  notifyCounters(recipient = null) {
+    return notificationCounters(this.notifications, recipient);
+  }
+
+  /** 会话的完整通知时间线报告。 */
+  notifyReport(sessionId, { generatedAt = null } = {}) {
+    return buildNotifyReport(sessionId, {
+      rules: this.notifyRules, events: this.notifyEvents, items: this.notifications,
+      outbox: this.notifyOutbox, sessions: this.reviewSessions, generatedAt,
+    });
+  }
+
+  /* ---------- 规则配置 ---------- */
+
+  saveNotifyRule(sessionId, spec, { editId = null } = {}) {
+    if (this.saveConflict) return { ok: false, error: '版本冲突未解决，请先重新加载' };
+    if (!this.reviewSessionById(sessionId)) return { ok: false, error: '审阅会话不存在，无法配置通知规则' };
+    const now = Date.now();
+    if (editId) {
+      const old = this.notifyRuleById(editId);
+      if (!old) return { ok: false, error: '规则不存在（可能已被其他页面删除）' };
+      if (this._notifyLockedRules.has(editId)) {
+        const draft = { kind: 'rule', ruleId: editId, spec, at: now, by: this.actor };
+        this._stashNotifyDraft(editId, draft);
+        return { ok: false, status: 409, reason: 'notify-rule-advanced', conflict: this.notifyConflict, draft };
+      }
+      let rule;
+      try { rule = editRule(old, spec, { now }); } catch (e) { return { ok: false, error: e.message }; }
+      this.notifyRules = this.notifyRules.map((x) => (x.id === editId ? rule : x));
+      this.pumpNotify({ now });
+      this._dirty = true;
+      this.persist();
+      this._emit('notify', { type: 'rule-edit', id: editId });
+      return { ok: true, rule };
+    }
+    let rule;
+    try {
+      rule = createRule({
+        sessionId, name: spec.name, triggers: spec.triggers, levels: spec.levels,
+        actor: this.actor || '未署名', now,
+      });
+    } catch (e) { return { ok: false, error: e.message }; }
+    this.notifyRules = [...this.notifyRules, rule];
+    this._notifyRuleSyncedRevs[rule.id] = 0; // HTTP 首次保存：服务端尚无此规则
+    if (!this._notifyAuthoredRuleRevs.has(rule.id)) this._notifyAuthoredRuleRevs.set(rule.id, new Set());
+    this._notifyAuthoredRuleRevs.get(rule.id).add(rule.rev);
+    this.pumpNotify({ now });
+    this._dirty = true;
+    this.persist();
+    this._emit('notify', { type: 'rule-create', id: rule.id });
+    return { ok: true, rule };
+  }
+
+  /** 启用 / 停用：暂停 / 恢复语义，不推进 rev、不移动 revisedAt。 */
+  toggleNotifyRule(id, enabled) {
+    const old = this.notifyRuleById(id);
+    if (!old) return { ok: false, error: '规则不存在' };
+    const rule = editRule(old, { enabled: enabled !== false }, { now: Date.now() });
+    this.notifyRules = this.notifyRules.map((x) => (x.id === id ? rule : x));
+    this.pumpNotify({});
+    this._dirty = true;
+    this.persist();
+    this._emit('notify', { type: 'rule-toggle', id });
+    return { ok: true, rule };
+  }
+
+  removeNotifyRule(id) {
+    const old = this.notifyRuleById(id);
+    if (!old || old.deleted) return { ok: false, error: '规则不存在' };
+    const rule = deleteRule(old, { now: Date.now() });
+    this.notifyRules = this.notifyRules.map((x) => (x.id === id ? rule : x));
+    this._dirty = true;
+    this.persist();
+    this._emit('notify', { type: 'rule-delete', id });
+    return { ok: true, rule };
+  }
+
+  /* ---------- 通知项操作：确认 / 稍后 / 转交 / 重排 ---------- */
+
+  _applyNotifyItemAction(id, action, payload = {}, { stashOnConflict = true } = {}) {
+    const now = Date.now();
+    const by = this.actor || '未署名';
+    const before = this.notifications;
+    let res;
+    if (action === 'ack') res = acknowledgeNotification(before, id, { by, now, note: payload.note || '' });
+    else if (action === 'snooze') res = snoozeNotification(before, id, payload.snoozeMin, { by, now });
+    else if (action === 'transfer') res = transferNotification(before, id, payload.to, { by, now, reason: payload.reason || '' });
+    else if (action === 'retry') res = retryNotification(before, id, { by, now });
+    else return { ok: false, status: 400, reason: 'unknown-action' };
+
+    if (res.status === 404) return { ok: false, status: 404, reason: 'notification-missing' };
+    if (res.status === 409 || res.status === 400) return { ok: false, ...res };
+    if (res.idempotent) return { ok: true, idempotent: true };
+    this.notifications = res.items;
+    // 记住这次乐观动作：服务端 409（另一窗口已处理同一项）时转成保留草稿并回滚。
+    // 转交同时改了原项与派生项；原项记录带 newId，派生项记录用 spawnedBy 指回原项。
+    const pendingRec = { action, payload, newId: res.newId || null, at: now, by };
+    this._notifyPendingItemActions.set(id, pendingRec);
+    if (res.newId) this._notifyPendingItemActions.set(res.newId, { ...pendingRec, newId: null, spawnedBy: id });
+    // 持久乐观日志：409 恢复时即使保存链已清空 pending map 也能找回本地动作
+    this._notifyOptimisticLog.set(id, pendingRec);
+    if (res.newId) this._notifyOptimisticLog.set(res.newId, { ...pendingRec, newId: null, spawnedBy: id });
+    // 标记本页自写状态（用于本地多页签冲突检测）；OCC 基线【不】乐观前进，
+    // 只在服务端确认保存后更新——否则确认/转交的首个 PUT 会用超前基线对旧服务端状态误判 409。
+    for (const n of this.notifications) this._markAuthoredItem(n.id, n.status);
+    // 确认 / 转交后，已在队列中的旧通知项不再发送
+    this.notifyOutbox = this.notifyOutbox.filter((o) => {
+      const it = this.notifications.find((x) => x.id === o.notifyId);
+      return it && (it.status === 'pending' || it.status === 'sent');
+    });
+    this.pumpNotify({ now });
+    // 若该通知项此前已收到过“服务端已被另一窗口处理”的 409（当时本地尚无动作而挂起），
+    // 现在用刚记录的本地动作完成冲突处理：回滚权威状态并把本地动作保留为草稿。
+    const deferred = this._notifyDeferredItemConflicts.get(id);
+    if (deferred) {
+      this._notifyDeferredItemConflicts.delete(id);
+      this._onNotifyConflict({ reason: 'notify-item-advanced', notifyId: id, item: deferred.serverItem, serverStatus: deferred.serverItem.status });
+    }
+    this._dirty = true;
+    this.persist();
+    this.flushOutbox().catch(() => {});
+    this._emit('notify', { type: action, id, newId: res.newId || null });
+    return { ok: true, newId: res.newId || null };
+  }
+
+  ackNotification(id, note = '') { return this._applyNotifyItemAction(id, 'ack', { note }); }
+  snoozeNotification(id, snoozeMin) { return this._applyNotifyItemAction(id, 'snooze', { snoozeMin }); }
+  transferNotification(id, to, reason = '') { return this._applyNotifyItemAction(id, 'transfer', { to, reason }); }
+  retryNotification(id) { return this._applyNotifyItemAction(id, 'retry'); }
+
+  /* ---------- 409：版本冲突与本地未提交操作保留 ---------- */
+
+  _stashNotifyDraft(id, draft) {
+    if (draft.kind === 'rule') {
+      this._notifyRuleDrafts.set(id, draft);
+    } else {
+      const list = this._notifyItemDrafts.get(id) || [];
+      const key = `${draft.action}|${draft.payload?.to || ''}|${draft.payload?.snoozeMin || ''}|${draft.payload?.note || ''}`;
+      if (!list.some((d) => `${d.action}|${d.payload?.to || ''}|${d.payload?.snoozeMin || ''}|${d.payload?.note || ''}` === key)) list.push(draft);
+      this._notifyItemDrafts.set(id, list);
+    }
+    this._emit('notify', { type: 'draft', id });
+  }
+
+  notifyRuleDrafts(id) { return this._notifyRuleDrafts.get(id) || null; }
+  notifyItemDrafts(id) { return this._notifyItemDrafts.get(id) || []; }
+
+  /** 409 解决后把本地保留的规则编辑作为新修订重新提交（采用本地值）。 */
+  reapplyNotifyRuleDraft(id) {
+    const draft = this._notifyRuleDrafts.get(id);
+    if (!draft) return { ok: false, error: '没有待提交的本地规则编辑' };
+    const rule = this.notifyRuleById(id);
+    if (!rule) { this.discardNotifyRuleDraft(id); return { ok: false, error: '规则已被删除' }; }
+    this._notifyLockedRules.delete(id);
+    if (!this._hasNotifyLocks()) this.notifyConflict = null;
+    const res = this.saveNotifyRule(rule.sessionId, draft.spec, { editId: id });
+    if (res.ok) this.discardNotifyRuleDraft(id);
+    return res;
+  }
+
+  discardNotifyRuleDraft(id) {
+    this._notifyRuleDrafts.delete(id);
+    this._notifyLockedRules.delete(id);
+    if (!this._hasNotifyLocks()) this.notifyConflict = null;
+    this._emit('notify', { type: 'draft-discard', id });
+    return { ok: true };
+  }
+
+  /** 409 解决后把本地保留的通知项动作应用到服务端最新状态。 */
+  reapplyNotifyItemDraft(id, draft) {
+    this._notifyLockedItems.delete(id);
+    if (!this._hasNotifyLocks()) this.notifyConflict = null;
+    const res = this._applyNotifyItemAction(id, draft.action, draft.payload || {});
+    if (res.ok) {
+      const list = (this._notifyItemDrafts.get(id) || []).filter((d) => d !== draft);
+      if (list.length) this._notifyItemDrafts.set(id, list); else this._notifyItemDrafts.delete(id);
+    }
+    return res;
+  }
+
+  discardNotifyItemDraft(id, draft) {
+    const list = (this._notifyItemDrafts.get(id) || []).filter((d) => d !== draft);
+    if (list.length) this._notifyItemDrafts.set(id, list); else this._notifyItemDrafts.delete(id);
+    this._notifyLockedItems.delete(id);
+    if (!this._hasNotifyLocks()) this.notifyConflict = null;
+    this._emit('notify', { type: 'draft-discard', id });
+    return { ok: true };
+  }
+
+  /**
+   * 409 命中的通知项在服务端缺失（通常是本地乐观转交产生、服务端还没有的派生项）：
+   * 从乐观日志找回动作，转交到原项上保留为草稿，移除乐观派生项，锁定原项。
+   */
+  _resolveMissingItemConflict(lockedId, now) {
+    let pending = this._notifyPendingItemActions.get(lockedId) || this._notifyOptimisticLog.get(lockedId);
+    if (!pending?.action) {
+      for (const p of [...this._notifyPendingItemActions.values(), ...this._notifyOptimisticLog.values()]) {
+        if (p.newId === lockedId || p.spawnedBy === lockedId) { pending = p; break; }
+      }
+    }
+    if (!pending) return;
+    let originalId, spawnedId;
+    if (pending.spawnedBy) { originalId = pending.spawnedBy; spawnedId = lockedId; }
+    else if (pending.newId) { originalId = lockedId; spawnedId = pending.newId !== lockedId ? pending.newId : null; }
+    else { originalId = lockedId; spawnedId = null; }
+    this._stashNotifyDraft(originalId, { kind: 'item', notifyId: originalId, action: pending.action, payload: pending.payload || {}, at: now, by: pending.by || this.actor });
+    if (spawnedId) this.notifications = this.notifications.filter((x) => x.id !== spawnedId);
+    // 原项若无服务端权威副本，保守置回 pending（去掉乐观 transferred / snoozed）
+    const orig = this.notifications.find((x) => x.id === originalId);
+    if (orig && ['transferred', 'snoozed'].includes(orig.status)) {
+      this.notifications = this.notifications.map((x) => x.id === originalId ? { ...x, status: 'pending', ackedAt: null, ackedBy: null, snoozeUntil: null } : x);
+    }
+    this._notifyItemBase.set(originalId, { status: orig?.status || 'pending', ackedAt: null });
+    this._notifyPendingItemActions.delete(originalId);
+    this._notifyPendingItemActions.delete(spawnedId);
+    this._notifyOptimisticLog.delete(originalId);
+    this._notifyOptimisticLog.delete(spawnedId);
+    this._notifyLockedItems.add(originalId);
+  }
+
+  /**
+   * 通知中心 409（规则被另一窗口修改 / 通知项被另一窗口处理）：
+   * 采用服务端权威副本，锁定该规则 / 项，本地未提交操作保留为 draft。
+   */
+  _onNotifyConflict(info) {
+    const now = Date.now();
+    // 同一轮保存链可能连续收到多个 409（先 advanced、再 missing）：已锁定的不被后续缺 item 的响应清掉
+    const alreadyLocked = (info.notifyId && this._notifyLockedItems.has(info.notifyId))
+      || (info.ruleId && this._notifyLockedRules.has(info.ruleId));
+    const adoptServerRule = (serverRule) => {
+      if (!serverRule) return;
+      const clean = sanitizeRules([serverRule], { now })[0];
+      // 保留本地未提交编辑（以草稿形式），再用服务端权威值整体替换该规则
+      const mine = this.notifyRuleById(clean.id);
+      if (mine && Math.max(mine.rev || 0, mine.deleteRev || 0) !== this._notifyRuleSyncedRevs[clean.id]) {
+        this._stashNotifyDraft(clean.id, { kind: 'rule', ruleId: clean.id, spec: ruleSpecOf(mine), at: now, by: this.actor });
+      }
+      this.notifyRules = this.notifyRules.map((x) => (x.id === clean.id ? clean : x));
+      this._notifyRuleSyncedRevs[clean.id] = Math.max(clean.rev || 0, clean.deleteRev || 0);
+      this._notifyAuthoredRuleRevs.delete(clean.id);
+      this._notifyLockedRules.add(clean.id);
+    };
+    const adoptServerItem = (serverItem) => {
+      if (!serverItem) return;
+      const clean = sanitizeNotifications([serverItem], { now })[0];
+      const lockedId = clean.id;
+      // 在乐观日志 / 待确认动作里找出与本次 409 项配对的原始转交动作（可能按原项 id 或派生项 id 命中）。
+      let pending = this._notifyPendingItemActions.get(lockedId) || this._notifyOptimisticLog.get(lockedId);
+      if (!pending?.action) {
+        for (const p of [...this._notifyPendingItemActions.values(), ...this._notifyOptimisticLog.values()]) {
+          if (p.newId === lockedId || p.spawnedBy === lockedId) { pending = p; break; }
+        }
+      }
+      // 最后兜底：本地该项已被乐观动作改成 transferred / 派生新项，据此重建待重试动作
+      if (!pending?.action) {
+        const localItem = this.notifications.find((x) => x.id === lockedId);
+        const spawned = this.notifications.find((x) => x.transferOf === lockedId);
+        if (localItem?.status === 'transferred') {
+          pending = { action: 'transfer', payload: { to: spawned?.recipient || localItem.transferredTo, reason: localItem.history?.find((h) => h.action === 'transfer')?.detail || '' }, newId: spawned?.id || null, by: this.actor };
+        } else if (localItem?.status === 'snoozed') {
+          pending = { action: 'snooze', payload: { snoozeMin: Math.max(1, Math.round((localItem.snoozeUntil - now) / 60000)) }, by: this.actor };
+        } else if (localItem?.status === 'acknowledged') {
+          pending = { action: 'ack', payload: { note: localItem.history?.find((h) => h.action === 'acknowledge')?.detail || '' }, by: localItem.ackedBy || this.actor };
+        }
+      }
+      // 409 到达时本地还没有对应乐观动作（来自较早一次在飞保存）：挂起该冲突，
+      // 等用户随后对同一项执行动作时再恢复本地未提交操作。
+      if (!pending?.action) {
+        this._notifyDeferredItemConflicts.set(lockedId, { serverItem: clean, info, at: now });
+        return;
+      }
+      // 原项 / 派生项配对：
+      // - 409 命中派生项（pending.spawnedBy 指向原项）：originalId=spawnedBy，spawnedId=lockedId；
+      // - 否则 409 命中原项：originalId=lockedId，若 pending 带 newId 则它是派生项。
+      let originalId, spawnedId;
+      if (pending?.spawnedBy) {
+        originalId = pending.spawnedBy;
+        spawnedId = lockedId;
+      } else {
+        originalId = lockedId;
+        spawnedId = pending?.newId && pending.newId !== lockedId ? pending.newId : null;
+      }
+      if (pending?.action) {
+        const draft = { kind: 'item', notifyId: originalId, action: pending.action, payload: pending.payload || {}, at: now, by: pending.by || this.actor };
+        this._stashNotifyDraft(originalId, draft);
+        // 409 命中派生项时，也在 409 返回的 notifyId 下保留同一动作，便于按该 id 查询/重试
+        if (spawnedId && lockedId === spawnedId) this._stashNotifyDraft(spawnedId, { ...draft, notifyId: spawnedId });
+      }
+      if (spawnedId) this.notifications = this.notifications.filter((x) => x.id !== spawnedId);
+      // 原项恢复服务端权威状态
+      const origExists = this.notifications.some((x) => x.id === originalId);
+      if (origExists) this.notifications = this.notifications.map((x) => (x.id === originalId ? { ...clean, id: originalId } : x));
+      else this.notifications = [...this.notifications, { ...clean, id: originalId }];
+      this._notifyItemBase.set(originalId, { status: clean.status, ackedAt: clean.ackedAt ?? null });
+      this._notifyPendingItemActions.delete(originalId);
+      this._notifyPendingItemActions.delete(spawnedId);
+      this._notifyLockedItems.add(originalId);
+    };
+
+    if (info.ruleId) adoptServerRule(info.rule || null);
+    if (info.notifyId) {
+      if (info.item) adoptServerItem(info.item);
+      else this._resolveMissingItemConflict(info.notifyId, now);
+    }
+
+    // 已处理过的同一冲突：保留首个（含 item / rule 权威值的）冲突描述，不被后续 missing 响应覆盖
+    if (!alreadyLocked || info.item || info.rule) {
+      this.notifyConflict = {
+        kind: info.ruleId ? 'rule' : 'item',
+        reason: info.reason, ruleId: info.ruleId || null, notifyId: info.notifyId || null,
+        serverRev: info.serverRev ?? null, serverStatus: info.serverStatus || null, at: now,
+      };
+    }
+    const needFetch = (info.ruleId && !info.rule) || (info.notifyId && !info.item && !alreadyLocked);
+    if (needFetch) {
+      this._fetchDoc().then((doc) => {
+        if (!doc) return;
+        if (info.ruleId) {
+          const r = (doc.notifyRules || []).find((x) => x.id === info.ruleId);
+          if (r) { adoptServerRule(r); this._emit('notify', { type: 'conflict' }); }
+        }
+        if (info.notifyId) {
+          const n = (doc.notifications || []).find((x) => x.id === info.notifyId);
+          if (n) { adoptServerItem(n); this._emit('notify', { type: 'conflict' }); }
+        }
+      }).catch(() => {});
+    }
+    this._emit('notify', { type: 'conflict' });
+  }
+
+  /* ---------- 发送队列（断网保留 / 恢复按序重试 / 幂等） ---------- */
+
+  /**
+   * 等待当前在飞 / 防抖中的保存链落定一次（不重入发送、不重新 flush 通知队列）。
+   * 供默认 in-app 发送通道确认“权威文档已保存”使用，避免 flushed() 的递归竞争。
+   */
+  async _waitSaveSettled() {
+    clearTimeout(this._saveTimer);
+    await this._sendLatest();
+  }
+
+  /**
+   * 按 FIFO 刷新发送队列。默认 in-app 通道：通知项随权威文档保存成功即视为送达，
+   * 因此每发送一项先等待一次持久化确认；网络不可用时留在队列，恢复后按原顺序重试。
+   * 可通过 setNotifyTransport 注入测试通道（可控在线 / 失败）。
+   */
+  async flushOutbox() {
+    if (this._flushing || this.saveConflict) return;
+    this._flushing = true;
+    try {
+      let guard = 0;
+      while (guard++ < 10000) {
+        if (this._hasNotifyLocks()) break;
+        // 队头：按 enqueuedAt 顺序；未到退避时刻的项阻塞其后续（严格顺序）
+        const ordered = [...this.notifyOutbox].sort((a, b) => (a.enqueuedAt - b.enqueuedAt) || (a.id < b.id ? -1 : 1));
+        const head = ordered[0];
+        if (!head) break;
+        const item = this.notifications.find((n) => n.id === head.notifyId);
+        if (!item || !['pending', 'sent'].includes(item.status)) {
+          this.notifyOutbox = this.notifyOutbox.filter((o) => o.id !== head.id);
+          continue;
+        }
+        if (head.nextAttemptAt != null && Date.now() < head.nextAttemptAt) break; // 严格顺序：等队头退避
+        if (!this._isOnline()) break; // 断网：留在队列，恢复后重试
+
+        let result;
+        if (this._transport?.send) {
+          try { result = await this._transport.send(item, head); }
+          catch (e) { result = { ok: false, error: e?.message || 'transport-error' }; }
+        } else {
+          // 默认 in-app：权威文档保存确认即送达。不能递归调用 flushed()（会重入保存链，
+          // 与正在进行的确认/决定保存竞争），只等待当前在飞 / 防抖中的 PUT 落定一次。
+          try {
+            await this._waitSaveSettled();
+            result = this.online ? { ok: true, detail: 'in-app 已送达并持久化' } : { ok: false, error: '离线，保留在队列' };
+          } catch (e) { result = { ok: false, error: e?.message || 'persist-failed' }; }
+        }
+
+        const now = Date.now();
+        const merged = recordDeliveryAttempt(this.notifications, this.notifyOutbox, item.id, result,
+          { now, backoffMs: this.notifyBackoffMs });
+        this.notifications = merged.items;
+        this.notifyOutbox = merged.outbox;
+        // 注意：这里【不】乐观推进 OCC 基线（_notifyItemBase）。基线只能在服务端确认保存后
+        // 前进，否则“刚送达、尚未保存”的下一次 PUT 会带新基线对旧服务端状态而误判为 409。
+        for (const n of this.notifications) this._markAuthoredItem(n.id, n.status);
+        this._dirty = true;
+        this.persist();
+        // in-app 通道：送达已随上面 persist 的保存确认，持久化基线在保存成功回调里前进
+        this._emit('notify', { type: result.ok ? 'delivered' : 'send-error', id: item.id });
+        if (!result.ok) { this.online = false; break; } // 断网：停止，保留队列与顺序
+        this.online = true;
+      }
+    } finally {
+      this._flushing = false;
+    }
+  }
+
+  /** 网络恢复（测试 / 浏览器 online 事件可调用）：按原顺序重试队列。 */
+  notifyOnline() {
+    if (this.online) return;
+    this.online = true;
+    this.pumpNotify({ persist: true });
+    this.flushOutbox().catch(() => {});
+  }
 
   experimentById(id) { return this.experiments.find((x) => x.id === id) || null; }
 
@@ -1453,6 +2174,7 @@ export class Store extends EventTarget {
     this._disposed = true;
     this._runners.clear();
     clearTimeout(this._saveTimer);
+    if (this._notifyTimer) { clearInterval(this._notifyTimer); this._notifyTimer = null; }
     this._saveChain = Promise.resolve();
     this._sendLatest = () => Promise.resolve();
   }
@@ -1623,9 +2345,17 @@ function withPreviewPositions(model, rep) {
   return m;
 }
 
+/** 把规则还原成可编辑 spec（409 后本地规则编辑以草稿保留时使用）。 */
+function ruleSpecOf(rule) {
+  return {
+    name: rule.name,
+    triggers: { ...rule.triggers },
+    levels: (rule.levels || []).map((l) => ({ delayMin: l.delayMin, recipients: [...l.recipients] })),
+  };
+}
+
 /** 载入时清洗版本列表：结构不完整的一律丢弃，published 归一为布尔。 */
-function sanitizeVersions(list) {
-  if (!Array.isArray(list)) return [];
+function sanitizeVersions(list) {  if (!Array.isArray(list)) return [];
   const seen = new Set();
   const out = [];
   for (const v of list) {

@@ -157,6 +157,53 @@ def _valid_shape(doc):
                 return False
             if n.get("decision") not in ("pending", "pass", "reject", "review"):
                 return False
+    # 审阅通知与升级中心（可为空）：轻量结构校验，对账 / 幂等在浏览器纯函数里
+    if not _valid_notify_shape(doc):
+        return False
+    return True
+
+
+def _valid_notify_shape(doc):
+    events = doc.get("notifyEvents", [])
+    if not isinstance(events, list):
+        return False
+    for e in events:
+        if not isinstance(e, dict) or not isinstance(e.get("id"), str) or not isinstance(e.get("sessionId"), str):
+            return False
+        if e.get("type") not in (
+            "decision", "signature", "node-confirmed", "conflict", "conflict-resolved",
+            "session-completed", "session-reopened",
+        ):
+            return False
+    rules = doc.get("notifyRules", [])
+    if not isinstance(rules, list):
+        return False
+    for rr in rules:
+        if not isinstance(rr, dict) or not isinstance(rr.get("id"), str) or not isinstance(rr.get("sessionId"), str):
+            return False
+        if not isinstance(rr.get("rev"), int) or isinstance(rr.get("rev"), bool):
+            return False
+        if not isinstance(rr.get("levels"), list):
+            return False
+    items = doc.get("notifications", [])
+    if not isinstance(items, list):
+        return False
+    for n in items:
+        if not isinstance(n, dict) or not isinstance(n.get("id"), str) or not isinstance(n.get("ruleId"), str):
+            return False
+        if not isinstance(n.get("eventId"), str) or not isinstance(n.get("recipient"), str):
+            return False
+        if n.get("status") not in (
+            "scheduled", "pending", "sent", "delivered", "acknowledged",
+            "snoozed", "transferred", "failed", "cancelled",
+        ):
+            return False
+    outbox = doc.get("notifyOutbox", [])
+    if not isinstance(outbox, list):
+        return False
+    for o in outbox:
+        if not isinstance(o, dict) or not isinstance(o.get("id"), str) or not isinstance(o.get("notifyId"), str):
+            return False
     return True
 
 
@@ -481,6 +528,173 @@ def _merge_review_sessions(server_list, client_list):
     return [by_id[i] for i in order]
 
 
+def _notify_event_sort(e):
+    rank = {
+        "session-reopened": 0, "session-completed": 1, "conflict": 2,
+        "conflict-resolved": 3, "decision": 4, "signature": 5, "node-confirmed": 6,
+    }.get(e.get("type"), 9)
+    return (int(e.get("at") or 0), rank, e.get("id") or "")
+
+
+def _merge_notify_events(server_list, client_list):
+    """通知事件 append-only，按 id 并集。"""
+    by_id = {}
+    for e in list(server_list or []) + list(client_list or []):
+        if isinstance(e, dict) and isinstance(e.get("id"), str):
+            by_id.setdefault(e["id"], e)
+    return sorted(by_id.values(), key=_notify_event_sort)
+
+
+def _merge_notify_rules(server_list, client_list):
+    """规则按 id 并集；rev / 墓碑 deleteRev 更大者整体胜出，旧副本不能复活删除。"""
+    by_id, order = {}, []
+    for r in list(server_list or []) + list(client_list or []):
+        if not isinstance(r, dict) or not isinstance(r.get("id"), str):
+            continue
+        rid = r["id"]
+        if rid not in by_id:
+            by_id[rid] = r
+            order.append(rid)
+            continue
+        ex = by_id[rid]
+        ex_rev = max(int(ex.get("rev") or 0), int(ex.get("deleteRev") or 0) if ex.get("deleteRev") else 0)
+        new_rev = max(int(r.get("rev") or 0), int(r.get("deleteRev") or 0) if r.get("deleteRev") else 0)
+        if new_rev > ex_rev:
+            by_id[rid] = r
+    out = [by_id[i] for i in order]
+    out.sort(key=lambda r: (int(r.get("createdAt") or 0), r.get("id") or ""))
+    return out
+
+
+def _item_rank(n):
+    return {
+        "scheduled": 0, "cancelled": 1, "pending": 2, "snoozed": 2, "failed": 2,
+        "sent": 3, "delivered": 4, "transferred": 5, "acknowledged": 6,
+    }.get(n.get("status"), 0)
+
+
+def _merge_notifications(server_list, client_list):
+    """通知项按 id 并集；走得更远的状态胜出，操作历史按 (at,action,detail) 并集，attempts 取大。"""
+    by_id = {}
+    for n in list(server_list or []) + list(client_list or []):
+        if not isinstance(n, dict) or not isinstance(n.get("id"), str):
+            continue
+        nid = n["id"]
+        ex = by_id.get(nid)
+        if ex is None:
+            by_id[nid] = n
+            continue
+        win = n if _item_rank(n) > _item_rank(ex) else ex
+        merged = dict(ex)
+        merged.update(win)
+        try:
+            merged["attempts"] = max(int(ex.get("attempts") or 0), int(n.get("attempts") or 0))
+        except (TypeError, ValueError):
+            merged["attempts"] = ex.get("attempts", 0)
+        hist = {}
+        for h in list(ex.get("history") or []) + list(n.get("history") or []):
+            if isinstance(h, dict):
+                hist[f'{h.get("at")}|{h.get("action")}|{h.get("detail") or ""}'] = h
+        merged["history"] = sorted(hist.values(), key=lambda h: (int(h.get("at") or 0), str(h.get("action"))))
+        by_id[nid] = merged
+    out = list(by_id.values())
+    out.sort(key=lambda n: (int(n.get("dueAt") or 0), int(n.get("eventAt") or 0), int(n.get("level") or 0), n.get("id") or ""))
+    return out
+
+
+def _merge_outbox(server_list, client_list):
+    """发送队列按 notifyId 并集：入队时间取早、attempts 取大、下次尝试取早，保持 FIFO。"""
+    by_notify = {}
+    for o in list(server_list or []) + list(client_list or []):
+        if not isinstance(o, dict) or not isinstance(o.get("notifyId"), str):
+            continue
+        nid = o["notifyId"]
+        ex = by_notify.get(nid)
+        if ex is None:
+            by_notify[nid] = o
+            continue
+        merged = dict(ex)
+        merged.update(o)
+        try:
+            merged["attempts"] = max(int(ex.get("attempts") or 0), int(o.get("attempts") or 0))
+        except (TypeError, ValueError):
+            pass
+        t1, t2 = ex.get("enqueuedAt"), o.get("enqueuedAt")
+        if isinstance(t1, (int, float)) and isinstance(t2, (int, float)):
+            merged["enqueuedAt"] = min(t1, t2)
+        nxt = [x for x in (ex.get("nextAttemptAt"), o.get("nextAttemptAt")) if isinstance(x, (int, float))]
+        merged["nextAttemptAt"] = min(nxt) if nxt else (ex.get("nextAttemptAt") if ex.get("nextAttemptAt") is not None else o.get("nextAttemptAt"))
+        by_notify[nid] = merged
+    out = list(by_notify.values())
+    out.sort(key=lambda o: (int(o.get("enqueuedAt") or 0), o.get("id") or ""))
+    return out
+
+
+def _assess_notify_conflict(cur, doc):
+    """
+    通知中心乐观并发（与 web/js/geom/notifications.js assessServerNotifyConflict 同构）。
+    - 规则被另一窗口前进 / 删除 -> notify-rule-advanced；引用会话缺失 -> notify-session-missing；
+    - 通知项被另一窗口处理（状态 / 确认时间变化）-> notify-item-advanced；
+    - 追加事件引用不存在的会话 -> notify-event-orphan。
+    """
+    base_rule_revs = doc.get("baseNotifyRuleRevs")
+    base_item_revs = doc.get("baseNotifyItemRevs")
+    if not isinstance(base_rule_revs, dict) and not isinstance(base_item_revs, dict):
+        return None
+    if not isinstance(cur, dict):
+        cur = {}
+    sessions = {s.get("id") for s in cur.get("reviewSessions", []) if isinstance(s, dict)}
+    server_rules = {r.get("id"): r for r in cur.get("notifyRules", []) if isinstance(r, dict)}
+    server_items = {n.get("id"): n for n in cur.get("notifications", []) if isinstance(n, dict)}
+
+    if isinstance(base_rule_revs, dict):
+        for r in doc.get("notifyRules", []) or []:
+            if not isinstance(r, dict) or not isinstance(r.get("id"), str):
+                continue
+            if r.get("sessionId") not in sessions:
+                return {"reason": "notify-session-missing", "ruleId": r.get("id"), "sessionId": r.get("sessionId")}
+            base = base_rule_revs.get(r.get("id"))
+            if not isinstance(base, int) or isinstance(base, bool):
+                continue
+            try:
+                client_rev = max(int(r.get("rev") or 0), int(r.get("deleteRev") or 0))
+            except (TypeError, ValueError):
+                continue
+            if client_rev <= base:
+                continue
+            srv = server_rules.get(r.get("id"))
+            srv_rev = 0
+            if srv:
+                srv_rev = max(int(srv.get("rev") or 0), int(srv.get("deleteRev") or 0) if srv.get("deleteRev") else 0)
+            if srv_rev != base:
+                return {"reason": "notify-rule-advanced", "ruleId": r.get("id"), "serverRev": srv_rev, "rule": srv}
+
+    if isinstance(base_item_revs, dict):
+        for n in doc.get("notifications", []) or []:
+            if not isinstance(n, dict) or not isinstance(n.get("id"), str):
+                continue
+            base = base_item_revs.get(n.get("id"))
+            if not isinstance(base, dict):
+                continue
+            srv = server_items.get(n.get("id"))
+            if srv is None:
+                if base.get("status") != "absent":
+                    return {"reason": "notify-item-missing", "notifyId": n.get("id")}
+                continue
+            if srv.get("status") != base.get("status") or (srv.get("ackedAt") or None) != (base.get("ackedAt") or None):
+                return {"reason": "notify-item-advanced", "notifyId": n.get("id"), "serverStatus": srv.get("status"), "item": srv}
+
+    server_events = {e.get("id") for e in cur.get("notifyEvents", []) if isinstance(e, dict)}
+    for e in doc.get("notifyEvents", []) or []:
+        if not isinstance(e, dict) or not isinstance(e.get("id"), str):
+            continue
+        if e.get("id") in server_events:
+            continue
+        if e.get("sessionId") not in sessions:
+            return {"reason": "notify-event-orphan", "eventId": e.get("id"), "sessionId": e.get("sessionId")}
+    return None
+
+
 def _merge_docs(server_doc, client_doc):
     """跨分支并发合流。与 web/js/geom/audit.js mergeDocs 同构。"""
     evs = {e["id"]: e for e in server_doc.get("events", []) if isinstance(e, dict)}
@@ -506,6 +720,12 @@ def _merge_docs(server_doc, client_doc):
     experiments = _merge_experiments(server_doc.get("experiments", []), client_doc.get("experiments", []))
     review_sessions = _merge_review_sessions(server_doc.get("reviewSessions", []), client_doc.get("reviewSessions", []))
 
+    # 通知中心：事件 append-only 并集；规则按 rev/墓碑；通知项远端状态胜出 + 历史并集；队列 FIFO 并集
+    notify_events = _merge_notify_events(server_doc.get("notifyEvents", []), client_doc.get("notifyEvents", []))
+    notify_rules = _merge_notify_rules(server_doc.get("notifyRules", []), client_doc.get("notifyRules", []))
+    notifications = _merge_notifications(server_doc.get("notifications", []), client_doc.get("notifications", []))
+    notify_outbox = _merge_outbox(server_doc.get("notifyOutbox", []), client_doc.get("notifyOutbox", []))
+
     merged = dict(server_doc)
     merged.update({
         "events": list(evs.values()),
@@ -513,6 +733,10 @@ def _merge_docs(server_doc, client_doc):
         "versions": list(vs.values()),
         "experiments": experiments,
         "reviewSessions": review_sessions,
+        "notifyEvents": notify_events,
+        "notifyRules": notify_rules,
+        "notifications": notifications,
+        "notifyOutbox": notify_outbox,
         "activeReviewId": server_doc.get("activeReviewId")
             or (client_doc.get("activeReviewId") if any(s.get("id") == client_doc.get("activeReviewId") for s in review_sessions) else None),
         "currentVersionId": server_doc.get("currentVersionId"),
@@ -599,6 +823,11 @@ class Handler(BaseHTTPRequestHandler):
             if review_conflict:
                 self._send_json(409, {"error": "review-conflict", "rev": cur_rev, **review_conflict})
                 return
+            # 通知中心乐观并发：规则被前进 / 删除、通知项被另一窗口处理 → 409（本地未提交操作保留）
+            notify_conflict = _assess_notify_conflict(cur, doc)
+            if notify_conflict:
+                self._send_json(409, {"error": "notify-conflict", "rev": cur_rev, **notify_conflict})
+                return
             if doc["baseRev"] != cur_rev:
                 # 文档已被其他页面前进：先判断是否可以按分支合流
                 mergeable, info = _assess_conflict(cur, doc)
@@ -614,6 +843,8 @@ class Handler(BaseHTTPRequestHandler):
                     merged.pop("baseRev", None)
                     merged.pop("baseHeads", None)
                     merged.pop("baseReviewRevs", None)
+                    merged.pop("baseNotifyRuleRevs", None)
+                    merged.pop("baseNotifyItemRevs", None)
                     merged["rev"] = cur_rev + 1
                     _save_doc(merged)
                     self._send_json(200, {"ok": True, "rev": merged["rev"], "merged": True, "doc": merged})
@@ -622,6 +853,8 @@ class Handler(BaseHTTPRequestHandler):
                 doc.pop("baseRev", None)
                 doc.pop("baseHeads", None)
                 doc.pop("baseReviewRevs", None)
+                doc.pop("baseNotifyRuleRevs", None)
+                doc.pop("baseNotifyItemRevs", None)
                 doc["rev"] = 1
                 _save_doc(doc)
                 self._send_json(200, {"ok": True, "rev": 1})
@@ -634,6 +867,8 @@ class Handler(BaseHTTPRequestHandler):
             doc.pop("baseRev", None)
             doc.pop("baseHeads", None)
             doc.pop("baseReviewRevs", None)
+            doc.pop("baseNotifyRuleRevs", None)
+            doc.pop("baseNotifyItemRevs", None)
             doc["rev"] = cur_rev + 1
             _save_doc(doc)
             self._send_json(200, {"ok": True, "rev": doc["rev"], "entries": len(doc.get("events", [])), "events": len(doc.get("events", []))})

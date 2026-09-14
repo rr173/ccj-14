@@ -5,6 +5,7 @@ import { VersionPanel } from './geom/versionpanel.js';
 import { AuditPanel } from './geom/auditpanel.js';
 import { ExperimentPanel } from './geom/experimentpanel.js';
 import { WorkbenchPanel } from './geom/workbenchpanel.js';
+import { NotifyPanel } from './geom/notifypanel.js';
 import {
   newRect, newSnap, newMinGap, newContain, newLock,
 } from './geom/model.js';
@@ -61,6 +62,10 @@ const versionPanel = new VersionPanel(store, { toast });
 const auditPanel = new AuditPanel(store, { toast });
 const experimentPanel = new ExperimentPanel(store, { toast });
 const workbenchPanel = new WorkbenchPanel(store, { toast });
+const notifyPanel = new NotifyPanel(store, { toast });
+
+// 浏览器网络恢复：按 FIFO 原顺序重发通知队列（稳定 id，不重复）
+window.addEventListener('online', () => store.notifyOnline());
 
 let activeTab = 'constraints';
 
