@@ -118,6 +118,48 @@ export function makeExperimentForkRootEvent(newBranchId, variantResult, exp, { a
   });
 }
 
+/* ---------------- 旧版布局批量迁移 fork-root ---------------- */
+
+/**
+ * 由迁移结果构造 fork-root 事件：内容为迁移后模型的只读快照（同指纹），
+ * 带 migration 来源 provenance。为保证“相同源文件重复导入不产生重复布局”，
+ * 事件 id 与分支 id 由【源文件内容指纹】确定性派生：
+ * 同一源内容在任何批次 / 任何页面导入都指向同一个分支 root。
+ * 原分支与任何审计事件都不被改写。
+ */
+export function migrationBranchId(sourceFileHash) {
+  return `b_mig_${sourceFileHash}`;
+}
+
+export function makeMigrationForkRootEvent(result, meta, { actor, t = Date.now() }) {
+  const m = normalize(result.model);
+  const report = result.report;
+  return freeze({
+    id: `e_mig_${meta.sourceFileHash}`,
+    branch: migrationBranchId(meta.sourceFileHash),
+    parentId: null, kind: 'fork-root', seq: 1, t,
+    actor: String(actor || '未署名'),
+    label: `旧版布局迁移：${result.name || meta.fileName || meta.sourceFileHash.slice(0, 8)}`,
+    model: structuredClone(m),
+    report: structuredClone(report),
+    hash: result.hash,
+    hashBefore: result.hash,
+    changes: null,
+    conflicts: structuredClone(report.conflicts || []),
+    provenance: {
+      kind: 'migration',
+      migrationBatchId: meta.batchId,
+      batchName: meta.batchName || '',
+      fileId: meta.fileId,
+      fileName: meta.fileName,
+      sourceFileHash: meta.sourceFileHash,
+      sourceFormat: meta.sourceFormat || null,
+      mapping: structuredClone(result.mapping || { rects: [], constraints: [], branches: [], versions: [] }),
+      quarantinedCount: Array.isArray(result.quarantined) ? result.quarantined.length : 0,
+    },
+  });
+}
+
 /* ---------------- 时间线浏览 ---------------- */
 
 /** 事件在其所属分支链上的本地序号（从根 1 起）。 */
@@ -288,7 +330,17 @@ export function sanitizeAudit(doc) {
       rootEventId: root.id,
       headEventId: headId,
       redoTipId,
-      source: root.provenance ? { branchId: root.provenance.branchId, eventId: root.provenance.eventId } : null,
+      source: root.provenance
+        ? (root.provenance.kind === 'migration'
+          ? {
+              kind: 'migration',
+              branchId: null,
+              eventId: null,
+              migrationBatchId: root.provenance.migrationBatchId,
+              sourceFileHash: root.provenance.sourceFileHash,
+            }
+          : { branchId: root.provenance.branchId, eventId: root.provenance.eventId })
+        : null,
       ...(root.provenance?.kind === 'experiment'
         ? { experimentSource: { experimentId: root.provenance.experimentId, variantId: root.provenance.variantId } }
         : (b0.experimentSource && typeof b0.experimentSource === 'object'
@@ -508,9 +560,12 @@ export function assessConflict(serverDoc, clientDoc) {
   const baseHeads = clientDoc.baseHeads || {};
   const serverBranch = sb.get(cur);
   if (!serverBranch) {
-    // 客户端新建的分支：fork-root 在客户端事件里；其 provenance 来源事件须已在服务端
+    // 客户端新建的分支：fork-root 在客户端事件里
     const nb = (clientDoc.branches || []).find((b) => b.id === cur);
     const root = (clientDoc.events || []).find((e) => e.id === nb?.rootEventId);
+    // 旧版迁移导入的分支：fork-root 是自包含快照（无来源事件），root 在本次提交里即可
+    if (nb && root?.provenance?.kind === 'migration' && root.id === nb.rootEventId) return { mergeable: true };
+    // 其余 fork：其 provenance 来源事件须已在服务端
     const srcId = root?.provenance?.eventId;
     if (nb && srcId && byId.has(srcId)) return { mergeable: true };
     return { mergeable: false, reason: 'branch-missing' };

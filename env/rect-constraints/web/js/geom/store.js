@@ -23,6 +23,7 @@ import { validate, normalize, seedModel, uid } from './model.js';
 import { snapshotVersion, compareVersions } from './versions.js';
 import {
   MAIN_BRANCH, makeRootEvent, makeEvent, makeForkRootEvent, makeExperimentForkRootEvent,
+  makeMigrationForkRootEvent, migrationBranchId,
   sanitizeAudit, migrateLegacy, timelineFor, localSeqOf, isAncestor,
   mergeDocs, assessConflict, freeze,
 } from './audit.js';
@@ -58,6 +59,11 @@ import {
   sanitizeReleases, mergeReleases, assessServerReleaseConflict,
   assessReleaseStaleAgainstDoc, frozenGateBlocked, buildReleaseReport,
 } from './releases.js';
+import {
+  ingestFile, makeBatch, executeFile, reconcileBatchState, batchCounters,
+  cancelBatchState, sanitizeMigrations, mergeMigrations,
+  migrationDiff, buildMigrationReport, sourceFingerprint,
+} from './migration.js';
 
 const LS_KEY = 'rect-constraints-doc-v2';
 const LS_KEY_LEGACY = 'rect-constraints-doc-v1';
@@ -95,6 +101,11 @@ export class Store extends EventTarget {
     this.experiments = [];
     this.experimentWarnings = [];
     this._runners = new Map();   // experimentId -> {token}（进行中的批量运行）
+
+    // 旧版布局批量迁移
+    this.migrations = [];                 // 迁移批次（含每文件预览/终态结果/原始输入/导入记录）
+    this.migrationWarnings = [];
+    this._migrationRunners = new Map();   // batchId -> {token}（进行中的批次运行器）
 
     // 审阅通知与升级中心
     this.notifyEvents = [];        // append-only 通知事件（决定/签署/冲突/完成），按 id 幂等并集
@@ -163,7 +174,10 @@ export class Store extends EventTarget {
     }
     // 重启后把可能已到期 / 待发送的通知队列按序发送一次
     this.flushOutbox().catch(() => {});
-    this._emit('load');
+    // 服务中断恢复：刷新/重启时仍在运行的迁移批次已被清洗为“已暂停（running 语义）”，
+    // 从已完成文件之后自动续跑（排队项不重跑、完成项不覆盖）；用户显式暂停的批次保持暂停。
+    this._resumeInterruptedMigrations();
+    this._emit('load');;
   }
 
   /** 把一个（可能是旧版、可能损坏的）文档装载为当前状态。 */
@@ -237,6 +251,11 @@ export class Store extends EventTarget {
     this.experimentWarnings = [];
     this.experiments = sanitizeExperiments(doc.experiments, this.experimentWarnings);
     this._runners = new Map();
+
+    // 旧版布局批量迁移：结构/指纹清洗；running 文件回排队、批次收敛为已暂停（完成项不丢、顺序不变）
+    this.migrationWarnings = [];
+    this.migrations = sanitizeMigrations(doc.migrations, this.migrationWarnings);
+    this._migrationRunners = new Map();
 
     this.replayEventId = null;
     this.replaySnapshot = null;
@@ -447,6 +466,7 @@ export class Store extends EventTarget {
       compare: this.compare,
       branchCompare: this.branchCompare,
       experiments: this.experiments,
+      migrations: this.migrations,
       auditWorkbench: this.auditWorkbench,
       reviewSessions: this.reviewSessions,
       activeReviewId: this.activeReviewId,
@@ -509,6 +529,10 @@ export class Store extends EventTarget {
       const finalDoc = merged || { ...payload, rev: this.rev };
       // 实验按 id 合入磁盘（别的页签可能建了实验；完成结果永不被降级覆盖）
       finalDoc.experiments = mergeExperiments(prevExperiments || finalDoc.experiments || [], payload.experiments);
+      // 迁移批次按 id 合入磁盘（同批次文件按 id 合并，done/导入记录不被降级覆盖）
+      finalDoc.migrations = mergeMigrations(
+        Array.isArray(prev?.migrations) ? prev.migrations : (finalDoc.migrations || []),
+        payload.migrations || []);
       // 审阅会话按 id 合入磁盘（rev 更大者胜出；冲突记录并集）
       finalDoc.reviewSessions = mergeReviewSessions(
         Array.isArray(prev?.reviewSessions) ? prev.reviewSessions : (finalDoc.reviewSessions || []),
@@ -2833,6 +2857,348 @@ export class Store extends EventTarget {
 
   experimentById(id) { return this.experiments.find((x) => x.id === id) || null; }
 
+  /* ==================== 旧版布局批量迁移 ==================== */
+
+  migrationById(id) { return this.migrations.find((x) => x.id === id) || null; }
+
+  /**
+   * 导入前预览：解析 + 识别 + dry-run 转换（不建批次、不落盘）。
+   * 入参 files:[{name, text}]；返回逐文件 ingest 草稿（含 preview）。
+   * 相同内容（sourceHash）的多份文件在返回里标注 duplicateOf。
+   */
+  previewMigrations(files) {
+    const out = [];
+    const seen = new Map();
+    for (const f of Array.isArray(files) ? files : []) {
+      const draft = ingestFile(f.text, { name: f.name, size: f.size });
+      if (seen.has(draft.sourceHash)) draft.duplicateOf = seen.get(draft.sourceHash);
+      else seen.set(draft.sourceHash, draft.id);
+      out.push(draft);
+    }
+    return out;
+  }
+
+  /**
+   * 创建迁移批次（已含每文件 dry-run 预览），创建即排队并自动开始正式迁移。
+   * 幂等：
+   *  - 批次内相同 sourceHash 只保留第一份（其余记入 skippedDuplicates）；
+   *  - 跨批次重复提交相同源文件：已成功迁移（或已导入）的文件直接引用既有结果，
+   *    不会重复转换、不会产生重复分支（导入时分支 id 由内容指纹确定）。
+   */
+  createMigrationBatch(rawFiles, { name = '', autoImport = false } = {}) {
+    if (this.saveConflict) return { ok: false, error: '版本冲突未解决，请先重新加载' };
+    if (!Array.isArray(rawFiles) || !rawFiles.length) return { ok: false, error: '请先选择至少一份布局文件' };
+    if (rawFiles.length > 200) return { ok: false, error: '单批次最多 200 份文件' };
+
+    // 跨批次：按 sourceHash 找已成功迁移的文件（幂等引用，不重复转换）
+    const priorByHash = new Map();
+    for (const b of this.migrations) {
+      for (const f of b.files) {
+        if (f.sourceHash && (f.status === 'done') && f.result) priorByHash.set(f.sourceHash, { batchId: b.id, file: f });
+      }
+    }
+    const ingested = [];
+    const reused = [];
+    const skippedDuplicates = [];
+    const seen = new Map();
+    for (const rf of rawFiles) {
+      const draft = ingestFile(rf.text, { name: rf.name, size: rf.size });
+      // 批次内完全相同的源文件：只保留第一份，其余记入 skippedDuplicates（不产生重复布局）
+      if (seen.has(draft.sourceHash)) {
+        skippedDuplicates.push({ name: draft.name, sourceHash: draft.sourceHash, duplicateOf: seen.get(draft.sourceHash) });
+        continue;
+      }
+      seen.set(draft.sourceHash, draft.id);
+      const prior = priorByHash.get(draft.sourceHash);
+      if (prior) {
+        draft.status = 'done';
+        draft.detected = prior.file.detected;
+        draft.confidence = prior.file.confidence;
+        draft.result = prior.file.result;
+        draft.startedAt = draft.finishedAt = Date.now();
+        draft.reusedFrom = { batchId: prior.batchId, fileId: prior.file.id };
+        reused.push({ name: draft.name, sourceHash: draft.sourceHash, batchId: prior.batchId });
+      }
+      ingested.push(draft);
+    }
+    if (!ingested.length) return { ok: false, error: '所有文件都与批次内其他文件完全相同（重复源）' };
+
+    const t = Date.now();
+    const batch = makeBatch({
+      name: name.trim() || `迁移批次 ${new Date(t).toLocaleString()}`,
+      actor: this.actor || '未署名',
+      files: ingested, autoImport, t,
+    });
+    if (skippedDuplicates.length) batch.skippedDuplicates = skippedDuplicates;
+    // 复用的成功文件不计入 importedCount；其余排队
+    batch.runState = reused.length === ingested.length ? 'done' : 'running';
+    this.migrations = [...this.migrations, batch];
+    this._dirty = true;
+    this.persist();
+    this._emit('migrations', { type: 'create', id: batch.id, reused });
+    if (reused.length) this._emit('migrations', { type: 'idempotent', id: batch.id, reused });
+    if (batch.runState === 'running') this._startMigrationRunner(batch.id);
+    else if (autoImport) this._autoImportReady(batch);
+    return { ok: true, batch, reused };
+  }
+
+  /** 重试一个失败文件（保留原始输入，重新走转换管线；成功终态不被覆盖）。 */
+  retryMigrationFile(batchId, fileId) {
+    const batch = this.migrationById(batchId);
+    if (!batch) return { ok: false, error: '迁移批次不存在' };
+    const f = batch.files.find((x) => x.id === fileId);
+    if (!f) return { ok: false, error: '文件不在批次中' };
+    if (f.status !== 'failed') return { ok: false, error: '只有失败文件可以重试' };
+    f.status = 'queued';
+    f.error = null;
+    batch.runState = 'running';
+    this._bumpMigration(batch);
+    this._startMigrationRunner(batch.id);
+    return { ok: true };
+  }
+
+  /** 正式迁移运行器：按 files 顺序逐文件转换；文件之间让出事件循环以响应暂停/继续/取消。 */
+  async _startMigrationRunner(batchId) {
+    const cur = this._migrationRunners.get(batchId);
+    const batch0 = this.migrationById(batchId);
+    if (cur && batch0 && batch0.runState === 'running') return;
+    const token = {};
+    this._migrationRunners.set(batchId, { token });
+    try {
+      await this._runMigrationQueue(batchId, token);
+    } finally {
+      if (this._migrationRunners.get(batchId)?.token === token) this._migrationRunners.delete(batchId);
+    }
+  }
+
+  async _runMigrationQueue(batchId, token) {
+    for (;;) {
+      const batch = this.migrationById(batchId);
+      if (!batch || token.cancelled) return;
+      if (batch.runState !== 'running') return;
+      const f = batch.files.find((x) => x.status === 'queued');
+      if (!f) {
+        batch.runState = 'done';
+        this._bumpMigration(batch);
+        if (batch.autoImport) this._autoImportReady(batch);
+        return;
+      }
+      await this._migrationTick();
+      let b2 = this.migrationById(batchId);
+      if (!b2 || token.cancelled || this._migrationRunners.get(batchId)?.token !== token || b2.runState !== 'running') return;
+      if (this.onMigrationGate) await this.onMigrationGate(batchId, b2.files.indexOf(f));
+      // gate 返回后不再因“暂停”退出：与实验运行器同语义——文件之间让出，
+      // 已开始（已通过 gate）的当前文件正常收尾；仅取消（token / cancelling）立即中止。
+      b2 = this.migrationById(batchId);
+      if (!b2 || token.cancelled || this._migrationRunners.get(batchId)?.token !== token) return;
+      if (b2.runState === 'cancelled' || b2.files.some((x) => x.status === 'cancelled' && x.id === f.id)) return;
+      const outcome = executeFile(b2, f.id, { now: Date.now() });
+      if (!outcome.skipped) this._bumpMigration(b2);
+      if (b2.autoImport && f.status === 'done' && !f.imported && !f.reusedFrom) {
+        // autoImport 在批次结束时统一处理（避免部分导入时打断顺序）；此处不动作
+      }
+    }
+  }
+
+  _migrationTick() { return new Promise((r) => setTimeout(r, this.tickMs)); }
+
+  _bumpMigration(batch, { emit = true } = {}) {
+    batch.updatedAt = Date.now();
+    this._dirty = true;
+    this.persist();
+    if (emit) this._emit('migrations', { type: 'progress', id: batch.id });
+  }
+
+  pauseMigration(batchId) {
+    const batch = this.migrationById(batchId);
+    if (!batch) return { ok: false, error: '迁移批次不存在' };
+    if (!['queued', 'running'].includes(batch.runState)) return { ok: false, error: '该批次已结束，不能暂停' };
+    batch.runState = 'paused'; // 运行器在下一拍（文件之间）让出；正在转换的当前文件正常收尾
+    this._bumpMigration(batch);
+    return { ok: true };
+  }
+
+  resumeMigration(batchId) {
+    const batch = this.migrationById(batchId);
+    if (!batch) return { ok: false, error: '迁移批次不存在' };
+    if (!['paused', 'queued'].includes(batch.runState)) return { ok: false, error: '该批次不在暂停/排队状态' };
+    if (!batch.files.some((f) => f.status === 'queued')) return { ok: false, error: '没有排队中的文件' };
+    batch.runState = 'running';
+    this._dirty = true;
+    this.persist();
+    this._emit('migrations', { type: 'resume', id: batch.id });
+    this._startMigrationRunner(batch.id);
+    return { ok: true };
+  }
+
+  cancelMigration(batchId) {
+    const batch = this.migrationById(batchId);
+    if (!batch) return { ok: false, error: '迁移批次不存在' };
+    if (['done', 'cancelled'].includes(batch.runState)) return { ok: false, error: '该批次已结束' };
+    const r = this._migrationRunners.get(batchId);
+    if (r) r.token.cancelled = true;
+    cancelBatchState(batch);
+    this._bumpMigration(batch);
+    return { ok: true };
+  }
+
+  migrationCounters(batch) { return batchCounters(batch); }
+
+  /**
+   * 把一份迁移成功的文件导入为新的编辑分支：
+   * - 分支/root 事件 id 由【源文件内容指纹】确定性派生：相同源文件重复提交/重复导入
+   *   永远得到同一个分支，绝不产生重复布局；
+   * - 约束引用已在转换时重写到稳定重命名后的矩形，导入后仍指向正确对象；
+   * - 记录相对导入时分叉点（当前编辑分支 head）的差异摘要。
+   */
+  importMigrationFile(batchId, fileId, { name = null, switchTo = true } = {}) {
+    const batch = this.migrationById(batchId);
+    if (!batch) return { ok: false, error: '迁移批次不存在' };
+    const f = batch.files.find((x) => x.id === fileId);
+    if (!f) return { ok: false, error: '文件不在批次中' };
+    if (f.status !== 'done' || !f.result) return { ok: false, error: '该文件未成功迁移，无法导入' };
+
+    const bid = migrationBranchId(f.sourceHash);
+    const existing = this.branches.find((b) => b.id === bid);
+    if (existing) {
+      // 幂等：相同源内容已导入过 —— 不新建分支/事件，仅回填导入记录
+      const rootEvent = this.eventsById.get(existing.rootEventId);
+      f.imported = {
+        at: Date.now(), by: this.actor || '未署名',
+        branchId: bid, branchName: existing.name, eventId: existing.rootEventId,
+        diff: f.imported?.diff || this._migrationImportDiff(f), idempotent: true,
+      };
+      if (switchTo) this._switchToMigrationBranch(bid);
+      batch.importedCount = batch.files.filter((x) => x.imported).length;
+      this._dirty = true;
+      this.persist();
+      this._emit('migrations', { type: 'import-idempotent', id: batch.id, fileId, branchId: bid });
+      return { ok: true, idempotent: true, branch: existing, event: rootEvent };
+    }
+
+    const baseName = name || f.result.name || f.name.replace(/\.[^.]+$/, '') || '迁移布局';
+    const branchName = this._uniqueBranchName(baseName);
+    const root = makeMigrationForkRootEvent(f.result, {
+      batchId: batch.id, batchName: batch.name,
+      fileId: f.id, fileName: f.name,
+      sourceFileHash: f.sourceHash, sourceFormat: f.detected,
+    }, { actor: this.actor || '未署名' });
+    this.events = [...this.events, root];
+    this.eventsById.set(root.id, root);
+    const branch = freeze({
+      id: bid, name: branchName, createdAt: root.t,
+      rootEventId: root.id, headEventId: root.id, redoTipId: null,
+      source: {
+        kind: 'migration', branchId: null, eventId: null,
+        migrationBatchId: batch.id, sourceFileHash: f.sourceHash,
+      },
+    });
+    this.branches = [...this.branches, branch];
+    this._syncedHeads[bid] = root.id;
+    const diff = this._migrationImportDiff(f);
+    f.imported = {
+      at: Date.now(), by: this.actor || '未署名',
+      branchId: bid, branchName, eventId: root.id, diff, idempotent: false,
+    };
+    batch.importedCount = batch.files.filter((x) => x.imported).length;
+    if (switchTo) this._switchToMigrationBranch(bid);
+    this._dirty = true;
+    this.persist();
+    this._emit('migrations', { type: 'import', id: batch.id, fileId, branchId: bid });
+    this._emit('branch', { type: 'fork', id: bid, fromMigration: true });
+    this._emit('change', { label: 'migration-import' });
+    return { ok: true, idempotent: false, branch, event: root, diff };
+  }
+
+  _switchToMigrationBranch(bid) {
+    if (this.currentBranchId !== bid) {
+      this.currentBranchId = bid;
+      this.replayEventId = null;
+      this.replaySnapshot = null;
+    }
+  }
+
+  /** 导入差异：迁移结果相对“导入时当前编辑分支 head”的 compareVersions 差异摘要。 */
+  _migrationImportDiff(f) {
+    const head = this.headEvent;
+    const target = head && head.model && head.report
+      ? { model: head.model, report: head.report, hash: head.hash }
+      : { model: { rects: [], constraints: [] }, report: { conflicts: [] }, hash: '' };
+    try {
+      return migrationDiff(target, f.result);
+    } catch {
+      return null;
+    }
+  }
+
+  _uniqueBranchName(base) {
+    let name = String(base || '迁移布局').slice(0, 40);
+    if (!this.branches.some((b) => b.name === name)) return name;
+    let n = 2;
+    while (this.branches.some((b) => b.name === `${name} ${n}`)) n++;
+    return `${name} ${n}`;
+  }
+
+  /** 批次自动导入：所有成功且未导入的文件逐个导入为新分支（失败文件保留不动）。 */
+  _autoImportReady(batch) {
+    for (const f of batch.files) {
+      if (f.status === 'done' && f.result) {
+        // 已导入过（幂等分支已存在）也回填记录；不重复建分支
+        const bid = migrationBranchId(f.sourceHash);
+        if (!this.branches.some((b) => b.id === bid)) {
+          this.importMigrationFile(batch.id, f.id, { switchTo: false });
+        } else if (!f.imported) {
+          f.imported = {
+            at: Date.now(), by: this.actor || '未署名', branchId: bid,
+            branchName: this.branches.find((b) => b.id === bid)?.name || bid,
+            eventId: this.branches.find((b) => b.id === bid)?.rootEventId,
+            diff: this._migrationImportDiff(f), idempotent: true,
+          };
+        }
+      }
+    }
+    batch.importedCount = batch.files.filter((x) => x.imported).length;
+    this._dirty = true;
+    this.persist();
+    this._emit('migrations', { type: 'auto-import', id: batch.id });
+  }
+
+  /** 迁移报告：源摘要 + 映射表 + 隔离项 + 错误 + 最终分支标识 + 校验和。 */
+  migrationReport(batchId, { generatedAt = null } = {}) {
+    const batch = this.migrationById(batchId);
+    if (!batch) return null;
+    return buildMigrationReport(batch, { generatedAt: generatedAt || Date.now(), branchesById: this.branchesById });
+  }
+
+  /**
+   * 服务中断恢复：加载时对“刷新瞬间仍在运行”（interrupted 标记）的批次自动续跑，
+   * 从第一个仍排队的文件（即已完成文件之后）继续；完成项不重跑、不覆盖。
+   * 用户主动暂停的批次不带 interrupted，保持暂停等待手动继续。
+   */
+  _resumeInterruptedMigrations() {
+    for (const batch of this.migrations) {
+      if (!batch.interrupted) continue;
+      delete batch.interrupted;
+      if (batch.files.some((f) => f.status === 'queued')) {
+        batch.runState = 'running';
+        this._startMigrationRunner(batch.id);
+        this._emit('migrations', { type: 'resume-after-interrupt', id: batch.id });
+      }
+    }
+  }
+
+  /** 测试用：等待批次所有文件收尾且运行器退出。 */
+  async migrationSettled(batchId) {    for (let i = 0; i < 100000; i++) {
+      const b = this.migrationById(batchId);
+      if (b && !b.files.some((f) => f.status === 'running' || f.status === 'queued') && !this._migrationRunners.has(batchId)) return b;
+      if (b && this._migrationRunners.has(batchId)) await this._migrationTick();
+      else await Promise.resolve();
+    }
+    throw new Error('migrationSettled 超时');
+  }
+
+  /* ==================== 布局方案实验 ==================== */
+
   /**
    * 从当前编辑分支（head，或正在回放的历史事件）建立实验并立即排队批量求解。
    * 幂等：相同来源事件 + 相同有序参数变体（名称只是标签，不参与指纹）只返回已存在的实验。
@@ -2987,6 +3353,7 @@ export class Store extends EventTarget {
   dispose() {
     this._disposed = true;
     this._runners.clear();
+    this._migrationRunners.clear();
     clearTimeout(this._saveTimer);
     if (this._notifyTimer) { clearInterval(this._notifyTimer); this._notifyTimer = null; }
     this._saveChain = Promise.resolve();

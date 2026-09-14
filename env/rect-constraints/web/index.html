@@ -71,6 +71,7 @@
         <button class="tab" data-tab="experiments">实验 <span id="exp-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="workbench" title="可回放的实验审计工作台：跨实验/变体/分支筛选、求解前后模型与冲突链、顺序回放与差异切换">审计台 <span id="wb-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="notify" title="审阅通知与升级中心：按决定/签署/冲突/完成触发的多级通知、延迟升级、确认/稍后/转交与时间线报告">通知中心 <span id="ntf-count" class="badge zero">0</span></button>
+        <button class="tab" data-tab="migration" title="旧版布局批量迁移工作台：多格式识别/逐文件预览/批次隔离执行/暂停继续取消/中断恢复/导入为新分支/迁移报告">迁移 <span id="mig-count" class="badge zero">0</span></button>
       </div>
 
       <div class="tab-body" data-body="constraints">
@@ -138,6 +139,23 @@
       <div class="tab-body hidden" data-body="workbench"></div>
 
       <div class="tab-body hidden" data-body="notify"></div>
+
+      <div class="tab-body hidden" data-body="migration">
+        <div class="mig-import">
+          <button id="btn-mig-pick" class="primary">📂 选择历史布局文件…</button>
+          <input id="mig-files" type="file" accept=".json,application/json" multiple hidden />
+          <label class="mig-auto"><input type="checkbox" id="mig-auto-import" /> 成功后自动导入为新编辑分支</label>
+          <span class="spacer"></span>
+          <button id="btn-mig-report" class="mini" disabled>⬇ 导出迁移报告</button>
+        </div>
+        <div class="note" style="margin:8px 0 10px">
+          一次导入多份历史布局：自动识别 <b>当前规范模型 / 旧审计文档(entries·idx) / 2017 boxes·links / 2015 RC-TABLES</b>，
+          逐文件给出引用映射、隔离项与未知字段预览，确认后按批次隔离执行；可暂停 / 继续 / 取消，刷新或服务中断后从已完成文件之后恢复。
+        </div>
+        <div id="mig-warnings" class="audit-warnings hidden"></div>
+        <div id="mig-preview" class="mig-preview"></div>
+        <div id="migration-list" class="list"></div>
+      </div>
     </aside>
   </main>
 </div>

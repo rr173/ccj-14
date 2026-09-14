@@ -256,6 +256,52 @@ rev 更大者整体胜出、冲突记录按 id 并集。
 结构校验还会直接拒绝无撤销原因的 revoked 载荷（422）。跨分支合流时候选按 id 并集、
 同 id 以 rev 更大者整体胜出、审批意见与历史按 id 并集。
 
+## 旧版布局批量迁移工作台（migrations）
+
+「迁移」页一次导入多份来自不同历史格式的布局数据，先**逐文件识别格式并给出迁移预览**，
+确认后按批次隔离执行；每份文件独立成功或失败，成功布局可导入为新的编辑分支。全部状态
+（批次、文件、预览、原始输入、结果、导入记录、分支标识）随文档持久化。
+
+- **支持的历史格式**（`web/js/geom/migration.js` 纯函数识别，按结构特征 + 置信度）：
+  - `current` 当前规范模型（本系统导出物 `canvas/rects/constraints`）；
+  - `legacy-doc` 2019 前旧审计文档（`entries[]/idx`，取 idx 当前布局，其余 entries 记为版本引用）；
+  - `v2017-flat` 2017 扁平交换格式（`format=rect-layout/v1|rc-v2`、`boxes[[x,y,w,h,label,id]]/links[]`）；
+  - `v2015-tables` 2015 表格式（`schema=RC-TABLES`、`rects[uid,left/top…]/rules[op,target/anchor…]`）；
+  - 无法识别（含非法 JSON，给出行列位置）的文件直接标失败、绝不混入。
+- **逐文件迁移预览**：识别格式与置信度、矩形/约束/分支/版本四类引用的**映射表**、
+  **会被隔离的数据**及原因与修复建议、**无法识别的字段**（忽略不进模型）、位置夹回调整。
+- **标识冲突的稳定重命名**：源 id 缺失 / 含非法字符 / 在同一命名空间冲突时，按
+  `<清洗后id>_migN`（N 从 2 起确定性递增）重命名；**约束引用在重写后仍指向正确对象**
+  （源 id 只解析到第一次出现的矩形，重复矩形拿到新 id 但绝不顶替原映射）。
+- **隔离保证**：悬空引用（跟随/锚点矩形不存在）、未知约束类型、非法几何、完全越界或
+  超过画布尺寸的矩形、自贴齐、非法锁定尺寸等逐条隔离；**循环依赖**用确定性 DFS 找到环后
+  隔离环上 id 最大的“回边”约束（同图永远断同一条），保证无悬空、无环、无越界数据进入当前布局。
+  部分越界矩形确定性夹回画布并记录调整；所有进入布局的数据都通过 `validate + findCycle + solve`。
+- **逐文件隔离的批次执行**：按入批顺序转换，文件之间让出事件循环；可**暂停**（正在转换的
+  当前文件正常收尾）、**继续**、**取消剩余**（排队项进入已取消终态，完成/失败结果保留不覆盖）。
+- **幂等**：
+  - 批次内相同源内容（规范化 JSON 内容指纹，键序无关）只迁移一份，其余记入 `skippedDuplicates`；
+  - 跨批次重复提交相同源文件直接复用既有成功结果，不重复转换；
+  - 成功布局导入为编辑分支时，分支 id 与 fork-root 事件 id 均由**源文件内容指纹确定性派生**
+    （`b_mig_<hash>` / `e_mig_<hash>`），相同源文件重复提交/重复导入永远得到同一分支，
+    不产生重复布局。
+- **失败文件**：保留完整原始输入、`{code,message,line,column,suggestion}` 错误位置与修复建议，
+  可在修正后重试或重新提交；成功文件只保留截断后的原始输入。
+- **服务中断恢复**：刷新/重启时仍在运行（running）的批次，其 running 文件视为“已开始未落盘”
+  回到排队、批次收敛为**已暂停**并打 `interrupted` 标记，加载后**从已完成文件之后自动续跑**
+  （完成项不重跑、顺序不变）；用户主动暂停的批次保持暂停。
+- **导入为新编辑分支**：迁移成功文件可（逐份，或建批时勾选自动）导入为新的编辑分支，
+  fork-root 是迁移后模型的只读快照（带 `provenance.kind='migration'`：批次/文件/源指纹/格式/
+  映射表/隔离计数），与结果同指纹；记录相对导入时当前分支 head 的 compareVersions 式
+  **差异摘要**（矩形增删移动/尺寸、约束增删改、冲突变化）。
+- **持久化与多窗口**：批次/文件/结果/导入记录随文档保存；跨页面按批次 id、文件 id 合流，
+  “走得更远”的文件状态（done > failed > cancelled > running > queued）胜出、完成结果与导入
+  记录不降级；服务端 `_merge_migrations` 与浏览器同构，`_assess_conflict` 接受自包含的
+  迁移 fork-root（无来源事件），加载时重算迁移结果指纹，损坏结果只标该文件失败、不牵连其他文件。
+- **迁移报告**：一键导出 JSON，含批次/每文件**源摘要**（文件名/大小/源指纹/识别格式/置信度）、
+  **映射表**、**隔离项**（原因/建议/悬空引用/环）、**错误**（位置/建议）、未知字段、
+  **最终分支标识**与差异摘要、跳过的重复源；键名递归排序保证逐字节确定，并附 FNV 校验和。
+
 ## 运行
 
 ### Docker（推荐）
@@ -286,7 +332,7 @@ DATA_PATH=./data/doc.json HOST=127.0.0.1 PORT=8080 python3 server/server.py
 ```bash
 npm test          # 单元测试（求解器 15 + 布局版本 9 + 审计/分支 14 + 布局方案实验 17
                   # + 实验审计工作台 21 + 可恢复审阅会话 35 + 通知中心 26
-                  # + 发布门禁与证据快照 20）
+                  # + 发布门禁与证据快照 20 + 旧版布局批量迁移 21）
 # 端到端（需要先启动 server）：
 DATA_PATH=/tmp/rc.json python3 server/server.py &
 npm run test:e2e  # Store ↔ HTTP：提交、环拒绝、冲突链、undo/redo、刷新一致性、
@@ -294,6 +340,7 @@ npm run test:e2e  # Store ↔ HTTP：提交、环拒绝、冲突链、undo/redo�
 npm run test:e2e:experiments   # 实验建立/批量求解/幂等/暂停继续取消/损坏容忍/另存分支（真实 HTTP）
 npm run test:e2e:reviews       # 审阅会话快照/决定持久化/多窗口 409 + 逐项合并/指纹 409/报告导出（真实 HTTP）
 npm run test:e2e:releases      # 证据快照冻结/门禁阻断/过期与重新生成/多窗口审批 409/撤销/伪造拒绝（真实 HTTP）
+npm run test:e2e:migrations    # 多格式迁移/逐文件隔离/幂等/暂停继续取消/中断恢复/导入分支/报告（真实 HTTP）
 ```
 
 ## 目录
@@ -302,32 +349,39 @@ npm run test:e2e:releases      # 证据快照冻结/门禁阻断/过期与重新
 server/server.py        零依赖 HTTP：静态文件 + /api/doc（原子持久化 + baseRev/baseHeads
                          乐观并发：同分支 head 前进 -> 409，不同分支 -> 事件/实验并集合流；
                          审阅会话 baseReviewRevs + 节点指纹/存在性/分支链校验 -> review-* 409；
-                         发布候选 baseReleaseRevs + rev/会话/门禁/撤销原因/通知状态 -> release-* 409）
+                         发布候选 baseReleaseRevs + rev/会话/门禁/撤销原因/通知状态 -> release-* 409；
+                         迁移批次按 id/文件 id 合流、完成结果不降级；自包含迁移 fork-root 可合流）
 web/index.html
 web/css/app.css
-web/js/app.js           装配：工具栏 / 面板 / 审计分支事件 / 实验面板 / 冲突与回放横幅 / 快捷键 / toast
+web/js/app.js           装配：工具栏 / 面板 / 审计分支事件 / 实验面板 / 迁移工作台 / 冲突与回放横幅 / 快捷键 / toast
 web/js/geom/solver.js   确定性求解器 + 环检测 + 指纹（核心，无 DOM 依赖）
 web/js/geom/model.js    数据模型 / 校验 / 规范化
 web/js/geom/audit.js    不可变审计事件 / 分支 / 时间线 / 回放校验 / 损坏修复 / 迁移 / 合流
-                         （含实验变体 → 编辑分支的 experiment-fork-root）
+                         （含实验变体 experiment-fork-root、旧版迁移自包含 migration-fork-root）
+web/js/geom/migration.js 旧版布局批量迁移纯函数：4 种历史格式识别/dry-run 预览/稳定重命名/悬空·循环·越界隔离/
+                         批次状态机（暂停/继续/取消/中断恢复）/幂等/清洗损坏/合流/迁移报告（无 DOM 依赖）
 web/js/geom/experiments.js 实验纯函数：变体定义/配置指纹/批量求解/失败隔离/差异/清洗损坏/合流
 web/js/geom/auditbench.js 实验审计工作台纯函数：统一节点时间线/健康标注（缺失/重复/指纹/分支推进）/筛选/步进/状态清洗/导出
 web/js/geom/reviews.js  可恢复审阅会话纯函数：创建快照/决定与变更记录/进度/对账（损坏·缺失·指纹·分支推进转待复核）/
                          刷新基线/完成重开/清洗/合流/服务端冲突判定/审阅报告（纯函数，无 DOM 依赖）
 web/js/geom/releases.js 发布门禁纯函数：证据快照冻结（会话决定签署/实验来源/通知摘要）/门禁评估/
                          过期对账（会话·实验分支·通知哈希）/批准/撤销/重新生成/清洗/合流/服务端冲突判定/发布报告
-web/js/geom/store.js    事件流+分支+实验运行器（排队/暂停/继续/取消）、审阅会话（409 提案/逐项合并）、
+web/js/geom/store.js    事件流+分支+实验运行器（排队/暂停/继续/取消）、迁移批次运行器（预览/逐文件隔离/
+                         暂停继续取消/中断自动续跑/幂等导入分支）、审阅会话（409 提案/逐项合并）、
                          发布候选（门禁/过期/审批 409 意见保留/撤销）、回放/fork、版本与持久化
 web/js/geom/versions.js 版本快照 + 版本间差异比较（纯函数，无 DOM 依赖）
-web/js/geom/diff.js     差异结果 HTML 渲染（版本比较 / 分支比较 / 实验变体比较共用）
+web/js/geom/diff.js     差异结果 HTML 渲染（版本比较 / 分支比较 / 实验变体比较 / 迁移导入差异共用）
 web/js/geom/versionpanel.js  版本页 UI（保存/恢复/发布/删除/比较）
 web/js/geom/auditpanel.js    审计/分支页 UI（时间线/回放/fork/分支比较/健康警告）
+web/js/geom/migrationpanel.js 迁移页 UI（多文件选择/格式识别与逐文件映射·隔离·未知字段预览/
+                         批次进度/暂停继续取消/导入为分支与差异/失败重试与原始输入/导出报告）
 web/js/geom/experimentpanel.js 实验页 UI（变体编辑器/状态/暂停继续取消/与基准差异/另存分支）
 web/js/geom/workbenchpanel.js 审计台页 UI（筛选、求解前后切换、顺序回放、审阅会话决定/409 合并/报告、导出）
 web/js/geom/releasepanel.js 审计台页发布门禁 UI（候选/证据快照/门禁清单/缺失过期待复核/批准/重新生成/撤销/409 意见/报告）
 web/js/geom/view.js     SVG 渲染与统一指针手势（拖动/组拖/框选/调尺寸，回放时只读）
 web/js/geom/dialog.js   添加约束对话框（环拒绝时定位）
-test/                   单元测试 + HTTP 端到端冒烟（e2e.mjs / e2e-experiments.mjs / e2e-reviews.mjs / e2e-releases.mjs）
+test/                   单元测试 + HTTP 端到端冒烟（e2e.mjs / e2e-experiments.mjs / e2e-reviews.mjs /
+                         e2e-releases.mjs / e2e-migrations.mjs；migration.test.mjs 为迁移纯函数+Store 单元测试）
 ```
 
 ## 操作提示

@@ -160,6 +160,29 @@ def _valid_shape(doc):
     # 审阅通知与升级中心（可为空）：轻量结构校验，对账 / 幂等在浏览器纯函数里
     if not _valid_notify_shape(doc):
         return False
+    # 旧版布局批量迁移（可为空）：轻量结构校验，格式识别 / 指纹对账在浏览器纯函数里
+    if not _valid_migration_shape(doc):
+        return False
+    return True
+
+
+def _valid_migration_shape(doc):
+    batches = doc.get("migrations", [])
+    if not isinstance(batches, list):
+        return False
+    for mb in batches:
+        if not isinstance(mb, dict) or not isinstance(mb.get("id"), str):
+            return False
+        if mb.get("runState") not in (None, "queued", "running", "paused", "cancelling", "cancelled", "done"):
+            return False
+        files = mb.get("files")
+        if not isinstance(files, list):
+            return False
+        for mf in files:
+            if not isinstance(mf, dict) or not isinstance(mf.get("id"), str):
+                return False
+            if mf.get("status") not in (None, "queued", "running", "done", "failed", "cancelled"):
+                return False
     return True
 
 
@@ -265,6 +288,10 @@ def _assess_conflict(cur, doc):
         nb = next((b for b in doc.get("branches", []) if isinstance(b, dict) and b.get("id") == cur_id), None)
         root = next((e for e in doc.get("events", []) if isinstance(e, dict) and e.get("id") == (nb or {}).get("rootEventId")), None)
         prov = root.get("provenance") if isinstance(root, dict) else None
+        # 旧版迁移导入的分支：fork-root 是自包含快照（无来源事件），root 在本次提交里即可
+        if nb and isinstance(root, dict) and isinstance(prov, dict) and prov.get("kind") == "migration" \
+                and root.get("id") == nb.get("rootEventId"):
+            return True, None
         src_id = prov.get("eventId") if isinstance(prov, dict) else None
         if nb and src_id and src_id in cur_events:
             return True, None
@@ -906,8 +933,87 @@ def _assess_release_conflict(cur, doc):
     return None
 
 
+# ---- 旧版布局批量迁移合流（同 web/js/geom/migration.js mergeMigrations） ----
+
+_MIG_FILE_RANK = {"queued": 0, "running": 1, "cancelled": 2, "failed": 3, "done": 4}
+
+
+def _merge_migration_file(a, b):
+    """走得更远的文件状态胜出；迁移结果与导入记录不降级覆盖。"""
+    win = b if _MIG_FILE_RANK.get(b.get("status"), 0) > _MIG_FILE_RANK.get(a.get("status"), 0) else a
+    out = dict(a)
+    out["name"] = a.get("name")
+    out["sourceHash"] = a.get("sourceHash")
+    out["raw"] = a.get("raw") or b.get("raw") or ""
+    out["preview"] = a.get("preview") or b.get("preview")
+    out["status"] = win.get("status")
+    out["error"] = win.get("error") if win.get("error") is not None else a.get("error")
+    out["detected"] = win.get("detected") if win.get("detected") is not None else a.get("detected")
+    out["confidence"] = win.get("confidence") if win.get("confidence") is not None else a.get("confidence")
+    out["attempts"] = max(int(a.get("attempts") or 0), int(b.get("attempts") or 0))
+    out["result"] = a.get("result") or b.get("result")
+    ia, ib = a.get("imported"), b.get("imported")
+    if ia and ib:
+        out["imported"] = ib if int(ib.get("at") or 0) > int(ia.get("at") or 0) else ia
+    else:
+        out["imported"] = ia or ib
+    return out
+
+
+def _merge_one_migration_batch(s, c):
+    sf = {f["id"]: f for f in s.get("files", []) if isinstance(f, dict) and isinstance(f.get("id"), str)}
+    order = [f["id"] for f in s.get("files", []) if isinstance(f, dict) and isinstance(f.get("id"), str)]
+    for cf in c.get("files", []):
+        if not isinstance(cf, dict) or not isinstance(cf.get("id"), str):
+            continue
+        fid = cf["id"]
+        if fid not in sf:
+            sf[fid] = cf
+            if fid not in order:
+                order.append(fid)
+        else:
+            sf[fid] = _merge_migration_file(sf[fid], cf)
+    files = [sf[i] for i in order]
+    s_done = sum(1 for f in s.get("files", []) if f.get("status") in ("done", "failed", "cancelled"))
+    c_done = sum(1 for f in c.get("files", []) if f.get("status") in ("done", "failed", "cancelled"))
+    winner = c if c_done > s_done else s
+    merged = dict(s)
+    merged["files"] = files
+    merged["updatedAt"] = max(int(s.get("updatedAt") or 0), int(c.get("updatedAt") or 0))
+    merged["importedCount"] = max(int(s.get("importedCount") or 0), int(c.get("importedCount") or 0))
+    # 批次级状态重算（与 reconcileBatchState 同语义）
+    if any(f.get("status") == "running" for f in files):
+        state = "running"
+    elif winner.get("runState") == "cancelled":
+        state = "cancelled"   # 取消是终态，不被“无排队项”翻回 done
+    elif not any(f.get("status") == "queued" for f in files):
+        state = "done"
+    elif winner.get("runState") in ("running", "paused"):
+        state = "paused"
+    elif winner.get("runState") == "cancelled":
+        state = "cancelled"
+    else:
+        state = "queued"
+    merged["runState"] = state
+    return merged
+
+
+def _merge_migrations(server_list, client_list):
+    """迁移批次按 id 并集（与 migration.js mergeMigrations 同构）。"""
+    by_id, order = {}, []
+    for x in list(server_list or []) + list(client_list or []):
+        if not isinstance(x, dict) or not isinstance(x.get("id"), str):
+            continue
+        xid = x["id"]
+        if xid not in by_id:
+            by_id[xid] = x
+            order.append(xid)
+        else:
+            by_id[xid] = _merge_one_migration_batch(by_id[xid], x)
+    return [by_id[i] for i in order]
+
+
 def _merge_releases(server_list, client_list):
-    """发布候选按 id 并集；同 id rev 更大者整体胜出，审批/历史记录按 id 并集（审计链不丢）。"""
     by_id = {}
     order = []
     for r in list(server_list or []) + list(client_list or []):
@@ -975,6 +1081,7 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
     notify_batches = _merge_batches(server_doc.get("notifyBatches", []), client_doc.get("notifyBatches", []))
     notify_drafts = _merge_drafts(server_doc.get("notifyDrafts", []), client_doc.get("notifyDrafts", []))
     releases = _merge_releases(server_doc.get("releases", []), client_doc.get("releases", []))
+    migrations = _merge_migrations(server_doc.get("migrations", []), client_doc.get("migrations", []))
 
     merged = dict(server_doc)
     merged.update({
@@ -990,6 +1097,7 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
         "notifyBatches": notify_batches,
         "notifyDrafts": notify_drafts,
         "releases": releases,
+        "migrations": migrations,
         "activeReleaseId": server_doc.get("activeReleaseId")
             or (client_doc.get("activeReleaseId") if any(r.get("id") == client_doc.get("activeReleaseId") for r in releases) else None),
         "activeReviewId": server_doc.get("activeReviewId")

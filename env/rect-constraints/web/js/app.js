@@ -7,6 +7,7 @@ import { ExperimentPanel } from './geom/experimentpanel.js';
 import { WorkbenchPanel } from './geom/workbenchpanel.js';
 import { ReleasePanel } from './geom/releasepanel.js';
 import { NotifyPanel } from './geom/notifypanel.js';
+import { MigrationPanel } from './geom/migrationpanel.js';
 import {
   newRect, newSnap, newMinGap, newContain, newLock,
 } from './geom/model.js';
@@ -65,6 +66,7 @@ const experimentPanel = new ExperimentPanel(store, { toast });
 const workbenchPanel = new WorkbenchPanel(store, { toast });
 const releasePanel = new ReleasePanel(store, { toast });
 const notifyPanel = new NotifyPanel(store, { toast });
+const migrationPanel = new MigrationPanel(store, { toast });
 
 // 浏览器网络恢复：按 FIFO 原顺序重发通知队列（稳定 id，不重复）
 window.addEventListener('online', () => store.notifyOnline());
@@ -216,6 +218,7 @@ function renderPanels() {
   auditPanel.render();
   experimentPanel.render();
   workbenchPanel.render();
+  migrationPanel.render();
   updateButtons();
   updateChips();
 }
@@ -436,7 +439,9 @@ function updateBranchChip() {
   const src = b.source ? store.branches.find((x) => x.id === b.source.branchId) : null;
   const expSrc = b.experimentSource ? store.experiments.find((x) => x.id === b.experimentSource.experimentId) : null;
   chip.textContent = `⎘ ${b.name} #${head?.seq ?? '?'}`;
-  if (expSrc) {
+  if (b.source?.kind === 'migration') {
+    chip.title = `分支「${b.name}」由旧版布局批量迁移导入（源文件指纹 ${(b.source.sourceFileHash || '').slice(0, 12)}，批次 ${b.source.migrationBatchId || '?'}）；相同源文件重复导入幂等，不产生重复布局`;
+  } else if (expSrc) {
     chip.title = `分支「${b.name}」来自实验「${expSrc.name}」的变体另存；实验结果与基准事件未被改写`;
   } else if (src) {
     chip.title = `分支「${b.name}」，来自「${src.name}」的历史事件；本分支提交不影响原分支`;

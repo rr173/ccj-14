@@ -739,3 +739,88 @@ button.mini.ok { color: var(--ok); border-color: #bfe6cd; }
 .rl-a-list { margin: 6px 0 2px; padding-left: 20px; font-size: 11.5px; line-height: 1.8; }
 .rl-a-revoked { color: var(--danger); }
 .rl-a-sup { color: var(--muted); }
+
+/* ==================== 旧版布局批量迁移工作台 ==================== */
+.mig-import { display: flex; align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+.mig-auto { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 4px; cursor: pointer; }
+
+.mig-preview { margin: 6px 0 10px; }
+.mp-head { display: flex; align-items: center; gap: 8px; background: #f7f9fc; border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.mp-files { display: flex; flex-direction: column; gap: 6px; }
+.mp-file { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #fff; font-size: 12.5px; }
+.mp-file.ok { border-left: 3px solid var(--ok); }
+.mp-file.bad { border-left: 3px solid var(--danger); background: var(--danger-soft); }
+.mp-file.dup { border-left: 3px solid var(--muted); background: #f6f7f9; }
+.mpf-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mp-file.bad .mf-name, .mp-file.dup .mf-name { font-weight: 600; }
+.mf-badge { font-size: 11px; padding: 1px 7px; border-radius: 10px; white-space: nowrap; }
+.mf-badge.ok { background: var(--ok-soft); color: var(--ok); }
+.mf-badge.bad { background: #fff; color: var(--danger); border: 1px solid var(--danger); }
+.mf-badge.dup { background: #e9ebef; color: var(--muted); }
+.mf-name { font-weight: 600; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mf-fmt, .mf-note { color: var(--muted); font-size: 11.5px; }
+.mf-stats { font-size: 11.5px; color: #48505e; }
+.mf-hash code, .mcf-hash { font-size: 10.5px; background: #eef1f5; padding: 1px 5px; border-radius: 4px; color: var(--muted); }
+.mf-suggest { margin-top: 4px; font-size: 11.5px; color: var(--warn); }
+.mpf-flags { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.flag { font-size: 10.5px; padding: 1px 7px; border-radius: 10px; white-space: nowrap; }
+.flag-ok { background: var(--ok-soft); color: var(--ok); }
+.flag-q { background: var(--warn-soft); color: var(--warn); }
+.flag-u { background: #eef1fb; color: #4356b8; }
+.flag-rn { background: #f3ecfb; color: #7b43b8; }
+.mpf-detail { margin-top: 6px; font-size: 12px; }
+.mpf-detail summary { cursor: pointer; color: var(--muted); }
+.map-sec { margin-top: 6px; }
+.map-sec h5 { margin: 6px 0 3px; font-size: 11.5px; color: #48505e; }
+.map-sec ul { margin: 0; padding-left: 18px; line-height: 1.7; }
+.map-from { color: var(--danger); text-decoration: line-through; }
+.map-why { color: var(--muted); font-size: 11px; }
+.map-adj { color: var(--warn); font-size: 11px; }
+.map-empty { color: var(--muted); font-size: 11.5px; }
+.q-list { list-style: none; padding-left: 0 !important; }
+.q-li { border: 1px dashed var(--warn); border-radius: 7px; padding: 5px 8px; margin: 4px 0; background: var(--warn-soft); }
+.q-kind { font-size: 10px; background: #fff; color: var(--warn); border: 1px solid var(--warn); border-radius: 8px; padding: 0 6px; margin-right: 5px; }
+.q-reason { color: #8a5a12; font-size: 11.5px; margin-top: 2px; }
+.q-suggest { color: var(--warn); font-size: 11.5px; margin-top: 1px; }
+
+.mig-card { border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-bottom: 10px; background: #fff; }
+.mig-card.st-running { box-shadow: inset 3px 0 0 #3a7bd5; }
+.mig-card.st-paused { box-shadow: inset 3px 0 0 var(--warn); }
+.mig-card.st-cancelled { opacity: .82; box-shadow: inset 3px 0 0 var(--muted); }
+.mc-row1 { display: flex; align-items: center; gap: 8px; }
+.mc-state { font-size: 11px; padding: 1px 8px; border-radius: 10px; background: #eef1f5; color: #48505e; white-space: nowrap; }
+.st-running .mc-state { background: #e4eefb; color: #2a63c0; }
+.st-paused .mc-state { background: var(--warn-soft); color: var(--warn); }
+.st-cancelled .mc-state { background: #e9ebef; color: var(--muted); }
+.st-done .mc-state { background: var(--ok-soft); color: var(--ok); }
+.mc-name { font-weight: 600; font-size: 13px; }
+.mc-meta { font-size: 11px; color: var(--muted); }
+.mc-progress { height: 6px; background: #eef1f5; border-radius: 4px; margin: 8px 0 5px; overflow: hidden; }
+.mc-bar { height: 100%; background: linear-gradient(90deg, #3a7bd5, #5b9be0); transition: width .25s; }
+.mc-counts { display: flex; gap: 10px; font-size: 11.5px; color: var(--muted); flex-wrap: wrap; }
+.mc-counts .mc-total { font-weight: 700; color: #48505e; }
+.mc-counts .ok { color: var(--ok); }
+.mc-counts .bad { color: var(--danger); }
+.mc-counts .imp { color: #2a63c0; }
+.mc-counts .dup { color: var(--muted); }
+.mc-actions { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+.mc-files { display: flex; flex-direction: column; gap: 6px; }
+.mc-file { border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; }
+.mc-file.st-done { border-left: 3px solid var(--ok); }
+.mc-file.st-failed { border-left: 3px solid var(--danger); background: var(--danger-soft); }
+.mc-file.st-cancelled { border-left: 3px solid var(--muted); opacity: .85; }
+.mc-file.st-running { border-left: 3px solid #3a7bd5; }
+.mcf-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12.5px; }
+.mcf-status { font-size: 10.5px; padding: 0 7px; border-radius: 9px; background: #eef1f5; color: #48505e; white-space: nowrap; }
+.st-done .mcf-status { background: var(--ok-soft); color: var(--ok); }
+.st-failed .mcf-status { background: #fff; color: var(--danger); border: 1px solid var(--danger); }
+.st-running .mcf-status { background: #e4eefb; color: #2a63c0; }
+.mcf-name { font-weight: 600; }
+.mcf-fmt { color: var(--muted); font-size: 11px; }
+.mcf-err { font-size: 11.5px; color: var(--danger); margin-top: 4px; }
+.mcf-actions { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.mcf-detail { margin-top: 6px; }
+.mcf-imported { margin-top: 6px; border-top: 1px dashed var(--line); padding-top: 6px; font-size: 11.5px; color: #2a63c0;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mcf-diff { flex-basis: 100%; margin-top: 4px; }
