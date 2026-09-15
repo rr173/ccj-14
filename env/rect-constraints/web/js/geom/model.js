@@ -40,6 +40,20 @@ const num = (v) => {
 };
 const round3 = (v) => Math.round((v + Number.EPSILON) * 1000) / 1000;
 
+/** 规范化模板实例标签（非法标签直接丢弃，避免脏数据进入求解 / 指纹）。 */
+function normalizeTplTag(t) {
+  if (!t || typeof t !== 'object') return undefined;
+  if (typeof t.instanceId !== 'string' || typeof t.templateId !== 'string') return undefined;
+  const out = {
+    instanceId: t.instanceId,
+    templateId: t.templateId,
+    versionNo: Number.isInteger(t.versionNo) ? t.versionNo : 0,
+    key: typeof t.key === 'string' ? t.key : '',
+    pin: t.pin === true,
+  };
+  return out;
+}
+
 const EDGES = new Set(['l', 'r', 't', 'b', 'mid']);
 const SIDES = new Set(['left', 'right', 'above', 'below']);
 
@@ -93,6 +107,8 @@ export function normalize(model) {
   })).sort((a, b) => (a.id < b.id ? -1 : 1));
   const constraints = (model.constraints || []).map((c) => {
     const base = { id: c.id, kind: c.kind, rect: c.rect, priority: Math.round(num(c.priority)), enabled: c.enabled !== false };
+    // 模板实例标签（实例链接/固定/版本号）作为约束的可选一等字段随规范化保留
+    if (c.tpl && typeof c.tpl === 'object') base.tpl = normalizeTplTag(c.tpl);
     if (c.kind === 'snap') return { ...base, other: c.other, axis: c.axis, edge: c.edge, otherEdge: c.otherEdge, gap: round3(num(c.gap)) };
     if (c.kind === 'minGap') return { ...base, other: c.other, side: c.side, gap: round3(num(c.gap)) };
     if (c.kind === 'contain') return { ...base, margin: round3(num(c.margin)) };

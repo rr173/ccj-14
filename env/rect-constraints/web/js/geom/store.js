@@ -69,6 +69,14 @@ import {
   buildMergeReport, makeMergeDraft, mergeDraftId, findMergeBase,
   choicesToMap, itemKey, mergeMergeDrafts, rebaseConflictChoices,
 } from './merge.js';
+import {
+  extractDraft, publishVersion, templateVersion as tplVersion,
+  planInstance, mappingFingerprint, diffTemplateVersions, migrateParams,
+  deriveInstanceLinks, normalizeDraft as normalizeTplDraft, validateDraft,
+  setOverridable as tplSetOverridable, setDraftParamDefault,
+  sanitizeTemplates, sanitizeInstances, mergeTemplates, mergeInstances,
+  normalizeKeepTags, tplConstraintLabel,
+} from './templates.js';
 
 const LS_KEY = 'rect-constraints-doc-v2';
 const LS_KEY_LEGACY = 'rect-constraints-doc-v1';
@@ -116,6 +124,16 @@ export class Store extends EventTarget {
     this.mergeDrafts = [];                // merge draft[]（open / completed / abandoned）
     this.activeMergeDraftId = null;       // 当前打开的草案 id（随文档持久化）
     this.mergeConflict = null;            // null | { draftId, reason, targetHeadId, targetHeadSeq, serverRev }
+
+    // 参数化约束模板：模板（草稿 + 只读版本）与实例链接（文档级，随文档持久化）。
+    // 实例在某分支上“链接/固定/脱离”的状态由当前模型约束上的 tpl 标签派生（deriveInstanceLinks），
+    // 因此 undo/redo 移动分支 head 时，约束与实例链接天然回到同一状态。
+    this.templates = [];                  // template[]
+    this.templateInstances = [];          // instance[]
+    this.activeTemplateId = null;         // 当前打开的模板 id（随文档持久化）
+    this.templateConflict = null;         // null | { templateId, reason:'template-draft-advanced', serverDraftRev, localDraft, localDraftRev }
+    this._templateSyncedRevs = {};        // templateId -> 已确认的 draftRev（草稿乐观锁基线）
+    this._templateAuthoredRevs = new Map(); // templateId -> Set(draftRev)：本页自写（防抖窗内不误判外来推进）
 
     // 审阅通知与升级中心
     this.notifyEvents = [];        // append-only 通知事件（决定/签署/冲突/完成），按 id 幂等并集
@@ -329,6 +347,20 @@ export class Store extends EventTarget {
     this.mergeDrafts = sanitizeMergeDrafts(doc.mergeDrafts);
     this.activeMergeDraftId = this.mergeDrafts.some((d) => d.id === doc.activeMergeDraftId) ? doc.activeMergeDraftId : null;
     this.mergeConflict = null;
+
+    // 参数化约束模板：模板（草稿 + 只读版本）/ 实例链接随文档持久化。
+    // 版本不可改写由 sanitizeTemplates（同 no 保留第一条）与发布流程共同保证；
+    // 草稿乐观锁基线在装载时重置（本页自写 rev 由保存成功路径补登）。
+    const savedTemplateConflict = keepReviewConflict ? this.templateConflict : null;
+    this.templates = sanitizeTemplates(doc.templates);
+    this.templateInstances = sanitizeInstances(doc.templateInstances);
+    this.activeTemplateId = this.templates.some((t) => t.id === doc.activeTemplateId) ? doc.activeTemplateId : null;
+    this._templateSyncedRevs = {};
+    this._templateAuthoredRevs = new Map();
+    for (const t of this.templates) this._templateSyncedRevs[t.id] = t.draftRev || 0;
+    this.templateConflict = savedTemplateConflict && this.templates.some((t) => t.id === savedTemplateConflict.templateId)
+      ? { ...savedTemplateConflict, serverDraftRev: this.templateById(savedTemplateConflict.templateId)?.draftRev ?? savedTemplateConflict.serverDraftRev }
+      : null;
   }
 
   /**
@@ -496,6 +528,9 @@ export class Store extends EventTarget {
       activeReleaseId: this.activeReleaseId,
       mergeDrafts: this.mergeDrafts,
       activeMergeDraftId: this.activeMergeDraftId,
+      templates: this.templates,
+      templateInstances: this.templateInstances,
+      activeTemplateId: this.activeTemplateId,
       actor: this.actor,
     };
   }
@@ -540,6 +575,13 @@ export class Store extends EventTarget {
         const releaseConflict = this._checkLocalReleaseConflict(prev, payload);
         if (releaseConflict) {
           this._onReleaseConflict(releaseConflict);
+          return;
+        }
+        // 模板草稿：同一模板草稿被另一页面保存（draftRev 前进）→ 409 语义，
+        // 明确提示版本冲突并保留本地草稿，绝不覆盖对方版本
+        const templateConflict = this._checkLocalTemplateConflict(prev, payload);
+        if (templateConflict) {
+          this._onTemplateConflict(templateConflict);
           return;
         }
       }
@@ -588,6 +630,17 @@ export class Store extends EventTarget {
       finalDoc.activeMergeDraftId = finalDoc.mergeDrafts.some((x) => x.id === finalDoc.activeMergeDraftId)
         ? finalDoc.activeMergeDraftId
         : (payload.activeMergeDraftId && finalDoc.mergeDrafts.some((x) => x.id === payload.activeMergeDraftId) ? payload.activeMergeDraftId : null);
+      // 参数化约束模板：模板按 id 合流（草稿 draftRev 更大者胜出、已发布版本 no 并集不可改写），
+      // 实例按 id 合流（updatedAt 更新者整体胜出、detached 墓碑不复活）
+      finalDoc.templates = mergeTemplates(
+        Array.isArray(prev?.templates) ? prev.templates : (finalDoc.templates || []),
+        payload.templates || []);
+      finalDoc.templateInstances = mergeInstances(
+        Array.isArray(prev?.templateInstances) ? prev.templateInstances : (finalDoc.templateInstances || []),
+        payload.templateInstances || []);
+      finalDoc.activeTemplateId = finalDoc.templates.some((x) => x.id === finalDoc.activeTemplateId)
+        ? finalDoc.activeTemplateId
+        : (payload.activeTemplateId && finalDoc.templates.some((x) => x.id === payload.activeTemplateId) ? payload.activeTemplateId : null);
       localStorage.setItem(LS_KEY, JSON.stringify(finalDoc));
       // 记录本页自己写入过的会话 rev：防抖窗口内重读 localStorage 不把自己的写入误判成外来推进
       for (const rs of payload.reviewSessions || []) {
@@ -601,6 +654,10 @@ export class Store extends EventTarget {
       for (const rc of payload.releases || []) {
         if (!this._releaseAuthoredRevs.has(rc.id)) this._releaseAuthoredRevs.set(rc.id, new Set());
         this._releaseAuthoredRevs.get(rc.id).add(rc.rev);
+      }
+      for (const t of payload.templates || []) {
+        if (!this._templateAuthoredRevs.has(t.id)) this._templateAuthoredRevs.set(t.id, new Set());
+        this._templateAuthoredRevs.get(t.id).add(t.draftRev || 0);
       }
     } catch {}
     this._emit('persist');
@@ -790,6 +847,7 @@ export class Store extends EventTarget {
         baseNotifyRuleRevs: this._baseNotifyRuleRevs(),
         baseNotifyItemRevs: this._baseNotifyItemRevs(),
         baseReleaseRevs: this._baseReleaseRevs(),
+        baseTemplateRevs: { ...this._templateSyncedRevs },
         // 已终结 outbox 条目的墓碑（瞬态字段，不持久化进文档）：服务端合并时删除其旧副本
         notifyOutboxTombstones: [...this._notifyOutboxTombstones],
       };
@@ -887,6 +945,21 @@ export class Store extends EventTarget {
         delete payload.baseReleaseRevs[cid];
         body = JSON.stringify(payload);
       }
+      // 模板草稿冲突未解决：冲突模板的【本地过期草稿】不外发（本地草稿已保留），
+      // 其余模板 / 实例 / 几何保存照常。携带服务端权威副本而非删除（同 rev 直存时
+      // 客户端文档即权威，删除会清掉服务端仍存在的模板与其版本）。
+      if (this.templateConflict) {
+        const cid = this.templateConflict.templateId;
+        const serverDoc0 = await this._fetchDoc().catch(() => null);
+        const serverTemplate = (serverDoc0?.templates || []).find((x) => x.id === cid);
+        if (serverTemplate) {
+          payload.templates = (payload.templates || []).map((x) => (x.id === cid ? serverTemplate : x));
+        } else {
+          payload.templates = (payload.templates || []).filter((x) => x.id !== cid);
+        }
+        delete payload.baseTemplateRevs[cid];
+        body = JSON.stringify(payload);
+      }
       try {
         // 发请求前再次快照乐观动作：调用方可能在该保存入队后、实际发出前才执行确认/转交。
         const requestSnapshot = new Map([...pendingSnapshot, ...this._notifyPendingItemActions]);
@@ -914,6 +987,17 @@ export class Store extends EventTarget {
           if (typeof data?.releaseId === 'string' && String(data.reason || '').startsWith('release-')) {
             // 发布门禁冲突（候选 rev 前进 / 证据过期 / 门禁阻断）：本地审批意见保留
             this._onReleaseConflict(data);
+            return;
+          }
+          if (typeof data?.templateId === 'string' && String(data.reason || '').startsWith('template-')) {
+            // 模板草稿冲突（另一页面已保存更新草稿）：本地草稿保留、明确提示，不覆盖对方
+            this._onTemplateConflict({
+              reason: data.reason, templateId: data.templateId,
+              serverDraftRev: Number.isFinite(data.serverDraftRev) ? data.serverDraftRev : 0,
+              localDraftRev: Number.isFinite(data.localDraftRev) ? data.localDraftRev : 0,
+              localDraft: (this.templates.find((t) => t.id === data.templateId) || {}).draft || null,
+              serverTemplate: data.template || null,
+            });
             return;
           }
           this._onSaveConflict(data, Number.isFinite(data?.rev) ? data.rev : null);
@@ -999,6 +1083,11 @@ export class Store extends EventTarget {
             if (pend.length) this._releasePendingApprovals.set(r.id, pend);
             else this._releasePendingApprovals.delete(r.id);
           }
+        }
+        // 模板草稿基线前进到服务端确认值；已发布版本是 no 并集，不推进草稿基线
+        for (const t of payload.templates || []) {
+          this._templateSyncedRevs[t.id] = Math.max(this._templateSyncedRevs[t.id] || 0, t.draftRev || 0);
+          this._templateAuthoredRevs.get(t.id)?.add(t.draftRev || 0);
         }
         // 通知中心基线前进到服务端确认值（规则 rev / 通知项状态）
         for (const r of this.notifyRules) {
@@ -2672,6 +2761,74 @@ export class Store extends EventTarget {
     return null;
   }
 
+  /**
+   * localStorage 多页签模板草稿冲突检测（离线 / 服务端不可用时的协调）。
+   * 只锁【草稿编辑】（draftRev 前进）：发布版本走 no 并集，天然合流、不冲突。
+   * 本页自写的 draftRev 不算外来推进；另一页保存了更新草稿 -> template-draft-advanced，
+   * 本地草稿原样保留，绝不覆盖对方。
+   */
+  _checkLocalTemplateConflict(stored, payload) {
+    const storedById = new Map((stored.templates || []).map((t) => [t.id, t]));
+    for (const t of payload.templates || []) {
+      const base = this._templateSyncedRevs[t.id] ?? 0;
+      if (!((t.draftRev || 0) > base)) continue;
+      const authored = this._templateAuthoredRevs.get(t.id);
+      const srv = storedById.get(t.id);
+      if (srv && authored?.has(srv.draftRev || 0)) continue;
+      if (srv && (srv.draftRev || 0) !== base && (srv.draftRev || 0) > base) {
+        return {
+          reason: 'template-draft-advanced', templateId: t.id,
+          serverDraftRev: srv.draftRev || 0, localDraftRev: t.draftRev || 0,
+          localDraft: t.draft, serverTemplate: srv,
+        };
+      }
+    }
+    return null;
+  }
+
+  /** 模板草稿冲突：采用服务端权威模板，本地草稿保留在冲突状态里（可另存或放弃）。 */
+  _onTemplateConflict(info) {
+    if (this.templateConflict?.templateId === info.templateId) return;
+    const srv = info.serverTemplate;
+    if (srv) {
+      const clean = sanitizeTemplates([srv])[0];
+      if (clean) {
+        const i = this.templates.findIndex((x) => x.id === clean.id);
+        if (i >= 0) this.templates[i] = clean; else this.templates.push(clean);
+        this._templateSyncedRevs[clean.id] = clean.draftRev || 0;
+      }
+    }
+    this.templateConflict = {
+      templateId: info.templateId,
+      reason: 'template-draft-advanced',
+      serverDraftRev: info.serverDraftRev,
+      localDraft: info.localDraft || null,
+      localDraftRev: info.localDraftRev || 0,
+    };
+    this._emit('templateconflict', this.templateConflict);
+    this._emit('templates', { type: 'conflict' });
+  }
+
+  /** 放弃本地过期草稿（采用服务端版本），解除模板草稿冲突锁。 */
+  discardLocalTemplateDraft(templateId) {
+    if (this.templateConflict?.templateId !== templateId) return;
+    this.templateConflict = null;
+    this._dirty = true;
+    this.persist();
+    this._emit('templates', { type: 'conflict-resolved' });
+  }
+
+  /** 把冲突中保留的本地草稿另存为一个【新模板】（不覆盖对方版本）。 */
+  saveLocalDraftAsNewTemplate(templateId, name) {
+    const conf = this.templateConflict;
+    if (!conf || conf.templateId !== templateId || !conf.localDraft) return { ok: false, error: '没有可另存的本地草稿' };
+    const res = this.createTemplate(name, conf.localDraft, { publish: false });
+    if (!res.ok) return res;
+    this.templateConflict = null;
+    this._emit('templates', { type: 'conflict-resolved' });
+    return res;
+  }
+
   /** 服务端 409（release-*）：采用服务端权威候选，本地审批意见保留为提案。 */
   _onReleaseConflict(info) {
     const id = info.releaseId;
@@ -3990,6 +4147,458 @@ export class Store extends EventTarget {
     return compareVersions(a, b);
   }
 
+  /* ==================== 参数化约束模板 ==================== */
+
+  get activeTemplate() { return this.templates.find((t) => t.id === this.activeTemplateId) || null; }
+  templateById(id) { return this.templates.find((t) => t.id === id) || null; }
+  instanceById(id) { return this.templateInstances.find((x) => x.id === id) || null; }
+
+  /** 当前分支上每个实例的链接状态（由模型约束 tpl 标签派生，undo/redo 天然一致）。 */
+  instanceLinks() {
+    return deriveInstanceLinks(this.templateInstances, this.headEvent.model);
+  }
+
+  /** 模型中属于某实例的具体约束（当前分支）。 */
+  constraintsOfInstance(instanceId) {
+    return this.headEvent.model.constraints.filter((c) => c.tpl?.instanceId === instanceId);
+  }
+
+  /**
+   * 从一组选中矩形与其间约束创建模板（可同时发布 v1）。
+   * 草稿与版本都是新对象，不改写任何既有数据。
+   */
+  createTemplateFromSelection(name, rectIds, { publish = true } = {}) {
+    const ex = extractDraft(this.headEvent.model, rectIds);
+    if (!ex.ok) return { ok: false, error: ex.errors[0], errors: ex.errors };
+    return this.createTemplate(name, ex.draft, { publish });
+  }
+
+  /** 纯预览：从一组选中矩形抽取模板草稿（不修改任何状态）。 */
+  previewExtractTemplate(rectIds) {
+    return extractDraft(this.headEvent.model, rectIds);
+  }
+
+  createTemplate(name, draftRaw, { publish = true } = {}) {
+    name = String(name ?? '').trim();
+    if (!name) return { ok: false, error: '模板名称不能为空' };
+    if (this.templates.some((t) => t.name === name)) return { ok: false, error: `已存在同名模板「${name}」` };
+    const draft = normalizeTplDraft(draftRaw);
+    const errors = validateDraft(draft);
+    if (errors.length) return { ok: false, error: errors[0], errors };
+    const now = Date.now();
+    const id = uid('tpl');
+    const t = {
+      id, name, createdAt: now, updatedAt: now,
+      draftRev: 1, draft, versions: [], publishedNo: 0,
+    };
+    let firstVersion = null;
+    if (publish) {
+      const pub = publishVersion(t, { now });
+      if (!pub.ok) return { ok: false, error: pub.error, errors: pub.errors };
+      t.versions.push(pub.version); t.publishedNo = pub.no;
+      firstVersion = pub.version;
+    }
+    this.templates = [...this.templates, t];
+    this.activeTemplateId = id;
+    this._templateSyncedRevs[id] = 1;
+    this._templateAuthoredRevs.set(id, new Set([1]));
+    this._dirty = true;
+    this.persist();
+    this._emit('templates', { type: 'create', id });
+    return { ok: true, template: t, version: firstVersion };
+  }
+
+  /** 更新模板【草稿】（乐观锁：基于 baseDraftRev；冲突时保留本地草稿并提示）。 */
+  updateTemplateDraft(id, mutator, baseDraftRev) {
+    if (this.templateConflict?.templateId === id) return { ok: false, error: '模板草稿存在版本冲突，请先放弃本地草稿或另存为新模板' };
+    const t = this.templateById(id);
+    if (!t) return { ok: false, error: '模板不存在（可能已被其他页面删除）' };
+    if (!t.draft) return { ok: false, error: '该模板没有可编辑草稿' };
+    const base = Number.isInteger(baseDraftRev) ? baseDraftRev : (this._templateSyncedRevs[id] ?? t.draftRev);
+    if ((t.draftRev || 0) !== base) {
+      return { ok: false, conflict: true, reason: 'template-draft-advanced', serverDraftRev: t.draftRev, error: '模板草稿已被另一个页面更新，请刷新后重试' };
+    }
+    // 离线 / localStorage 多页签：同步核对磁盘上该模板草稿是否已被另一页面前进，
+    // 若已前进则立即判冲突（本地草稿参数随返回保留），不写入、不覆盖对方。
+    try {
+      const stored = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
+      const srvT = (stored?.templates || []).find((x) => x.id === id);
+      if (srvT) {
+        const authored = this._templateAuthoredRevs.get(id);
+        const diskRev = srvT.draftRev || 0;
+        if (diskRev > base && !authored?.has(diskRev)) {
+          const clean = sanitizeTemplates([srvT])[0];
+          if (clean) {
+            const i = this.templates.findIndex((x) => x.id === id);
+            if (i >= 0) this.templates[i] = clean;
+            this._templateSyncedRevs[id] = clean.draftRev || 0;
+          }
+          const localDraft = normalizeTplDraft(buildDraftAfterMutator(t.draft, mutator));
+          this._onTemplateConflict({
+            reason: 'template-draft-advanced', templateId: id,
+            serverDraftRev: diskRev, localDraftRev: base,
+            localDraft, serverTemplate: srvT,
+          });
+          return { ok: false, conflict: true, reason: 'template-draft-advanced', serverDraftRev: diskRev, error: '模板草稿已被另一个页面保存，本地草稿已保留' };
+        }
+      }
+    } catch {}
+    const draft = structuredClone(t.draft);
+    mutator(draft);
+    const normalized = normalizeTplDraft(draft);
+    const errors = validateDraft(normalized);
+    if (errors.length) return { ok: false, error: errors[0], errors };
+    const nextRev = Math.max((t.draftRev || 0) + 1, (this._templateSyncedRevs[id] || 0) + 1);
+    this._mutateTemplate(id, (x) => {
+      x.draft = normalized;
+      x.draftRev = nextRev;
+      x.updatedAt = Date.now();
+    });
+    this._templateSyncedRevs[id] = nextRev;
+    if (!this._templateAuthoredRevs.has(id)) this._templateAuthoredRevs.set(id, new Set());
+    this._templateAuthoredRevs.get(id).add(nextRev);
+    this._dirty = true;
+    this.persist();
+    this._emit('templates', { type: 'draft', id, draftRev: nextRev });
+    return { ok: true, draftRev: nextRev, draft: normalized };
+  }
+
+  /** 声明某条模板约束的某个参数是否允许实例覆盖（草稿编辑）。 */
+  setTemplateOverridable(id, key, field, flag, baseDraftRev) {
+    return this.updateTemplateDraft(id, (draft) => {
+      const d2 = tplSetOverridable(draft, key, field, flag);
+      draft.slots = d2.slots; draft.constraints = d2.constraints;
+    }, baseDraftRev);
+  }
+
+  /** 修改某条模板约束参数的草稿默认值。 */
+  setTemplateParamDefault(id, key, field, value, baseDraftRev) {
+    return this.updateTemplateDraft(id, (draft) => {
+      const d2 = setDraftParamDefault(draft, key, field, value);
+      draft.slots = d2.slots; draft.constraints = d2.constraints;
+    }, baseDraftRev);
+  }
+
+  /** 发布草稿为新版本（只读，绝不改写既有版本；实例“已应用版本”不受影响）。 */
+  publishTemplate(id) {
+    const t = this.templateById(id);
+    if (!t) return { ok: false, error: '模板不存在' };
+    if (this.templateConflict?.templateId === id) return { ok: false, error: '模板草稿存在版本冲突，请先解决' };
+    const pub = publishVersion(t, { now: Date.now() });
+    if (!pub.ok) return { ok: false, error: pub.error, errors: pub.errors };
+    // 幂等/不可改写：同 no 已存在则拒绝（正常流程不会发生）
+    if (t.versions.some((v) => v.no === pub.no)) return { ok: false, error: `版本 v${pub.no} 已存在，不能改写` };
+    const version = pub.version;
+    this._mutateTemplate(id, (x) => {
+      x.versions = [...x.versions, version];
+      x.publishedNo = pub.no;
+      x.updatedAt = Date.now();
+    });
+    this._dirty = true;
+    this.persist();
+    this._emit('templates', { type: 'publish', id, no: pub.no });
+    return { ok: true, version, no: pub.no };
+  }
+
+  setActiveTemplate(id) {
+    this.activeTemplateId = id && this.templates.some((t) => t.id === id) ? id : null;
+    this._dirty = true;
+    this.persist();
+    this._emit('templates', { type: 'active' });
+  }
+
+  _mutateTemplate(id, fn) {
+    this.templates = this.templates.map((t) => {
+      if (t.id !== id) return t;
+      const clone = structuredClone(t);
+      fn(clone);
+      return clone;
+    });
+  }
+
+  /**
+   * 应用模板版本到一组槽位映射（首次实例化）。
+   * 完整预览（新增约束 / 求解位置 / 未满足 / 冲突链）通过 planTemplate() 获取；
+   * 本方法在确认后原子创建实例 + 一次几何提交。任何非法（槽位缺失/重复/悬空/环/越界）都不创建实例。
+   */
+  applyTemplate({ templateId, versionNo, mapping, params = {} }) {
+    const t = this.templateById(templateId);
+    if (!t) return { ok: false, error: '模板不存在' };
+    const version = tplVersion(t, versionNo || t.publishedNo);
+    if (!version) return { ok: false, error: `模板没有版本 v${versionNo}` };
+    // 幂等：同模板版本 + 同槽位映射不得重复创建实例
+    const mapHash = mappingFingerprint(templateId, version.no, mapping);
+    const dup = this.templateInstances.find((x) =>
+      x.templateId === templateId && x.status !== 'detached' && x.mapHash === mapHash
+      && this._instanceCurrentOnBranch(x.id));
+    if (dup) return { ok: false, error: '同一模板版本已应用到这组槽位映射（重复实例被拒绝）', duplicate: true, instanceId: dup.id };
+
+    const instanceId = uid('ti');
+    const cidPrefix = instanceId;
+    const plan = planInstance({
+      template: t, version, model: this.headEvent.model, mapping, params,
+      instanceId, existing: null, pin: false, cidPrefix,
+    });
+    if (!plan.ok) return { ok: false, error: plan.errors[0]?.message || '应用被阻止', errors: plan.errors };
+
+    const now = Date.now();
+    const ins = {
+      id: instanceId, templateId, templateName: t.name, versionNo: version.no,
+      mapping: normalizeMappingOut(mapping, version), params: plan.params,
+      constraintIds: plan.constraints.map((c) => c.id),
+      mapHash, status: 'linked', pinned: {}, history: [{ t: now, action: 'apply', toNo: version.no }],
+      lastError: null, createdAt: now, updatedAt: now,
+    };
+    const newCids = new Set(ins.constraintIds);
+    const res = this.commit((m) => {
+      // 以计划中已求解的具体约束为准（复制其几何字段与 tpl 标签）
+      m.constraints = [...m.constraints, ...structuredClone(plan.constraints)];
+    }, { label: `应用模板「${t.name}」v${version.no}` });
+    if (!res.ok) {
+      // 提交被拒（环 / 校验 / 回放）：不留下任何实例或部分约束
+      return { ok: false, error: res.errors?.[0] || '应用被阻止', errors: res.errors || [], cycle: res.cycle };
+    }
+    this.templateInstances = [...this.templateInstances, ins];
+    this._dirty = true;
+    this.persist();
+    this._emit('templates', { type: 'apply', instanceId });
+    return { ok: true, instance: ins, plan, addedCids: ins.constraintIds };
+  }
+
+  /** 纯预览：应用 / 升级后将新增、替换、保留的约束，求解位置、未满足项与冲突链（不修改任何状态）。 */
+  planTemplate({ templateId, versionNo, mapping, params = {}, instanceId = null }) {
+    const t = this.templateById(templateId);
+    if (!t) return { ok: false, errors: [{ code: 'no-template', message: '模板不存在' }] };
+    const existing = instanceId ? this.instanceById(instanceId) : null;
+    const targetNo = versionNo || (existing ? latestAvailableNo(t, existing.versionNo) : t.publishedNo);
+    const version = tplVersion(t, targetNo);
+    if (!version) return { ok: false, errors: [{ code: 'no-version', message: `模板没有版本 v${targetNo}` }] };
+    const useMapping = mapping || existing?.mapping || {};
+    const useParams = params && Object.keys(params).length ? params : existing?.params || {};
+    const iid = instanceId || uid('ti');
+    const plan = planInstance({
+      template: t, version, model: this.headEvent.model,
+      mapping: useMapping, params: useParams, instanceId: iid,
+      existing, pin: existing ? this._instancePinnedOnBranch(existing) : false,
+      cidPrefix: iid,
+    });
+    return { ok: plan.ok, plan, template: t, version, errors: plan.errors, instance: existing };
+  }
+
+  /**
+   * 把实例升级到新版本：在一次几何提交里原子替换其约束。
+   * 升级失败（环 / 悬空 / 越界 / 校验）只影响该实例：旧约束原样保留、绝不留下部分替换，
+   * 并把失败原因记录到实例（随文档持久化，刷新/重启仍可见）。
+   */
+  upgradeInstance(instanceId, targetNo, { params = null } = {}) {
+    const ins = this.instanceById(instanceId);
+    if (!ins) return { ok: false, error: '实例不存在' };
+    const t = this.templateById(ins.templateId);
+    if (!t) return { ok: false, error: '实例引用的模板已不存在（悬空引用）' };
+    const fromV = tplVersion(t, ins.versionNo);
+    const toV = tplVersion(t, targetNo);
+    if (!fromV) return { ok: false, error: `实例固定在已缺失的版本 v${ins.versionNo}` };
+    if (!toV) return { ok: false, error: `目标版本 v${targetNo} 不存在` };
+    if (targetNo === ins.versionNo) return { ok: false, error: '实例已在该版本' };
+
+    // 迁移旧覆盖（仍存在且仍可覆盖的保留；过期覆盖丢弃并在预览中报告）
+    const migrated = migrateParams(fromV, toV, ins.params, ins.mapping);
+    const useParams = params !== null ? params : migrated.params;
+    const wasPinned = this._instancePinnedOnBranch(ins);
+
+    const plan = planInstance({
+      template: t, version: toV, model: this.headEvent.model,
+      mapping: migrated.mapping, params: useParams,
+      instanceId: ins.id, existing: ins, pin: false, cidPrefix: ins.id,
+    });
+    if (!plan.ok) {
+      const reason = plan.errors[0]?.message || '升级被阻止';
+      this._mutateInstance(instanceId, (x) => {
+        x.lastError = { at: Date.now(), action: 'upgrade', fromNo: ins.versionNo, toNo: targetNo,
+          errors: plan.errors.map((e) => ({ code: e.code, message: e.message })) };
+        x.history = [...x.history, { t: Date.now(), action: 'upgrade-failed', fromNo: ins.versionNo, toNo: targetNo, error: reason }];
+      });
+      this._dirty = true;
+      this.persist();
+      this._emit('templates', { type: 'upgrade-failed', instanceId });
+      // 旧约束未动：验证回滚后模型与实例仍一致
+      return { ok: false, error: reason, errors: plan.errors, instance: this.instanceById(instanceId) };
+    }
+
+    const oldCids = new Set(ins.constraintIds);
+    const res = this.commit((m) => {
+      // 原子替换：先移除该实例的全部旧约束，再按计划写入新约束（同键沿用旧 id）
+      m.constraints = m.constraints.filter((c) => !(c.tpl?.instanceId === instanceId));
+      m.constraints = [...m.constraints, ...structuredClone(plan.constraints)];
+    }, { label: `升级实例「${t.name}」v${ins.versionNo}→v${targetNo}` });
+    if (!res.ok) {
+      const reason = res.errors?.[0] || (res.cycle ? '升级后形成循环依赖' : '升级被阻止');
+      this._mutateInstance(instanceId, (x) => {
+        x.lastError = { at: Date.now(), action: 'upgrade', fromNo: ins.versionNo, toNo: targetNo, error: reason };
+      });
+      this._dirty = true;
+      this.persist();
+      this._emit('templates', { type: 'upgrade-failed', instanceId });
+      return { ok: false, error: reason, cycle: res.cycle, instance: this.instanceById(instanceId) };
+    }
+
+    const now = Date.now();
+    this._mutateInstance(instanceId, (x) => {
+      x.versionNo = targetNo;
+      x.params = plan.params;
+      x.mapping = normalizeMappingOut(migrated.mapping, toV);
+      x.constraintIds = plan.constraints.map((c) => c.id);
+      x.status = 'linked';
+      x.pinned = { ...x.pinned, [targetNo]: false };
+      x.mapHash = mappingFingerprint(ins.templateId, targetNo, migrated.mapping);
+      x.lastError = null;
+      x.updatedAt = now;
+      x.history = [...x.history, { t: now, action: 'upgrade', fromNo: ins.versionNo, toNo: targetNo }];
+    });
+    this._dirty = true;
+    this.persist();
+    this._emit('templates', { type: 'upgrade', instanceId, fromNo: ins.versionNo, toNo: targetNo });
+    return {
+      ok: true, plan, dropped: plan.dropped, paramDropped: migrated.dropped,
+      templateDiff: diffTemplateVersions(fromV, toV),
+    };
+  }
+
+  /**
+   * 继续固定旧版本：不改动几何，只在该实例当前分支的约束上打 pin 标记（一次可撤销提交），
+   * 之后新版本发布不再提示该实例升级。
+   */
+  pinInstanceVersion(instanceId) {
+    const ins = this.instanceById(instanceId);
+    if (!ins) return { ok: false, error: '实例不存在' };
+    if (this._instancePinnedOnBranch(ins)) return { ok: true, already: true };
+    const t = this.templateById(ins.templateId);
+    const res = this.commit((m) => {
+      for (const c of m.constraints) {
+        if (c.tpl?.instanceId === instanceId) c.tpl = { ...c.tpl, pin: true };
+      }
+    }, { label: `固定实例「${t?.name || instanceId}」在 v${ins.versionNo}` });
+    if (!res.ok) return { ok: false, error: res.errors?.[0] || '固定失败' };
+    this._mutateInstance(instanceId, (x) => { x.pinned = { ...x.pinned, [x.versionNo]: true }; x.updatedAt = Date.now(); });
+    this._dirty = true;
+    this.persist();
+    this._emit('templates', { type: 'pin', instanceId });
+    return { ok: true };
+  }
+
+  /** 取消“固定旧版本”（一次可撤销提交，移除 pin 标记，几何不变）。 */
+  unpinInstanceVersion(instanceId) {
+    const ins = this.instanceById(instanceId);
+    if (!ins) return { ok: false, error: '实例不存在' };
+    const t = this.templateById(ins.templateId);
+    const res = this.commit((m) => {
+      for (const c of m.constraints) {
+        if (c.tpl?.instanceId === instanceId) c.tpl = { ...c.tpl, pin: false };
+      }
+    }, { label: `取消固定实例「${t?.name || instanceId}」` });
+    if (!res.ok) return { ok: false, error: res.errors?.[0] || '取消固定失败' };
+    this._mutateInstance(instanceId, (x) => { x.pinned = { ...x.pinned, [x.versionNo]: false }; x.updatedAt = Date.now(); });
+    this._dirty = true;
+    this.persist();
+    this._emit('templates', { type: 'unpin', instanceId });
+    return { ok: true };
+  }
+
+  /**
+   * 脱离模板：当前分支上该实例的约束保留为普通约束（移除 tpl 标签，一次可撤销提交），
+   * 实例记录转为 detached 墓碑（不再参与升级提示），其他实例不受影响。
+   */
+  detachInstance(instanceId) {
+    const ins = this.instanceById(instanceId);
+    if (!ins) return { ok: false, error: '实例不存在' };
+    if (ins.status === 'detached') return { ok: false, error: '该实例已脱离模板' };
+    const t = this.templateById(ins.templateId);
+    const res = this.commit((m) => {
+      for (const c of m.constraints) {
+        if (c.tpl?.instanceId === instanceId) delete c.tpl;
+      }
+    }, { label: `实例脱离模板「${t?.name || ins.templateName}」` });
+    if (!res.ok) return { ok: false, error: res.errors?.[0] || '脱离失败' };
+    this._mutateInstance(instanceId, (x) => {
+      x.status = 'detached';
+      x.updatedAt = Date.now();
+      x.history = [...x.history, { t: Date.now(), action: 'detach', fromNo: x.versionNo }];
+    });
+    this._dirty = true;
+    this.persist();
+    this._emit('templates', { type: 'detach', instanceId });
+    return { ok: true };
+  }
+
+  /** 重新计算某实例在当前分支的 pin 状态（看模型标签）。 */
+  _instancePinnedOnBranch(ins) {
+    return this.headEvent.model.constraints.some((c) => c.tpl?.instanceId === ins.id && c.tpl?.pin);
+  }
+
+  /** 该实例在当前分支上是否仍以完整链接存在（用于幂等判定；脱离 / undo 到应用前不算）。 */
+  _instanceCurrentOnBranch(instanceId) {
+    const links = deriveInstanceLinks(this.templateInstances, this.headEvent.model);
+    return links.get(instanceId)?.status === 'linked';
+  }
+
+  _mutateInstance(id, fn) {
+    this.templateInstances = this.templateInstances.map((x) => {
+      if (x.id !== id) return x;
+      const clone = structuredClone(x);
+      fn(clone);
+      return clone;
+    });
+  }
+
+  /** 模板版本间差异（发布新版本后逐个实例对比用）。 */
+  templateVersionDiff(templateId, fromNo, toNo) {
+    const t = this.templateById(templateId);
+    if (!t) return null;
+    const a = tplVersion(t, fromNo), b = tplVersion(t, toNo);
+    if (!a || !b) return null;
+    return diffTemplateVersions(a, b);
+  }
+
+  /**
+   * 发布新版本后，逐个链接实例给出“升级会发生什么”的预览：
+   * 约束 / 求解差异、是否会失败（环/越界/悬空）、被丢弃的过期覆盖。
+   * 纯计算，不修改任何状态。
+   */
+  upgradePreviewsForNewVersion(templateId, toNo) {
+    const t = this.templateById(templateId);
+    if (!t || !tplVersion(t, toNo)) return [];
+    const links = this.instanceLinks();
+    const out = [];
+    for (const ins of this.templateInstances) {
+      if (ins.templateId !== templateId || ins.status === 'detached') continue;
+      const link = links.get(ins.id);
+      if (!link || link.status === 'absent') continue; // 未应用到当前分支 / 已 undo
+      if (ins.versionNo === toNo) continue;
+      const fromV = tplVersion(t, ins.versionNo);
+      const toV = tplVersion(t, toNo);
+      const pinned = !!link.pinned;
+      if (!fromV || !toV) {
+        out.push({ instanceId: ins.id, ok: false, pinned, errors: [{ code: 'missing-version', message: '实例固定在已缺失的版本' }] });
+        continue;
+      }
+      const migrated = migrateParams(fromV, toV, ins.params, ins.mapping);
+      const plan = planInstance({
+        template: t, version: toV, model: this.headEvent.model,
+        mapping: migrated.mapping, params: migrated.params,
+        instanceId: ins.id, existing: ins, pin: pinned, cidPrefix: ins.id,
+      });
+      out.push({
+        instanceId: ins.id, name: instanceLabel(ins),
+        fromNo: ins.versionNo, toNo, pinned,
+        ok: plan.ok, errors: plan.errors, changes: plan.changes,
+        constraints: plan.constraints || [], model: plan.model || null,
+        dropped: [...(plan.dropped || []), ...(migrated.dropped || [])],
+        report: plan.report, templateDiff: diffTemplateVersions(fromV, toV),
+      });
+    }
+    return out;
+  }
+
   /* ---------- 拖动（临时解 + 提交） ---------- */
 
   previewDrag(pinned, group) {
@@ -4025,6 +4634,33 @@ function withPreviewPositions(model, rep) {
     if (p) { r.x = p.x; r.y = p.y; r.w = p.w; r.h = p.h; }
   }
   return m;
+}
+
+/** 仅保留模板版本中真实存在的槽位映射（键排序、值字符串化）。 */
+function normalizeMappingOut(mapping, version) {
+  const out = {};
+  for (const s of version?.slots || []) {
+    const v = mapping?.[s.id];
+    if (v !== undefined && v !== null && v !== '') out[s.id] = String(v);
+  }
+  return out;
+}
+
+/** 实例可升级到的最高已发布版本号（草稿不计）。 */
+function latestAvailableNo(template, fallback) {
+  return template.publishedNo || Math.max(0, ...(template.versions || []).map((v) => v.no)) || fallback;
+}
+
+/** 在草稿克隆上跑一次 mutator，供冲突时保留“本地草稿”用。 */
+function buildDraftAfterMutator(baseDraft, mutator) {
+  const d = structuredClone(baseDraft);
+  try { mutator(d); } catch {}
+  return d;
+}
+
+/** 实例的显示名：模板名 + 槽位矩形名。 */
+function instanceLabel(ins) {
+  return ins.templateName || ins.templateId;
 }
 
 /** 把规则还原成可编辑 spec（409 后本地规则编辑以草稿保留时使用）。 */

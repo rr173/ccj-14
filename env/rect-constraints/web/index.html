@@ -67,6 +67,7 @@
         <button class="tab" data-tab="props">属性</button>
         <button class="tab" data-tab="conflicts">冲突 <span id="conflict-count" class="badge">0</span></button>
         <button class="tab" data-tab="versions">版本 <span id="version-count" class="badge zero">0</span></button>
+        <button class="tab" data-tab="templates" title="把选中矩形间的约束保存成带名槽位的参数化模板，应用到其他矩形组合；支持实例链接、版本升级/固定/脱离">模板 <span id="tpl-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="audit">审计/分支 <span id="audit-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="merge" title="基于共同祖先的三方合并：选择来源/目标分支，预览自动合并项与冲突，逐项保留目标/采用来源/手动填写，生成可反复打开的合并草案">合并 <span id="merge-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="experiments">实验 <span id="exp-count" class="badge zero">0</span></button>
@@ -100,6 +101,20 @@
           <select id="cmp-b" title="对比版本"></select>
         </div>
         <div id="compare-result"></div>
+      </div>
+
+      <div class="tab-body hidden" data-body="templates">
+        <div class="tpl-bar">
+          <button id="btn-new-tpl" class="primary" title="把当前选中矩形与其间约束保存为参数化模板">▣ 从所选矩形创建模板…</button>
+        </div>
+        <div class="note" style="margin:0 0 10px">
+          把选中矩形间的约束保存为带<b>具名槽位</b>的模板；应用时为每个槽位匹配一个矩形，
+          可声明间距/边/尺寸/优先级等参数允许实例覆盖。槽位缺失、重复占用、悬空引用、循环依赖或越界时不会创建实例。
+        </div>
+        <div id="tpl-warnings" class="audit-warnings hidden"></div>
+        <div id="template-list" class="list"></div>
+        <h4 class="ver-h">模板实例（当前分支）</h4>
+        <div id="template-instance-list" class="list"></div>
       </div>
 
       <div class="tab-body hidden" data-body="audit">
@@ -195,6 +210,60 @@
       <span class="spacer"></span>
       <button id="dlg-cancel">取消</button>
       <button id="dlg-ok" class="primary">提交约束</button>
+    </div>
+  </div>
+</div>
+
+<!-- 创建模板对话框 -->
+<div id="tpl-new-dlg" class="modal hidden">
+  <div class="modal-card" style="width:680px">
+    <div class="modal-head">
+      <span>▣ 从所选矩形创建参数化模板</span>
+      <span class="spacer"></span>
+      <button id="tpl-new-close" class="icon-btn">✕</button>
+    </div>
+    <div id="tpl-new-body" style="max-height:62vh;overflow:auto;padding:14px 16px"></div>
+    <div class="modal-foot">
+      <span id="tpl-new-error" class="dlg-error"></span>
+      <span class="spacer"></span>
+      <button id="tpl-new-cancel">取消</button>
+      <button id="tpl-new-ok" class="primary">保存并发布 v1</button>
+    </div>
+  </div>
+</div>
+
+<!-- 应用模板对话框 -->
+<div id="tpl-apply-dlg" class="modal hidden">
+  <div class="modal-card" style="width:760px">
+    <div class="modal-head">
+      <span id="tpl-apply-title">应用模板</span>
+      <span class="spacer"></span>
+      <button id="tpl-apply-close" class="icon-btn">✕</button>
+    </div>
+    <div id="tpl-apply-body" style="max-height:64vh;overflow:auto;padding:14px 16px"></div>
+    <div class="modal-foot">
+      <span id="tpl-apply-error" class="dlg-error"></span>
+      <span class="spacer"></span>
+      <button id="tpl-apply-cancel">取消</button>
+      <button id="tpl-apply-ok" class="primary">确认应用</button>
+    </div>
+  </div>
+</div>
+
+<!-- 模板详情 / 草稿编辑 / 版本与升级对话框 -->
+<div id="tpl-edit-dlg" class="modal hidden">
+  <div class="modal-card" style="width:820px">
+    <div class="modal-head">
+      <span id="tpl-edit-title">模板</span>
+      <span class="spacer"></span>
+      <button id="tpl-edit-close" class="icon-btn">✕</button>
+    </div>
+    <div id="tpl-edit-body" style="max-height:66vh;overflow:auto;padding:14px 16px"></div>
+    <div class="modal-foot">
+      <span id="tpl-edit-error" class="dlg-error"></span>
+      <span class="spacer"></span>
+      <button id="tpl-edit-publish" class="primary">发布为新版本</button>
+      <button id="tpl-edit-done">完成</button>
     </div>
   </div>
 </div>

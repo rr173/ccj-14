@@ -9,6 +9,7 @@ import { WorkbenchPanel } from './geom/workbenchpanel.js';
 import { ReleasePanel } from './geom/releasepanel.js';
 import { NotifyPanel } from './geom/notifypanel.js';
 import { MigrationPanel } from './geom/migrationpanel.js';
+import { TemplatePanel } from './geom/templatepanel.js';
 import {
   newRect, newSnap, newMinGap, newContain, newLock,
 } from './geom/model.js';
@@ -69,6 +70,7 @@ const workbenchPanel = new WorkbenchPanel(store, { toast });
 const releasePanel = new ReleasePanel(store, { toast });
 const notifyPanel = new NotifyPanel(store, { toast });
 const migrationPanel = new MigrationPanel(store, { toast });
+const templatePanel = new TemplatePanel(store, { toast, getSelectedRectIds: () => [...view.selected] });
 
 // 浏览器网络恢复：按 FIFO 原顺序重发通知队列（稳定 id，不重复）
 window.addEventListener('online', () => store.notifyOnline());
@@ -121,6 +123,7 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault(); view.select(store.model.rects.map((r) => r.id));
   } else if (e.key === 'Escape') {
     dialog.close(); experimentPanel.closeEditor(); view.clearSelection(); view.setCycleHighlight(null);
+    templatePanel.closeAll();
   }
 });
 
@@ -166,6 +169,13 @@ store.addEventListener('versions', (e) => {
   versionPanel.render();
   updateVersionChip();
   if (e.detail?.type === 'restore') view.clearSelection(); // 旧选择可能指向已不存在的矩形
+});
+store.addEventListener('templates', () => {
+  templatePanel.render();
+});
+store.addEventListener('templateconflict', () => {
+  templatePanel.render();
+  toast('模板草稿版本冲突：另一页面已保存更新草稿，本地草稿已保留（见模板页）', 'error');
 });
 store.addEventListener('persist', () => { $('#save-chip').textContent = '保存中…'; });
 store.addEventListener('saved', (e) => {
@@ -222,6 +232,7 @@ function renderPanels() {
   experimentPanel.render();
   workbenchPanel.render();
   migrationPanel.render();
+  templatePanel.render();
   updateButtons();
   updateChips();
 }
@@ -249,11 +260,15 @@ function renderConstraintList() {
     div.onclick = () => view.select(involvedRects);
 
     const conflict = report.conflicts.find((x) => x.cid === c.id);
+    const tplTag = c.tpl
+      ? `<span class="ctpl-tag" title="来自参数化模板实例（${c.tpl.instanceId.slice(-6)}）v${c.tpl.versionNo}${c.tpl.pin ? ' · 已固定' : ''}">▣ v${c.tpl.versionNo}${c.tpl.pin ? ' 📌' : ''}</span>`
+      : '';
     div.innerHTML = `
       <div class="row1">
         <span class="status-dot ${st?.disabled ? 'dot-off' : st?.satisfied ? 'dot-ok' : 'dot-bad'}"></span>
         <span class="kind kind-${c.kind}">${kindName(c.kind)}</span>
         <span class="desc">${escapeHtml(constraintLabel(c, new Map(model.rects.map((r) => [r.id, r]))))}</span>
+        ${tplTag}
       </div>
       <div class="meta">
         优先级

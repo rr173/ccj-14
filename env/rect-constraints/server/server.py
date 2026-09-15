@@ -168,6 +168,46 @@ def _valid_shape(doc):
     # 编辑分支三方合并草案（可为空）：轻量结构校验，共同祖先 / 环 / 越界对账在浏览器纯函数里
     if not _valid_merge_draft_shape(doc):
         return False
+    # 参数化约束模板与实例链接（可为空）：轻量结构校验，环 / 越界 / 槽位对账在浏览器纯函数里
+    if not _valid_template_shape(doc):
+        return False
+    return True
+
+
+def _valid_template_shape(doc):
+    templates = doc.get("templates", [])
+    if not isinstance(templates, list):
+        return False
+    for t in templates:
+        if not isinstance(t, dict) or not isinstance(t.get("id"), str) or not isinstance(t.get("name"), str):
+            return False
+        if not isinstance(t.get("draftRev", 0), int) or isinstance(t.get("draftRev"), bool):
+            return False
+        if t.get("draft") is not None:
+            d = t.get("draft")
+            if not isinstance(d, dict) or not isinstance(d.get("slots"), list) or not isinstance(d.get("constraints"), list):
+                return False
+            for s in d.get("slots", []):
+                if not isinstance(s, dict) or not isinstance(s.get("id"), str):
+                    return False
+        versions = t.get("versions", [])
+        if not isinstance(versions, list):
+            return False
+        for v in versions:
+            if not isinstance(v, dict) or not isinstance(v.get("no"), int) or isinstance(v.get("no"), bool):
+                return False
+            if not isinstance(v.get("slots"), list) or not isinstance(v.get("constraints"), list):
+                return False
+    instances = doc.get("templateInstances", [])
+    if not isinstance(instances, list):
+        return False
+    for i in instances:
+        if not isinstance(i, dict) or not isinstance(i.get("id"), str) or not isinstance(i.get("templateId"), str):
+            return False
+        if i.get("status") not in (None, "linked", "detached"):
+            return False
+        if not isinstance(i.get("mapping"), dict) or not isinstance(i.get("constraintIds"), list):
+            return False
     return True
 
 
@@ -1180,6 +1220,109 @@ def _merge_merge_drafts(server_list, client_list):
     return [by_id[i] for i in order]
 
 
+# ---- 参数化约束模板合流（同 web/js/geom/templates.js mergeTemplates / mergeInstances） ----
+
+def _merge_templates(server_list, client_list):
+    """模板按 id 并集：草稿 draftRev 更大者整体胜出；已发布版本按 no 并集且同 no 不改写。"""
+    by_id, order = {}, []
+
+    def put(t, from_client):
+        if not isinstance(t, dict) or not isinstance(t.get("id"), str):
+            return
+        tid = t["id"]
+        if tid not in by_id:
+            import copy
+            by_id[tid] = copy.deepcopy(t)
+            order.append(tid)
+            return
+        ex = by_id[tid]
+        if from_client and int(t.get("draftRev") or 0) >= int(ex.get("draftRev") or 0) and isinstance(t.get("name"), str):
+            ex["name"] = t["name"]
+        # 版本 no 并集，已存在的 no 绝不改写（模板版本 / 已应用版本不可改写）
+        nos = {v.get("no"): v for v in ex.get("versions", []) if isinstance(v, dict)}
+        for v in t.get("versions", []):
+            if isinstance(v, dict) and v.get("no") not in nos:
+                nos[v.get("no")] = v
+        ex["versions"] = sorted(nos.values(), key=lambda v: int(v.get("no") or 0))
+        ex["publishedNo"] = max(int(ex.get("publishedNo") or 0),
+                                *[int(v.get("no") or 0) for v in ex["versions"]], 0)
+        if int(t.get("draftRev") or 0) > int(ex.get("draftRev") or 0):
+            ex["draft"] = t.get("draft")
+            ex["draftRev"] = int(t.get("draftRev") or 0)
+        ex["updatedAt"] = max(int(ex.get("updatedAt") or 0), int(t.get("updatedAt") or 0))
+
+    for t in server_list or []:
+        put(t, False)
+    for t in client_list or []:
+        put(t, True)
+    return [by_id[i] for i in order]
+
+
+def _merge_template_instances(server_list, client_list):
+    """实例按 id 并集：updatedAt 更新者整体胜出，history 按键并集，detached 墓碑不复活。"""
+    import copy
+    by_id, order = {}, []
+    for ins in list(server_list or []) + list(client_list or []):
+        if not isinstance(ins, dict) or not isinstance(ins.get("id"), str):
+            continue
+        iid = ins["id"]
+        if iid not in by_id:
+            by_id[iid] = copy.deepcopy(ins)
+            order.append(iid)
+            continue
+        ex = by_id[iid]
+        win = ins if int(ins.get("updatedAt") or 0) >= int(ex.get("updatedAt") or 0) else ex
+        merged = dict(ex)
+        merged.update(win)
+        if ex.get("status") == "detached" or ins.get("status") == "detached":
+            det = ex if ex.get("status") == "detached" else ins
+            if int(det.get("updatedAt") or 0) >= int(merged.get("updatedAt") or 0):
+                merged["status"] = "detached"
+        hist = {}
+        for h in list(ex.get("history") or []) + list(ins.get("history") or []):
+            if isinstance(h, dict):
+                hist[f'{h.get("t")}|{h.get("action")}|{h.get("fromNo") or ""}|{h.get("toNo") or ""}'] = h
+        merged["history"] = sorted(hist.values(),
+                                   key=lambda h: (int(h.get("t") or 0), str(h.get("action") or "")))
+        by_id[iid] = merged
+    return [by_id[i] for i in order]
+
+
+def _assess_template_conflict(cur, doc):
+    """
+    模板草稿乐观并发（与 web/js/geom/store.js _checkLocalTemplateConflict 同构）。
+    仅当本次推进了某模板的 draftRev 时核验：另一页面已保存更新草稿
+    -> 409 template-draft-advanced，本地草稿保留、不覆盖对方。发布版本走 no 并集，不冲突。
+    """
+    base_revs = doc.get("baseTemplateRevs")
+    if not isinstance(base_revs, dict):
+        return None
+    if not isinstance(cur, dict):
+        cur = {}
+    server_templates = {t["id"]: t for t in cur.get("templates", []) if isinstance(t, dict) and isinstance(t.get("id"), str)}
+    for t in doc.get("templates", []) or []:
+        if not isinstance(t, dict) or not isinstance(t.get("id"), str):
+            continue
+        tid = t["id"]
+        base = base_revs.get(tid)
+        if not isinstance(base, int) or isinstance(base, bool):
+            continue
+        try:
+            client_rev = int(t.get("draftRev") or 0)
+        except (TypeError, ValueError):
+            continue
+        if client_rev <= base:
+            continue  # 仅发布版本（草稿未前进）：不拦截
+        srv = server_templates.get(tid)
+        if srv is not None and int(srv.get("draftRev") or 0) != base:
+            return {
+                "reason": "template-draft-advanced", "templateId": tid,
+                "serverDraftRev": int(srv.get("draftRev") or 0), "localDraftRev": client_rev,
+                "template": srv,
+            }
+    return None
+
+
 def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
     """跨分支并发合流。与 web/js/geom/audit.js mergeDocs 同构。"""
     evs = {e["id"]: e for e in server_doc.get("events", []) if isinstance(e, dict)}
@@ -1217,6 +1360,10 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
     releases = _merge_releases(server_doc.get("releases", []), client_doc.get("releases", []))
     migrations = _merge_migrations(server_doc.get("migrations", []), client_doc.get("migrations", []))
     merge_drafts = _merge_merge_drafts(server_doc.get("mergeDrafts", []), client_doc.get("mergeDrafts", []))
+    # 参数化约束模板：草稿 draftRev 更大者胜出、版本 no 并集不可改写；实例 id 并集、detached 墓碑不复活
+    templates = _merge_templates(server_doc.get("templates", []), client_doc.get("templates", []))
+    template_instances = _merge_template_instances(
+        server_doc.get("templateInstances", []), client_doc.get("templateInstances", []))
 
     merged = dict(server_doc)
     merged.update({
@@ -1234,6 +1381,11 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
         "releases": releases,
         "migrations": migrations,
         "mergeDrafts": merge_drafts,
+        "templates": templates,
+        "templateInstances": template_instances,
+        "activeTemplateId": server_doc.get("activeTemplateId")
+            if any(t.get("id") == server_doc.get("activeTemplateId") for t in templates)
+            else (client_doc.get("activeTemplateId") if any(t.get("id") == client_doc.get("activeTemplateId") for t in templates) else None),
         "activeMergeDraftId": server_doc.get("activeMergeDraftId")
             if any(d.get("id") == server_doc.get("activeMergeDraftId") for d in merge_drafts)
             else (client_doc.get("activeMergeDraftId") if any(d.get("id") == client_doc.get("activeMergeDraftId") for d in merge_drafts) else None),
@@ -1337,6 +1489,11 @@ class Handler(BaseHTTPRequestHandler):
             if release_conflict:
                 self._send_json(409, {"error": "release-conflict", "rev": cur_rev, **release_conflict})
                 return
+            # 参数化约束模板草稿：同一模板草稿被另一页面保存（draftRev 前进）→ 409，本地草稿保留不覆盖
+            template_conflict = _assess_template_conflict(cur, doc)
+            if template_conflict:
+                self._send_json(409, {"error": "template-conflict", "rev": cur_rev, **template_conflict})
+                return
             if doc["baseRev"] != cur_rev:
                 # 文档已被其他页面前进：先判断是否可以按分支合流
                 mergeable, info = _assess_conflict(cur, doc)
@@ -1355,6 +1512,7 @@ class Handler(BaseHTTPRequestHandler):
                     merged.pop("baseNotifyRuleRevs", None)
                     merged.pop("baseNotifyItemRevs", None)
                     merged.pop("baseReleaseRevs", None)
+                    merged.pop("baseTemplateRevs", None)
                     merged.pop("notifyOutboxTombstones", None)
                     merged["rev"] = cur_rev + 1
                     _save_doc(merged)
@@ -1367,6 +1525,7 @@ class Handler(BaseHTTPRequestHandler):
                 doc.pop("baseNotifyRuleRevs", None)
                 doc.pop("baseNotifyItemRevs", None)
                 doc.pop("baseReleaseRevs", None)
+                doc.pop("baseTemplateRevs", None)
                 doc.pop("notifyOutboxTombstones", None)
                 doc["rev"] = 1
                 _save_doc(doc)
@@ -1383,6 +1542,7 @@ class Handler(BaseHTTPRequestHandler):
             doc.pop("baseNotifyRuleRevs", None)
             doc.pop("baseNotifyItemRevs", None)
             doc.pop("baseReleaseRevs", None)
+            doc.pop("baseTemplateRevs", None)
             doc.pop("notifyOutboxTombstones", None)
             # 直存：客户端文档即权威；仅按其墓碑兜底过滤可能残留的已终结队列条目
             if outbox_tombstones and isinstance(doc.get("notifyOutbox"), list):

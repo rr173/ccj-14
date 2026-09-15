@@ -892,3 +892,42 @@ button.mini.ok { color: var(--ok); border-color: #bfe6cd; }
 .mg-res.target { color: #2f5fc4; }
 .mg-res.source { color: #237a49; }
 .mg-res.manual { color: var(--warn); }
+
+/* ==================== 参数化约束模板 ==================== */
+.tpl-bar { display: flex; gap: 8px; margin-bottom: 10px; }
+.tpl-item .vmeta code, .slot-chip code { font-size: 10px; color: var(--muted); }
+.tag-draft { background: #eef1f7; color: #5a6473; }
+.tag-pin { background: var(--warn-soft); color: var(--warn); }
+.tag-warn { background: var(--warn-soft); color: var(--warn); }
+.tag-up { background: var(--accent-soft); color: var(--accent); }
+.tpl-inst.partial { border-color: var(--warn); }
+.tpl-lasterr { font-size: 11px; color: var(--danger); margin-top: 4px; line-height: 1.5; }
+.tpl-slots { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0; font-size: 12px; }
+.slot-chip { background: #f2f5fb; border: 1px solid var(--line); border-radius: 12px; padding: 2px 10px; font-size: 12px; }
+.tpl-slots-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; margin: 8px 0; }
+.tpl-con-card { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; background: #fff; }
+.tpl-con-title { font-size: 13px; font-weight: 600; }
+.tpl-ov-row { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 6px; }
+.tpl-ov { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: #444d5c; cursor: pointer; }
+.tpl-ov code { color: var(--muted); }
+.tpl-chg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.tpl-chg { border-radius: 8px; padding: 7px 10px; font-size: 12px; background: #f7f9fd; border: 1px solid var(--line); }
+.tpl-chg ul { margin: 5px 0 0; padding-left: 18px; }
+.tpl-chg.add { border-color: #bfe3cc; background: var(--ok-soft); }
+.tpl-chg.rep { border-color: #f0d9ae; background: var(--warn-soft); }
+.tpl-chg.rm { border-color: #f0bcbc; background: var(--danger-soft); }
+.tpl-chg.keep { border-color: var(--line); }
+.tpl-pos { margin: 4px 0 0; padding-left: 18px; font-size: 12px; color: #444d5c; }
+.tpl-ok { color: var(--ok); font-size: 13px; }
+.tpl-unmet { font-size: 12px; color: var(--danger); }
+.tpl-chain { font-size: 11px; color: #7a6250; margin: 2px 0 6px; padding-left: 18px; }
+.tpl-prev-errors { background: var(--danger-soft); border: 1px solid #f0bcbc; border-radius: 8px; padding: 9px 12px; font-size: 12.5px; color: #8c2f2f; margin-top: 8px; }
+.tpl-prev-errors ul { margin: 5px 0 0; padding-left: 18px; }
+.tpl-diff { margin: 4px 0 10px; padding-left: 18px; font-size: 12.5px; }
+.tpl-diff .add { color: var(--ok); }
+.tpl-diff .rm { color: var(--danger); }
+.tpl-diff .rep { color: var(--warn); }
+.tpl-version-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.tpl-conf { font-size: 12.5px; line-height: 1.6; }
+.tpl-conf-actions { display: flex; gap: 8px; margin-top: 8px; }
+.ctpl-tag { margin-left: auto; font-size: 10px; font-weight: 700; color: var(--accent); background: var(--accent-soft); border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
