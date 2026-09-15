@@ -81,5 +81,56 @@ ok(s3.model.rects.some((r) => r.name === '冲突页几何'), '冲突页几何编
 // 草稿仍是页面一的 rev（页面二本地草稿未覆盖）
 ok(s3.templateById(tplId).draft.slots[0].label === '页面一', '本地过期草稿未覆盖对方草稿');
 
+// 8) 脱离 → 撤销：实例记录 / 约束链接 / 可升级状态一起恢复；重做重新脱离；刷新保持
+await fetch(BASE + '/api/reset', { method: 'POST' });
+const s4 = new Store({ base: BASE });
+await s4.load();
+const A4 = byName(s4, '卡片A'), B4 = byName(s4, '标签B');
+const c4 = s4.createTemplateFromSelection('脱离撤销', [A4, B4], { publish: true });
+ok(c4.ok, '（脱离场景）创建模板');
+const t4 = c4.template.id;
+const vv = c4.template.versions[0];
+const mm = {};
+for (const slot of vv.slots) mm[slot.id] = slot.label.includes('A') ? A4 : B4;
+const a4 = s4.applyTemplate({ templateId: t4, versionNo: 1, mapping: mm });
+ok(a4.ok, '（脱离场景）应用模板');
+const i4 = a4.instance.id;
+const cids4 = [...a4.instance.constraintIds];
+const sk4 = vv.constraints.find((c) => c.kind === 'snap').key;
+s4.updateTemplateDraft(t4, (d) => { const c = d.constraints.find((x) => x.key === sk4); c.priority = 321; c.overrides.priority.value = 321; }, 1);
+s4.publishTemplate(t4);
+await s4.flushed();
+ok(s4.upgradePreviewsForNewVersion(t4, 2).length === 1, '（脱离场景）脱离前可升级预览 1 条');
+ok(s4.detachInstance(i4).ok, '（脱离场景）执行脱离');
+await s4.flushed();
+ok(s4.instanceById(i4).status === 'detached', '（脱离场景）记录为 detached');
+ok(s4.upgradePreviewsForNewVersion(t4, 2).length === 0, '（脱离场景）脱离后无升级预览');
+// 撤销
+s4.undo();
+await s4.flushed();
+ok(s4.instanceById(i4).status === 'linked', '撤销脱离：实例记录恢复 linked');
+ok(s4.model.constraints.filter((c) => c.tpl?.instanceId === i4).length === vv.constraints.length, '撤销脱离：画布约束链接恢复');
+ok(s4.upgradePreviewsForNewVersion(t4, 2).length === 1, '撤销脱离：重新出现在新版本升级预览里');
+// 刷新：从服务端重新装载，结果一致
+const s5 = new Store({ base: BASE });
+await s5.load();
+ok(s5.instanceById(i4).status === 'linked', '撤销后刷新：记录仍 linked');
+ok(s5.instanceLinks().get(i4)?.status === 'linked', '撤销后刷新：链接 linked');
+for (const cid of cids4) ok(!!s5.model.constraints.find((c) => c.id === cid && c.tpl?.instanceId === i4), `撤销后刷新：约束 ${cid} 标签在`);
+ok(s5.upgradePreviewsForNewVersion(t4, 2).length === 1, '撤销后刷新：仍可升级');
+// 重做脱离
+s5.redo();
+await s5.flushed();
+ok(s5.instanceById(i4).status === 'detached', '重做：记录重新 detached');
+ok(s5.model.constraints.filter((c) => c.tpl?.instanceId === i4).length === 0, '重做：标签再次移除');
+ok(cids4.every((cid) => s5.model.constraints.some((c) => c.id === cid && !c.tpl)), '重做：约束保留为普通约束');
+ok(s5.upgradePreviewsForNewVersion(t4, 2).length === 0, '重做：无升级预览');
+// 再刷新保持
+const s6 = new Store({ base: BASE });
+await s6.load();
+ok(s6.instanceById(i4).status === 'detached', '重做后刷新：保持 detached');
+ok(s6.instanceLinks().get(i4)?.status === 'absent', '重做后刷新：链接 absent');
+ok(s6.upgradePreviewsForNewVersion(t4, 2).length === 0, '重做后刷新：无升级预览');
+
 console.log(`\n模板 e2e：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

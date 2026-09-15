@@ -22,12 +22,13 @@ globalThis.localStorage = {
 globalThis.fetch = () => { throw new Error('offline'); };
 
 const { Store } = await import('../web/js/geom/store.js');
+const { MAIN_BRANCH } = await import('../web/js/geom/audit.js');
 const { newRect, newSnap, newMinGap, newContain } = await import('../web/js/geom/model.js');
 const {
   extractDraft, publishVersion, templateVersion, planInstance, mappingFingerprint,
   validateMapping, diffTemplateVersions, migrateParams, deriveInstanceLinks,
   sanitizeTemplates, sanitizeInstances, mergeTemplates, mergeInstances,
-  validateDraft, templateCycle,
+  validateDraft, templateCycle, deriveInstanceRecordStatus, reconcileInstanceStatuses,
 } = await import('../web/js/geom/templates.js');
 
 const freshStore = async () => {
@@ -491,6 +492,184 @@ test('mappingFingerprint 确定性：同模板版本同映射同指纹，换槽�
   assert.equal(a, b);
   assert.notEqual(a, mappingFingerprint('t', 2, { a: 'r1', b: 'r2' }));
   assert.notEqual(a, mappingFingerprint('t', 1, { a: 'r1', b: 'r3' }));
+});
+
+/* ---------------- 脱离的 undo/redo：实例记录 / 约束链接 / 可升级状态同一恢复 ---------------- */
+
+test('脱离后撤销：实例记录、约束链接、可升级状态一起恢复；可再次脱离', async () => {
+  const s = await freshStore();
+  const { tpl, slotMap } = makeABTemplate(s);
+  const applied = s.applyTemplate({ templateId: tpl.id, versionNo: 1, mapping: slotMap() });
+  const id = applied.instance.id;
+  const cids = [...applied.instance.constraintIds];
+
+  // 发布 v2，使实例成为“可升级”
+  const snapKey = tpl.versions[0].constraints.find((c) => c.kind === 'snap').key;
+  s.updateTemplateDraft(tpl.id, (d) => { const c = d.constraints.find((x) => x.key === snapKey); c.priority = 321; c.overrides.priority.value = 321; }, 1);
+  s.publishTemplate(tpl.id);
+  assert.equal(s.upgradePreviewsForNewVersion(tpl.id, 2).length, 1);
+
+  // 脱离
+  assert.equal(s.detachInstance(id).ok, true);
+  assert.equal(s.instanceById(id).status, 'detached');
+  assert.equal(s.model.constraints.filter((c) => c.tpl?.instanceId === id).length, 0);
+  // 普通约束仍在
+  for (const cid of cids) assert.ok(s.model.constraints.some((c) => c.id === cid && !c.tpl));
+  assert.equal(s.upgradePreviewsForNewVersion(tpl.id, 2).length, 0);
+  assert.equal(s.instanceLinks().get(id).status, 'absent');
+
+  // 撤销脱离：画布标签、实例记录、可升级状态必须一起恢复
+  s.undo();
+  const insAfterUndo = s.instanceById(id);
+  assert.equal(insAfterUndo.status, 'linked', '撤销后实例记录恢复 linked');
+  assert.equal(s.instanceLinks().get(id).status, 'linked', '撤销后约束链接恢复 linked');
+  for (const cid of cids) {
+    const c = s.model.constraints.find((x) => x.id === cid);
+    assert.ok(c && c.tpl?.instanceId === id, `约束 ${cid} 的 tpl 标签恢复`);
+  }
+  const previews = s.upgradePreviewsForNewVersion(tpl.id, 2);
+  assert.equal(previews.length, 1, '撤销后实例重新出现在 v2 升级预览里');
+  assert.equal(previews[0].instanceId, id);
+  // 可再次脱离（幂等防护不误判）
+  assert.equal(s.detachInstance(id).ok, true);
+  assert.equal(s.instanceById(id).status, 'detached');
+  // 再撤销
+  s.undo();
+  assert.equal(s.instanceById(id).status, 'linked');
+  assert.equal(s.instanceLinks().get(id).status, 'linked');
+});
+
+test('撤销脱离后重做：重新变为脱离状态（标签移除、记录 detached、无升级预览）', async () => {
+  const s = await freshStore();
+  const { tpl, slotMap } = makeABTemplate(s);
+  const applied = s.applyTemplate({ templateId: tpl.id, versionNo: 1, mapping: slotMap() });
+  const id = applied.instance.id;
+  const cids = [...applied.instance.constraintIds];
+  const snapKey = tpl.versions[0].constraints.find((c) => c.kind === 'snap').key;
+  s.updateTemplateDraft(tpl.id, (d) => { const c = d.constraints.find((x) => x.key === snapKey); c.priority = 111; c.overrides.priority.value = 111; }, 1);
+  s.publishTemplate(tpl.id);
+
+  s.detachInstance(id);
+  s.undo();
+  assert.equal(s.instanceById(id).status, 'linked');
+  s.redo();
+  assert.equal(s.instanceById(id).status, 'detached', '重做后记录重新 detached');
+  assert.equal(s.model.constraints.filter((c) => c.tpl?.instanceId === id).length, 0, '重做后标签再次移除');
+  for (const cid of cids) assert.ok(s.model.constraints.some((c) => c.id === cid), '重做后普通约束保留');
+  assert.equal(s.instanceLinks().get(id).status, 'absent');
+  assert.equal(s.upgradePreviewsForNewVersion(tpl.id, 2).length, 0);
+
+  // 再 undo/redo 一轮仍确定一致
+  s.undo();
+  assert.equal(s.instanceById(id).status, 'linked');
+  assert.equal(s.instanceLinks().get(id).status, 'linked');
+  s.redo();
+  assert.equal(s.instanceById(id).status, 'detached');
+  assert.equal(s.instanceLinks().get(id).status, 'absent');
+});
+
+test('刷新后保持撤销/重做的同一结果（刷新愈合旧墓碑）', async () => {
+  const s = await freshStore();
+  const { tpl, slotMap } = makeABTemplate(s);
+  const applied = s.applyTemplate({ templateId: tpl.id, versionNo: 1, mapping: slotMap() });
+  const id = applied.instance.id;
+  const cids = [...applied.instance.constraintIds];
+  const snapKey = tpl.versions[0].constraints.find((c) => c.kind === 'snap').key;
+  s.updateTemplateDraft(tpl.id, (d) => { const c = d.constraints.find((x) => x.key === snapKey); c.priority = 222; c.overrides.priority.value = 222; }, 1);
+  s.publishTemplate(tpl.id);
+  s.detachInstance(id);
+  s.undo(); // 当前 head：链接恢复
+  await s.flushed();
+
+  // 新页面装载同一份存档（head 停在撤销后的位置）
+  const s2 = new Store({ base: '' });
+  await s2.load();
+  assert.equal(s2.instanceById(id).status, 'linked', '刷新后记录随 head 恢复 linked');
+  assert.equal(s2.instanceLinks().get(id).status, 'linked');
+  assert.equal(s2.upgradePreviewsForNewVersion(tpl.id, 2).length, 1, '刷新后可升级状态恢复');
+  for (const cid of cids) {
+    const c = s2.model.constraints.find((x) => x.id === cid);
+    assert.ok(c && c.tpl?.instanceId === id, `刷新后约束 ${cid} 标签恢复`);
+  }
+  // 在 s2 上重做脱离：刷新后 undo/redo 链仍可用
+  s2.redo();
+  assert.equal(s2.instanceById(id).status, 'detached');
+  assert.equal(s2.model.constraints.filter((c) => c.tpl?.instanceId === id).length, 0);
+  await s2.flushed();
+
+  // 再刷新：保持脱离
+  const s3 = new Store({ base: '' });
+  await s3.load();
+  assert.equal(s3.instanceById(id).status, 'detached', '重做脱离后刷新保持 detached');
+  assert.equal(s3.instanceLinks().get(id).status, 'absent');
+  assert.equal(s3.upgradePreviewsForNewVersion(tpl.id, 2).length, 0);
+});
+
+test('旧版本存档（画布已链接、记录却是 detached 墓碑）装载时确定性愈合', async () => {
+  const s = await freshStore();
+  const { tpl, slotMap } = makeABTemplate(s);
+  const applied = s.applyTemplate({ templateId: tpl.id, versionNo: 1, mapping: slotMap() });
+  const id = applied.instance.id;
+  // 模拟旧版本留下的撕裂：记录是 detached，但当前 head 模型上标签齐全
+  const doc = {
+    events: s.events, branches: s.branches, currentBranchId: s.currentBranchId,
+    templates: s.templates,
+    templateInstances: s.templateInstances.map((x) => (x.id === id ? { ...x, status: 'detached' } : x)),
+    versions: [], actor: s.actor,
+  };
+  mem.set('rect-constraints-doc-v2', JSON.stringify(doc));
+  const s2 = new Store({ base: '' });
+  await s2.load();
+  assert.equal(s2.instanceById(id).status, 'linked', '装载时按 head 标签愈合为 linked');
+  assert.equal(s2.instanceLinks().get(id).status, 'linked');
+});
+
+test('切换分支 / 另存分支：实例记录状态随目标 head 对齐', async () => {
+  const s = await freshStore();
+  const { tpl, slotMap } = makeABTemplate(s);
+  const applied = s.applyTemplate({ templateId: tpl.id, versionNo: 1, mapping: slotMap() });
+  const id = applied.instance.id;
+  // fork 到应用之后的事件：新分支同样链接
+  const headId = s.headEvent.id;
+  const fork = s.forkFromEvent(headId, '分支X');
+  assert.ok(fork.ok);
+  const xBranchId = fork.branch.id;
+  assert.equal(s.instanceById(id).status, 'linked');
+  // 在新分支脱离
+  s.detachInstance(id);
+  assert.equal(s.instanceById(id).status, 'detached');
+  // 切回主分支（主分支 head 仍是应用事件）：记录按主分支 head 恢复 linked
+  const back = s.switchBranch(MAIN_BRANCH);
+  assert.ok(back.ok);
+  assert.equal(s.instanceById(id).status, 'linked');
+  assert.equal(s.instanceLinks().get(id).status, 'linked');
+  // 再切回分支X：又变为 detached
+  s.switchBranch(xBranchId);
+  assert.equal(s.instanceById(id).status, 'detached');
+  assert.equal(s.instanceLinks().get(id).status, 'absent');
+});
+
+test('deriveInstanceRecordStatus / reconcileInstanceStatuses 纯函数规则', () => {
+  const ins = { id: 'i', status: 'linked', constraintIds: ['c1', 'c2'] };
+  const linkedModel = { constraints: [{ id: 'c1', tpl: { instanceId: 'i' } }, { id: 'c2', tpl: { instanceId: 'i' } }] };
+  const detachedModel = { constraints: [{ id: 'c1' }, { id: 'c2' }] };
+  const absentModel = { constraints: [{ id: 'other' }] };
+  assert.equal(deriveInstanceRecordStatus(ins, linkedModel), 'linked');
+  assert.equal(deriveInstanceRecordStatus(ins, detachedModel), 'detached');
+  // 标签全无且约束也不在：保持原状态（墓碑不复活 / 未应用不变 linked）
+  assert.equal(deriveInstanceRecordStatus(ins, absentModel), 'linked');
+  assert.equal(deriveInstanceRecordStatus({ ...ins, status: 'detached' }, absentModel), 'detached');
+  // 部分标签在 -> 仍是 linked（partial 链接，可继续脱离）
+  const partialModel = { constraints: [{ id: 'c1', tpl: { instanceId: 'i' } }, { id: 'c2' }] };
+  assert.equal(deriveInstanceRecordStatus(ins, partialModel), 'linked');
+
+  const r1 = reconcileInstanceStatuses([{ ...ins, status: 'detached' }], linkedModel, { now: 100 });
+  assert.equal(r1.changed, true);
+  assert.equal(r1.instances[0].status, 'linked');
+  assert.ok(r1.instances[0].updatedAt >= 100, '愈合推进 updatedAt 以压过旧墓碑合流');
+  const r2 = reconcileInstanceStatuses([ins], linkedModel, { now: 100 });
+  assert.equal(r2.changed, false);
+  assert.equal(r2.instances[0], ins);
 });
 
 /* ---------------- 注册 ---------------- */

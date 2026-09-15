@@ -72,7 +72,8 @@ import {
 import {
   extractDraft, publishVersion, templateVersion as tplVersion,
   planInstance, mappingFingerprint, diffTemplateVersions, migrateParams,
-  deriveInstanceLinks, normalizeDraft as normalizeTplDraft, validateDraft,
+  deriveInstanceLinks, reconcileInstanceStatuses,
+  normalizeDraft as normalizeTplDraft, validateDraft,
   setOverridable as tplSetOverridable, setDraftParamDefault,
   sanitizeTemplates, sanitizeInstances, mergeTemplates, mergeInstances,
   normalizeKeepTags, tplConstraintLabel,
@@ -192,10 +193,12 @@ export class Store extends EventTarget {
     }
     await this._adopt(doc, { seed: true });
     this._dirty = false;
-    // 首次播种 / 迁移后立即回写并等待确认；正常加载不产生版本号竞争
-    if (this._needsInitialPersist || this._notifyNeedsPersist) {
+    // 首次播种 / 迁移后立即回写并等待确认；正常加载不产生版本号竞争。
+    // 实例 status 愈合（刷新后与当前 head 标签对齐）也需补存一次，否则刷新结果不落盘。
+    if (this._needsInitialPersist || this._notifyNeedsPersist || this._templateStatusHealed) {
       this._needsInitialPersist = false;
       this._notifyNeedsPersist = false;
+      this._templateStatusHealed = false;
       this._dirty = true;
       this.persist();
       await this.flushed();
@@ -210,6 +213,7 @@ export class Store extends EventTarget {
 
   /** 把一个（可能是旧版、可能损坏的）文档装载为当前状态。 */
   async _adopt(doc, { seed = false, keepReviewConflict = false } = {}) {
+    this._templateStatusHealed = false;
     const savedReviewConflict = keepReviewConflict ? this.reviewConflict : null;
     const savedProposals = keepReviewConflict ? new Map(this._reviewProposals) : null;
     let seeded = false;
@@ -361,6 +365,17 @@ export class Store extends EventTarget {
     this.templateConflict = savedTemplateConflict && this.templates.some((t) => t.id === savedTemplateConflict.templateId)
       ? { ...savedTemplateConflict, serverDraftRev: this.templateById(savedTemplateConflict.templateId)?.draftRev ?? savedTemplateConflict.serverDraftRev }
       : null;
+
+    // 按【当前分支 head】的 tpl 标签对齐实例记录 status：刷新 / 重启 / 合流重载后，
+    // “画布链接已恢复但记录仍是 detached 墓碑”的旧状态（含旧版本存档）在此确定性愈合，
+    // 与 undo/redo / 切分支走同一派生规则；有翻转时标记一次，由 load()/保存链补存。
+    if (this.templateInstances.length) {
+      const { instances, changed } = reconcileInstanceStatuses(this.templateInstances, this.headEvent.model);
+      if (changed) {
+        this.templateInstances = instances;
+        this._templateStatusHealed = true;
+      }
+    }
   }
 
   /**
@@ -1055,6 +1070,13 @@ export class Store extends EventTarget {
           // 否则从新分支切回原分支后首个提交会携带 fork 前的旧 head，被误判 branch-advanced。
           for (const b of this.branches) this._syncedHeads[b.id] = b.headEventId;
           this._dirty = false;
+          // 合流文档里的实例 status 可能来自旧副本（仍是 detached 墓碑）：adopt 已按当前
+          // head 愈合，若有翻转补存一次，让权威文档与画布链接状态一致。
+          if (this._templateStatusHealed) {
+            this._templateStatusHealed = false;
+            this._dirty = true;
+            this.persist();
+          }
           this._emit('load');
           this._emit('saved', { rev: this.rev, merged: true });
           return;
@@ -1267,6 +1289,10 @@ export class Store extends EventTarget {
     const tipWas = b.redoTipId || cur.id;
     this._replaceBranch({ ...b, headEventId: cur.parentId, redoTipId: tipWas });
     this.dragPreview = null;
+    // head 回到上一条事件后，文档级实例记录（detach 墓碑等）必须随画布 tpl 标签一起回退：
+    // 撤销“实例脱离”时实例记录恢复 linked、可升级状态与升级预览同时恢复；撤销“应用/升级”
+    // 时记录保持原样（当前 head 上没有其约束，墓碑规则不变）。
+    this._reconcileTemplateStatuses();
     this._dirty = true;
     this.persist();
     this._emit('change', { label: 'undo' });
@@ -1282,6 +1308,8 @@ export class Store extends EventTarget {
     const redoTipId = nextId === b.redoTipId ? null : b.redoTipId;
     this._replaceBranch({ ...b, headEventId: nextId, redoTipId });
     this.dragPreview = null;
+    // 重做“实例脱离”：标签再次移除、约束保留为普通约束，记录重新变为 detached。
+    this._reconcileTemplateStatuses();
     this._dirty = true;
     this.persist();
     this._emit('change', { label: 'redo' });
@@ -1413,6 +1441,8 @@ export class Store extends EventTarget {
     this.currentBranchId = id;
     this.replayEventId = null;
     this.replaySnapshot = null;
+    // 新分支 head 是来源快照：实例记录状态按该 head 的 tpl 标签对齐
+    this._reconcileTemplateStatuses();
     this._syncedHeads[id] = root.id;
     // 当前分支从原分支切走：其余已知分支的 head 都来自已装载的权威文档，补齐其乐观基线，
     // 否则以后切回原分支提交时 baseHeads 仍是 fork 前的旧值，会被误判 branch-advanced。
@@ -1436,6 +1466,8 @@ export class Store extends EventTarget {
     // 切换到的分支 head 来自已装载的权威文档：登记为乐观基线，
     // 否则切分支后的首个提交 baseHeads 缺该分支，会被误判为 branch-advanced。
     if (this._syncedHeads[id] === undefined) this._syncedHeads[id] = b.headEventId;
+    // 实例记录的 linked/detached 是相对当前分支 head 的：切换后按新 head 对齐
+    this._reconcileTemplateStatuses();
     this._dirty = true; // 记住用户最后停留的分支
     this.persist();
     this._emit('branch', { type: 'switch', id });
@@ -1858,6 +1890,8 @@ export class Store extends EventTarget {
     this.currentBranchId = tb.id;
     this.replayEventId = null;
     this.replaySnapshot = null;
+    // 合并结果成为新 head：实例记录 status 按合并后模型的 tpl 标签对齐
+    this._reconcileTemplateStatuses();
 
     // 回填完整合并报告（合并前后差异 + 逐项裁决）到事件与草案
     const report = buildMergeReport({
@@ -3773,6 +3807,8 @@ export class Store extends EventTarget {
       this.currentBranchId = bid;
       this.replayEventId = null;
       this.replaySnapshot = null;
+      // 迁移导入分支的 head 是外部布局快照：实例记录状态按该 head 对齐
+      this._reconcileTemplateStatuses();
     }
   }
 
@@ -4066,6 +4102,8 @@ export class Store extends EventTarget {
     this.currentBranchId = id;
     this.replayEventId = null;
     this.replaySnapshot = null;
+    // 新分支 head 是来源快照：实例记录状态按该 head 的 tpl 标签对齐
+    this._reconcileTemplateStatuses();
     this._syncedHeads[id] = root.id;
     this._dirty = true;
     this.persist();
@@ -4156,6 +4194,25 @@ export class Store extends EventTarget {
   /** 当前分支上每个实例的链接状态（由模型约束 tpl 标签派生，undo/redo 天然一致）。 */
   instanceLinks() {
     return deriveInstanceLinks(this.templateInstances, this.headEvent.model);
+  }
+
+  /**
+   * 把文档级实例记录的 status 对齐到【当前分支 head】模型：
+   * undo 脱离 / redo 脱离 / 切换分支 / 装载合流后，画布标签与实例记录必须同一状态，
+   * 升级预览、实例计数等读 status 的地方才不会与画布撕裂。
+   * 发生翻转时记录 updatedAt 已在纯函数里推进（合流时压过旧 detached 墓碑）。
+   */
+  _reconcileTemplateStatuses({ persist = true } = {}) {
+    if (!this.templateInstances.length) return false;
+    const { instances, changed } = reconcileInstanceStatuses(this.templateInstances, this.headEvent.model);
+    if (changed) {
+      this.templateInstances = instances;
+      if (persist) {
+        this._dirty = true;
+        this.persist();
+      }
+    }
+    return changed;
   }
 
   /** 模型中属于某实例的具体约束（当前分支）。 */
@@ -4506,12 +4563,16 @@ export class Store extends EventTarget {
 
   /**
    * 脱离模板：当前分支上该实例的约束保留为普通约束（移除 tpl 标签，一次可撤销提交），
-   * 实例记录转为 detached 墓碑（不再参与升级提示），其他实例不受影响。
+   * 实例记录转为 detached（不再参与升级提示），其他实例不受影响。
+   * 记录的 linked/detached 与画布标签由 reconcileInstanceStatuses 在 undo/redo / 装载 /
+   * 切分支时统一对齐：撤销脱离会一起恢复记录、约束链接与可升级状态，重做则再次脱离。
    */
   detachInstance(instanceId) {
     const ins = this.instanceById(instanceId);
     if (!ins) return { ok: false, error: '实例不存在' };
-    if (ins.status === 'detached') return { ok: false, error: '该实例已脱离模板' };
+    // 以当前 head 上的实际标签为准（记录 status 可能尚未随某次 undo 对齐）
+    const linkedOnBranch = this.headEvent.model.constraints.some((c) => c.tpl?.instanceId === instanceId);
+    if (ins.status === 'detached' || !linkedOnBranch) return { ok: false, error: '该实例已脱离模板' };
     const t = this.templateById(ins.templateId);
     const res = this.commit((m) => {
       for (const c of m.constraints) {

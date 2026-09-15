@@ -703,6 +703,45 @@ export function deriveInstanceLinks(instances, model) {
   return out;
 }
 
+/**
+ * 由【当前 head 模型】派生实例【记录】应有的 status（'linked' | 'detached'）。
+ *
+ * 记录 status 是文档级状态，但几何的 tpl 标签随审计事件链移动；undo/redo / 切换分支 /
+ * 刷新装载后必须以当前 head 上的标签为准重算，否则会出现“画布链接已恢复、记录仍是
+ * detached 墓碑”的撕裂（撤销脱离后实例不进升级预览、不能再次脱离等）。
+ *
+ *  - 模型里还有带本实例标签的约束 -> linked（含 partial：仍挂在模板上，可继续升级/脱离）；
+ *  - 标签全无、但实例约束 id 仍作为【普通约束】留在模型里 -> detached（脱离的语义：
+ *    链接移除、几何约束保留；redo 脱离时由此重新得到 detached）；
+ *  - 标签与普通约束都不在当前 head（未应用到本分支 / undo 回到应用之前）-> 保持记录
+ *    原状态：无法仅凭当前模型区分“从未应用”与“已脱离且约束也被删”，保持墓碑不复活。
+ */
+export function deriveInstanceRecordStatus(ins, model) {
+  const constraints = model?.constraints || [];
+  const tagged = constraints.some((c) => c.tpl?.instanceId === ins.id);
+  if (tagged) return 'linked';
+  const known = new Set(ins.constraintIds || []);
+  const plainKept = known.size && constraints.some((c) => known.has(c.id) && !c.tpl?.instanceId);
+  if (plainKept) return 'detached';
+  return ins.status === 'detached' ? 'detached' : 'linked';
+}
+
+/**
+ * 批量对齐全部实例记录的 status 到给定 head 模型（纯函数，返回 {instances, changed}）。
+ * status 发生翻转时把 updatedAt 推进到 now（不小于原值），使多页签 / 服务端合流时
+ * “已撤销脱离（linked）”能压过旧 detached 墓碑，而不会被旧副本按墓碑规则复活。
+ */
+export function reconcileInstanceStatuses(instances, model, { now = Date.now() } = {}) {
+  let changed = false;
+  const next = (instances || []).map((ins0) => {
+    const status = deriveInstanceRecordStatus(ins0, model);
+    if (status === ins0.status) return ins0;
+    changed = true;
+    return { ...ins0, status, updatedAt: Math.max(ins0.updatedAt || 0, now) + 1 };
+  });
+  return { instances: next, changed };
+}
+
 /* ---------------- 清洗 / 合流（持久化 & 多页签） ---------------- */
 
 /** 载入时清洗模板列表（结构不完整丢弃；版本只读、按 no 去重保留第一条）。 */
