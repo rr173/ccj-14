@@ -10,7 +10,7 @@
 
 import { diffHtml } from './diff.js';
 
-const KIND_LABEL = { root: '初始', edit: '编辑', 'fork-root': '分支起点', merge: '合并' };
+const KIND_LABEL = { root: '初始', edit: '编辑', 'fork-root': '分支起点', merge: '合并', impact: '安全变更' };
 
 export class AuditPanel {
   constructor(store, hooks) {
@@ -159,6 +159,8 @@ export class AuditPanel {
       ? `<div class="tl-prov">来源：${escapeHtml(this.store.branches.find((b) => b.id === ev.provenance.branchId)?.name || ev.provenance.branchId)} #${ev.provenance.seq}</div>` : '';
     const mergeInfo = ev.kind === 'merge' && ev.merge
       ? `<div class="tl-prov">三方合并来源：${escapeHtml(this.store.branches.find((b) => b.id === ev.merge.sourceBranchId)?.name || ev.merge.sourceBranchId)} #${ev.merge.sourceHeadSeq ?? '?'}（共同祖先 #${this._baseSeq(ev.merge.baseEventId)}）· 自动 ${ev.merge.auto ?? 0} 项 / 冲突 ${ev.merge.conflicts ?? 0} 项</div>` : '';
+    const impactInfo = ev.kind === 'impact' && ev.impact
+      ? `<div class="tl-prov">影响分析安全变更：候选 ${ev.impact.changes?.length ?? ev.impact.changeIds?.length ?? 0} 项 · 基线指纹 ${(ev.impact.baseHash || '').slice(0, 8)} · 结果指纹 ${(ev.impact.resultHash || ev.hash || '').slice(0, 8)}（同组候选重复提交不产生重复事件）</div>` : '';
     const changeSum = ev.changes && !ev.changes.identical ? this._changeSummary(ev.changes) : '';
     if (r.corrupt) {
       return `<div class="${cls}" data-eid="${ev.id}" data-clickable="0">
@@ -185,7 +187,7 @@ export class AuditPanel {
         矩形 ${nRect} · 约束 ${nCons} · 冲突 ${nConf}
       </div>
       <div class="tl-hash">指纹 ${hashB} → <b>${ev.hash.slice(0, 8)}</b>${changeSum ? ' · ' + changeSum : ''}</div>
-      ${prov}${mergeInfo}
+      ${prov}${mergeInfo}${impactInfo}
       <div class="tl-actions">
         <button class="mini" data-act="replay">▶ 重放到此</button>
         <button class="mini" data-act="fork" title="把这一刻的完整布局另存为新的编辑分支（原事件与原分支不改写）">⎇ 另存为分支</button>

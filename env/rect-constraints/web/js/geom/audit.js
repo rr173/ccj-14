@@ -31,6 +31,7 @@ import { validate, normalize, seedModel, uid } from './model.js';
 import { compareVersions } from './versions.js';
 import { mergeExperiments } from './experiments.js';
 import { mergeMergeDrafts } from './merge.js';
+import { mergeImpactSnapshots } from './impact.js';
 
 export const MAIN_BRANCH = 'main';
 
@@ -161,6 +162,28 @@ export function makeMigrationForkRootEvent(result, meta, { actor, t = Date.now()
       quarantinedCount: Array.isArray(result.quarantined) ? result.quarantined.length : 0,
     },
   });
+}
+
+/* ---------------- 影响分析安全变更事件 ---------------- */
+
+/**
+ * 由一次已接受的影响分析安全变更构造审计事件（调用方须先完成模拟管线校验）。
+ * 事件挂在快照绑定的分支 head 之后；事件带 impact 元数据（快照 id、分析时文档版本、
+ * 逐项候选变更与结果指纹），完整影响报告可由快照 / 事件重建。
+ */
+export function makeImpactEvent(parent, branch, model, report, meta) {
+  const changes = parent ? compareVersions(like(parent), { model, report, hash: report.hash }) : null;
+  const ev = {
+    id: uid('e'), branch, parentId: parent ? parent.id : null,
+    kind: 'impact', seq: parent ? parent.seq + 1 : 1,
+    t: meta.t ?? Date.now(), actor: String(meta.actor || '未署名'),
+    label: String(meta.label || '安全变更'),
+    model: structuredClone(model), report: structuredClone(report), hash: report.hash,
+    hashBefore: parent ? parent.hash : null,
+    changes, conflicts: structuredClone(report.conflicts),
+    impact: structuredClone(meta.impact),
+  };
+  return freeze(ev);
 }
 
 /* ---------------- 三方合并事件 ---------------- */
@@ -406,7 +429,7 @@ function sanitizeEvent(raw, warnings) {
     id: raw.id,
     branch: typeof raw.branch === 'string' ? raw.branch : MAIN_BRANCH,
     parentId: typeof raw.parentId === 'string' ? raw.parentId : null,
-    kind: ['root', 'edit', 'fork-root', 'merge'].includes(raw.kind) ? raw.kind : 'edit',
+    kind: ['root', 'edit', 'fork-root', 'merge', 'impact'].includes(raw.kind) ? raw.kind : 'edit',
     seq: Number.isFinite(raw.seq) && raw.seq > 0 ? Math.floor(raw.seq) : 0,
     t: Number.isFinite(raw.t) ? raw.t : 0,
     actor: typeof raw.actor === 'string' ? raw.actor : '未知操作者',
@@ -466,6 +489,7 @@ function sanitizeEvent(raw, warnings) {
       : structuredClone(rep.conflicts),
     ...(raw.provenance && typeof raw.provenance === 'object' ? { provenance: raw.provenance } : {}),
     ...(raw.merge && typeof raw.merge === 'object' ? { merge: raw.merge } : {}),
+    ...(raw.impact && typeof raw.impact === 'object' ? { impact: raw.impact } : {}),
   });
 }
 
@@ -569,6 +593,12 @@ export function mergeDocs(serverDoc, clientDoc) {
     Array.isArray(clientDoc.mergeDrafts) ? clientDoc.mergeDrafts : [],
   );
 
+  // 影响分析快照按 id 合流：applied 不被 open 旧副本降级，open 以最近更新者为准
+  const impactSnapshots = mergeImpactSnapshots(
+    Array.isArray(serverDoc.impactSnapshots) ? serverDoc.impactSnapshots : [],
+    Array.isArray(clientDoc.impactSnapshots) ? clientDoc.impactSnapshots : [],
+  );
+
   return {
     ...serverDoc,
     events: [...evs.values()],
@@ -576,6 +606,7 @@ export function mergeDocs(serverDoc, clientDoc) {
     versions: [...vs.values()],
     experiments,
     mergeDrafts,
+    impactSnapshots,
     currentVersionId: serverDoc.currentVersionId ?? null,
     compare: serverDoc.compare || { a: null, b: null },
     branchCompare: serverDoc.branchCompare || { a: null, b: null },

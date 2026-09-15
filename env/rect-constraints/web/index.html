@@ -70,6 +70,7 @@
         <button class="tab" data-tab="templates" title="把选中矩形间的约束保存成带名槽位的参数化模板，应用到其他矩形组合；支持实例链接、版本升级/固定/脱离">模板 <span id="tpl-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="audit">审计/分支 <span id="audit-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="merge" title="基于共同祖先的三方合并：选择来源/目标分支，预览自动合并项与冲突，逐项保留目标/采用来源/手动填写，生成可反复打开的合并草案">合并 <span id="merge-count" class="badge zero">0</span></button>
+        <button class="tab" data-tab="impact" title="影响分析与安全变更：沿约束关系展开直接/间接受影响的矩形、约束与分支结果；把删除/移动/改参数作为候选变更先模拟，显示位置变化、冲突链、循环依赖与越界风险，绑定文档版本后一次性应用">影响分析 <span id="impact-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="experiments">实验 <span id="exp-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="workbench" title="可回放的实验审计工作台：跨实验/变体/分支筛选、求解前后模型与冲突链、顺序回放与差异切换">审计台 <span id="wb-count" class="badge zero">0</span></button>
         <button class="tab" data-tab="notify" title="审阅通知与升级中心：按决定/签署/冲突/完成触发的多级通知、延迟升级、确认/稍后/转交与时间线报告">通知中心 <span id="ntf-count" class="badge zero">0</span></button>
@@ -142,6 +143,8 @@
       </div>
 
       <div class="tab-body hidden" data-body="merge"></div>
+
+      <div class="tab-body hidden" data-body="impact"></div>
 
       <div class="tab-body hidden" data-body="experiments">
         <div class="exp-bar">

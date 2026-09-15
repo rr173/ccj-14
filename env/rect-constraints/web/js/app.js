@@ -4,6 +4,7 @@ import { ConstraintDialog } from './geom/dialog.js';
 import { VersionPanel } from './geom/versionpanel.js';
 import { AuditPanel } from './geom/auditpanel.js';
 import { MergePanel } from './geom/mergepanel.js';
+import { ImpactPanel } from './geom/impactpanel.js';
 import { ExperimentPanel } from './geom/experimentpanel.js';
 import { WorkbenchPanel } from './geom/workbenchpanel.js';
 import { ReleasePanel } from './geom/releasepanel.js';
@@ -65,6 +66,10 @@ dialog.hooks = { onCycle: (cyc) => view.setCycleHighlight(cyc) };
 const versionPanel = new VersionPanel(store, { toast });
 const auditPanel = new AuditPanel(store, { toast });
 const mergePanel = new MergePanel(store, { toast });
+const impactPanel = new ImpactPanel(store, {
+  toast,
+  getSelectedRectIds: () => [...view.selected],
+});
 const experimentPanel = new ExperimentPanel(store, { toast });
 const workbenchPanel = new WorkbenchPanel(store, { toast });
 const releasePanel = new ReleasePanel(store, { toast });
@@ -105,12 +110,14 @@ $('#btn-delete').onclick = () => {
 
 /* ---------- tabs ---------- */
 
-$$('.tab').forEach((b) => b.onclick = () => {
-  activeTab = b.dataset.tab;
-  $$('.tab').forEach((x) => x.classList.toggle('active', x === b));
-  $$('.tab-body').forEach((x) => x.classList.toggle('hidden', x.dataset.body !== activeTab));
+$$('.tab').forEach((b) => b.onclick = () => switchToTab(b.dataset.tab));
+
+function switchToTab(name) {
+  activeTab = name;
+  $$('.tab').forEach((x) => x.classList.toggle('active', x.dataset.tab === name));
+  $$('.tab-body').forEach((x) => x.classList.toggle('hidden', x.dataset.body !== name));
   renderPanels();
-});
+}
 
 /* ---------- 快捷键 ---------- */
 
@@ -229,6 +236,7 @@ function renderPanels() {
   versionPanel.render();
   auditPanel.render();
   mergePanel.render();
+  impactPanel.render();
   experimentPanel.render();
   workbenchPanel.render();
   migrationPanel.render();
@@ -278,6 +286,7 @@ function renderConstraintList() {
         </label>
         <span class="spacer"></span>
         <span class="actions">
+          <button class="mini" data-act="impact" title="沿约束关系展开受影响矩形/约束，并把删除/移动/改参数作为候选变更先模拟">影响分析</button>
           <button class="mini" data-act="dup" title="复制约束">复制</button>
           <button class="mini danger" data-act="del">删除</button>
         </span>
@@ -299,6 +308,13 @@ function renderConstraintList() {
     div.querySelector('[data-act=en]').onchange = (e) =>
       commitConstraintEdit(c.id, (cc) => (cc.enabled = e.target.checked));
     div.querySelector('[data-act=del]').onclick = (e) => { e.stopPropagation(); commitConstraintEdit(c.id, null); };
+    div.querySelector('[data-act=impact]').onclick = (e) => {
+      e.stopPropagation();
+      const res = store.createImpactAnalysis({ kind: 'constraint', id: c.id });
+      if (!res.ok) { toast(res.error, 'error'); return; }
+      switchToTab('impact');
+      toast('已创建该约束的影响分析快照');
+    };
     div.querySelector('[data-act=dup]').onclick = (e) => {
       e.stopPropagation();
       store.commit((m) => {

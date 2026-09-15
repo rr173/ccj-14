@@ -18,12 +18,12 @@
  * - 本页有未保存修改时收到 409：锁定写入并提示；无修改时静默跟随。
  */
 
-import { solve, findCycle } from './solver.js';
+import { solve, findCycle, constraintLabel } from './solver.js';
 import { validate, normalize, seedModel, uid } from './model.js';
 import { snapshotVersion, compareVersions } from './versions.js';
 import {
   MAIN_BRANCH, makeRootEvent, makeEvent, makeForkRootEvent, makeExperimentForkRootEvent,
-  makeMigrationForkRootEvent, migrationBranchId, makeMergeEvent,
+  makeMigrationForkRootEvent, migrationBranchId, makeMergeEvent, makeImpactEvent,
   sanitizeAudit, migrateLegacy, timelineFor, localSeqOf, isAncestor,
   mergeDocs, assessConflict, freeze,
 } from './audit.js';
@@ -69,6 +69,10 @@ import {
   buildMergeReport, makeMergeDraft, mergeDraftId, findMergeBase,
   choicesToMap, itemKey, mergeMergeDrafts, rebaseConflictChoices,
 } from './merge.js';
+import {
+  analyzeImpact, simulateChanges, normalizeChange, makeImpactSnapshot, impactSnapshotId,
+  sanitizeImpactSnapshots, mergeImpactSnapshots, buildImpactReport,
+} from './impact.js';
 import {
   extractDraft, publishVersion, templateVersion as tplVersion,
   planInstance, mappingFingerprint, diffTemplateVersions, migrateParams,
@@ -125,6 +129,13 @@ export class Store extends EventTarget {
     this.mergeDrafts = [];                // merge draft[]（open / completed / abandoned）
     this.activeMergeDraftId = null;       // 当前打开的草案 id（随文档持久化）
     this.mergeConflict = null;            // null | { draftId, reason, targetHeadId, targetHeadSeq, serverRev }
+
+    // 影响分析与安全变更工作台：分析快照（绑定分析时文档版本 / 分支 head）+ 候选变更 + 模拟结果，
+    // 全部随文档持久化；刷新 / 重启后可继续逐项放弃候选、查看模拟与报告，应用时一次性写审计事件。
+    this.impactSnapshots = [];            // impact snapshot[]（open / applied / abandoned）
+    this.activeImpactId = null;           // 当前打开的分析快照 id（随文档持久化）
+    this.impactWarnings = [];
+    this._impactApplying = null;          // 应用在途标记 { snapshotId, branchId, rollback, conflict }
 
     // 参数化约束模板：模板（草稿 + 只读版本）与实例链接（文档级，随文档持久化）。
     // 实例在某分支上“链接/固定/脱离”的状态由当前模型约束上的 tpl 标签派生（deriveInstanceLinks），
@@ -352,6 +363,12 @@ export class Store extends EventTarget {
     this.activeMergeDraftId = this.mergeDrafts.some((d) => d.id === doc.activeMergeDraftId) ? doc.activeMergeDraftId : null;
     this.mergeConflict = null;
 
+    // 影响分析与安全变更：分析快照（绑定分析时文档版本 / 分支 head）/ 候选变更 / 模拟结果 /
+    // 应用事件随文档持久化。加载时做确定性结构清洗；冲突原因保留到对应 open 快照上。
+    this.impactWarnings = [];
+    this.impactSnapshots = sanitizeImpactSnapshots(doc.impactSnapshots, this.impactWarnings);
+    this.activeImpactId = this.impactSnapshots.some((x) => x.id === doc.activeImpactId) ? doc.activeImpactId : null;
+
     // 参数化约束模板：模板（草稿 + 只读版本）/ 实例链接随文档持久化。
     // 版本不可改写由 sanitizeTemplates（同 no 保留第一条）与发布流程共同保证；
     // 草稿乐观锁基线在装载时重置（本页自写 rev 由保存成功路径补登）。
@@ -543,6 +560,8 @@ export class Store extends EventTarget {
       activeReleaseId: this.activeReleaseId,
       mergeDrafts: this.mergeDrafts,
       activeMergeDraftId: this.activeMergeDraftId,
+      impactSnapshots: this.impactSnapshots,
+      activeImpactId: this.activeImpactId,
       templates: this.templates,
       templateInstances: this.templateInstances,
       activeTemplateId: this.activeTemplateId,
@@ -645,6 +664,13 @@ export class Store extends EventTarget {
       finalDoc.activeMergeDraftId = finalDoc.mergeDrafts.some((x) => x.id === finalDoc.activeMergeDraftId)
         ? finalDoc.activeMergeDraftId
         : (payload.activeMergeDraftId && finalDoc.mergeDrafts.some((x) => x.id === payload.activeMergeDraftId) ? payload.activeMergeDraftId : null);
+      // 影响分析快照按 id 合流（applied 不被 open 旧副本降级；open 以最近更新者为准），刷新/多页签后快照一致
+      finalDoc.impactSnapshots = mergeImpactSnapshots(
+        Array.isArray(prev?.impactSnapshots) ? prev.impactSnapshots : (finalDoc.impactSnapshots || []),
+        payload.impactSnapshots || []);
+      finalDoc.activeImpactId = finalDoc.impactSnapshots.some((x) => x.id === finalDoc.activeImpactId)
+        ? finalDoc.activeImpactId
+        : (payload.activeImpactId && finalDoc.impactSnapshots.some((x) => x.id === payload.activeImpactId) ? payload.activeImpactId : null);
       // 参数化约束模板：模板按 id 合流（草稿 draftRev 更大者胜出、已发布版本 no 并集不可改写），
       // 实例按 id 合流（updatedAt 更新者整体胜出、detached 墓碑不复活）
       finalDoc.templates = mergeTemplates(
@@ -984,6 +1010,17 @@ export class Store extends EventTarget {
         });
         if (res.status === 409) {
           const data = await res.json().catch(() => ({}));
+          // 影响分析安全变更在途：同分支被另一页面提交（branch-advanced）时由 impact 流程接管：
+          // 记录冲突信息，applyImpact 会回滚本地事件推进并保留候选，绝不进入全局只读冲突态。
+          if (this._impactApplying && (data.reason === 'branch-advanced' || data.error === 'revision-conflict')) {
+            this._impactApplying.conflict = {
+              branchId: this._impactApplying.branchId,
+              headEventId: data.headEventId || null,
+              headSeq: data.headSeq ?? null,
+              serverRev: Number.isFinite(data.rev) ? data.rev : null,
+            };
+            return;
+          }
           if (typeof data?.sessionId === 'string' && String(data.reason || '').startsWith('review-')) {
             // 审阅冲突（会话 rev 前进 / 节点指纹变化 / 节点缺失 / 分支推进）：
             // 不锁定几何编辑，只锁定该会话；本地决定保留为 proposals，等待逐项合并
@@ -1953,6 +1990,447 @@ export class Store extends EventTarget {
   mergeReportForEvent(eventId) {
     const ev = this.eventsById.get(eventId);
     return ev?.kind === 'merge' ? (ev.merge?.report || null) : null;
+  }
+
+  /* ==================== 影响分析与安全变更 ==================== */
+
+  get activeImpact() {
+    return this.impactSnapshots.find((x) => x.id === this.activeImpactId) || null;
+  }
+
+  impactById(id) { return this.impactSnapshots.find((x) => x.id === id) || null; }
+
+  /** 当前分支 head 的只读影响分析预览（不落盘）。rectIds 非空时种子取第一个选中矩形。 */
+  previewImpact(seed) {
+    if (this.replaying) return { ok: false, error: '回放模式为只读，请先退出回放' };
+    const head = this.headEvent;
+    if (!head?.model) return { ok: false, error: '当前分支没有可分析的布局' };
+    if (!seed || !['rect', 'constraint'].includes(seed.kind)) return { ok: false, error: '请先选择一个矩形或约束' };
+    if (seed.kind === 'rect' && !head.model.rects.some((r) => r.id === seed.id)) {
+      return { ok: false, error: '选中的矩形不存在' };
+    }
+    if (seed.kind === 'constraint' && !head.model.constraints.some((c) => c.id === seed.id)) {
+      return { ok: false, error: '选中的约束不存在' };
+    }
+    const impact = analyzeImpact(head.model, seed, { simulation: null, baseReport: head.report });
+    if (!impact.seed.valid) return { ok: false, error: '选中的对象不存在，无法展开影响面' };
+    return { ok: true, impact, model: head.model, report: head.report };
+  }
+
+  /**
+   * 为当前分支 head 创建（或复用同内容的）影响分析快照并绑定分析时的文档版本。
+   * 快照记录完整基线模型 / 求解报告：之后分支继续前进，分析仍基于同一版本可查看、可模拟。
+   */
+  createImpactAnalysis(seed, { name = '', changes = null } = {}) {
+    if (this.replaying) return { ok: false, error: '回放模式为只读，请先退出回放或另存为新分支' };
+    const preview = this.previewImpact(seed);
+    if (!preview.ok) return preview;
+    const head = this.headEvent;
+    const normChanges = this._normalizeChanges(changes || []);
+    if (normChanges.errors.length) return { ok: false, error: normChanges.errors[0] };
+
+    const id = impactSnapshotId({
+      branchId: this.currentBranchId, headEventId: head.id,
+      seed: { kind: seed.kind, id: seed.id }, changes: normChanges.list,
+    });
+    const existed = this.impactSnapshots.some((x) => x.id === id);
+    let snap = this.impactSnapshots.find((x) => x.id === id);
+    let simulation = null;
+    let impact = preview.impact;
+    if (normChanges.list.length) {
+      simulation = simulateChanges(head.model, head.report, normChanges.list);
+      impact = analyzeImpact(head.model, seed, { simulation, baseReport: head.report });
+    }
+    if (!snap) {
+      snap = makeImpactSnapshot({
+        id,
+        name: String(name || '').trim() || this._defaultImpactName(seed, head.model),
+        seed: { kind: seed.kind, id: seed.id },
+        branchId: this.currentBranchId,
+        branchName: this.branch?.name || '',
+        headEventId: head.id,
+        docRev: this.rev,
+        baseModel: head.model,
+        baseReport: head.report,
+        baseHash: head.hash,
+        changes: normChanges.list,
+        simulation,
+        analysis: impact,
+        actor: this.actor || '',
+      });
+      this.impactSnapshots = [...this.impactSnapshots, snap];
+    } else if (normChanges.list.length) {
+      // 同 id 快照更新候选（同分支 head + 同种子 + 同候选内容才会同 id，正常不会走到；保留确定性兜底）
+      snap = this._replaceImpact({ ...snap, changes: normChanges.list, simulation, impact, updatedAt: Date.now() });
+    }
+    this.activeImpactId = id;
+    this._dirty = true;
+    this.persist();
+    this._emit('impact', { type: 'create', id });
+    return { ok: true, snapshot: snap, impact, simulation, reused: existed };
+  }
+
+  _defaultImpactName(seed, model) {
+    if (seed.kind === 'rect') {
+      const r = model.rects.find((x) => x.id === seed.id);
+      return `影响分析：矩形「${r?.name || seed.id}」`;
+    }
+    const c = model.constraints.find((x) => x.id === seed.id);
+    const label = c ? constraintLabel(c, new Map(model.rects.map((r) => [r.id, r]))) : seed.id;
+    return `影响分析：${label}`;
+  }
+
+  _normalizeChanges(rawList) {
+    const list = [];
+    const errors = [];
+    (Array.isArray(rawList) ? rawList : []).forEach((raw, i) => {
+      const norm = normalizeChange(raw, { idx: i });
+      if (norm.error) errors.push(`第 ${i + 1} 项：${norm.error}`);
+      else if (!list.some((x) => x.id === norm.value.id)) list.push(norm.value);
+    });
+    list.sort((a, b) => (a.id < b.id ? -1 : 1));
+    return { list, errors };
+  }
+
+  /**
+   * 更新快照的候选变更集合（添加 / 替换 / 逐项放弃），并重跑确定性模拟。
+   * mode='replace'（默认）整体替换；'discard' 放弃指定 changeId 列表（逐项放弃候选）。
+   */
+  updateImpactCandidates(id, rawChanges, { mode = 'replace' } = {}) {
+    const snap = this.impactById(id);
+    if (!snap) return { ok: false, error: '影响分析快照不存在' };
+    if (snap.status !== 'open') return { ok: false, error: `该分析已${snap.status === 'applied' ? '应用' : '放弃'}，不能再修改候选` };
+    let next;
+    if (mode === 'discard') {
+      const drop = new Set(Array.isArray(rawChanges) ? rawChanges : [rawChanges]);
+      next = snap.changes.filter((c) => !drop.has(c.id));
+    } else {
+      const norm = this._normalizeChanges(rawChanges);
+      if (norm.errors.length) return { ok: false, error: norm.errors[0] };
+      next = norm.list;
+    }
+    const simulation = next.length
+      ? simulateChanges(snap.baseModel, snap.baseReport, next)
+      : null;
+    const impact = analyzeImpact(snap.baseModel, snap.seed, { simulation, baseReport: snap.baseReport });
+    const updated = freeze({
+      ...snap,
+      changes: next,
+      simulation,
+      impact,
+      conflict: null, // 候选变化后旧的版本冲突原因不再适用；应用时重新核对
+      updatedAt: Date.now(),
+    });
+    this._replaceImpact(updated);
+    this._dirty = true;
+    this.persist();
+    this._emit('impact', { type: 'candidates', id });
+    return { ok: true, snapshot: this.impactById(id), simulation, impact };
+  }
+
+  /** 逐项放弃一个候选变更（其余候选保留并重新模拟）。 */
+  discardImpactChange(id, changeId) {
+    return this.updateImpactCandidates(id, [changeId], { mode: 'discard' });
+  }
+
+  selectImpact(id) {
+    if (id && !this.impactSnapshots.some((x) => x.id === id)) return { ok: false };
+    this.activeImpactId = id || null;
+    this._dirty = true;
+    this.persist();
+    this._emit('impact', { type: 'select', id });
+    return { ok: true };
+  }
+
+  /** 放弃整张分析快照（候选与模拟一并标记 abandoned；审计事件不受影响）。 */
+  abandonImpact(id) {
+    const snap = this.impactById(id);
+    if (!snap) return { ok: false, error: '影响分析快照不存在' };
+    if (snap.status === 'open') {
+      this._replaceImpact(freeze({ ...snap, status: 'abandoned', updatedAt: Date.now() }));
+      this._dirty = true;
+      this.persist();
+    }
+    if (this.activeImpactId === id) this.activeImpactId = null;
+    this._emit('impact', { type: 'abandon', id });
+    return { ok: true };
+  }
+
+  /** 用当前候选重跑模拟（纯查看；基线固定为分析时版本）。 */
+  resimulateImpact(id, extraChanges = null) {
+    const snap = this.impactById(id);
+    if (!snap) return { ok: false, error: '影响分析快照不存在' };
+    const changes = extraChanges || snap.changes;
+    const simulation = simulateChanges(snap.baseModel, snap.baseReport, changes);
+    const impact = analyzeImpact(snap.baseModel, snap.seed, { simulation, baseReport: snap.baseReport });
+    return { ok: true, simulation, impact };
+  }
+
+  /** 快照绑定的分支 head 在本地是否已前进。 */
+  impactBranchAdvanced(snap) {
+    const b = this.branches.find((x) => x.id === snap.branchId);
+    return !!(b && snap.status === 'open' && b.headEventId !== snap.headEventId);
+  }
+
+  /**
+   * 正式应用一组候选变更：
+   *  - 快照绑定分析时文档版本（docRev / headEventId / baseHash）；应用前核对本地与服务端权威 head，
+   *    文档或当前分支已前进 -> 409 impact-branch-advanced，不追加任何事件，候选原样保留；
+   *  - 模拟阻断项（结构 / 悬空 / 环 / 越界）-> 拒绝，不追加事件，无部分修改；
+   *  - 同一组候选（同快照 / 同结果指纹）重复提交 -> 幂等返回既有 impact 事件；
+   *  - 通过后在快照分支一次性追加一条 kind='impact' 审计事件（原子提交），快照标记 applied。
+   */
+  async applyImpact(id, { label = '' } = {}) {
+    if (this.replaying) return { ok: false, status: 403, reason: 'replay-readonly', error: '回放模式为只读，请先退出回放或另存为新分支' };
+    if (this.saveConflict) return { ok: false, status: 409, reason: 'branch-advanced', error: '版本冲突未解决，请先重新加载' };
+    const snap0 = this.impactById(id);
+    if (!snap0) return { ok: false, status: 404, error: '影响分析快照不存在' };
+    if (snap0.status === 'applied' && snap0.appliedEventId) {
+      const existing = this.eventsById.get(snap0.appliedEventId);
+      if (existing) return { ok: true, idempotent: true, event: existing, snapshot: snap0 };
+    }
+    if (snap0.status !== 'open') return { ok: false, error: '该影响分析已放弃，不能应用' };
+
+    // 1) 版本核对：本地分支 head 前进优先返回；否则拉服务端权威文档核对
+    const advanced = await this._checkImpactAdvanced(snap0);
+    if (advanced) {
+      const conflict = { reason: 'impact-branch-advanced', ...advanced, at: Date.now() };
+      this._replaceImpact(freeze({ ...snap0, conflict, updatedAt: Math.max(snap0.updatedAt || 0, Date.now()) }));
+      this._emit('impact', { type: 'conflict', id });
+      // 采用服务端权威文档再保存冲突状态（快照按 id 合流保留），避免随后保存撞上同分支 409
+      await this._adoptServerAfterImpactConflict(id);
+      this._dirty = true;
+      this.persist();
+      return {
+        ok: false, status: 409, reason: 'impact-branch-advanced',
+        error: `分析绑定的分支已前进到 #${advanced.headSeq ?? '?'}，候选变更保留但未应用——请基于最新版本重新分析`,
+        ...advanced, conflict,
+      };
+    }
+
+    // 2) 重跑模拟（权威判定；不依赖快照里可能较旧的 simulation）
+    const sim = simulateChanges(snap0.baseModel, snap0.baseReport, snap0.changes);
+    if (!sim.ok) {
+      const first = sim.errors.find((e) => e.code === 'cycle')
+        || sim.errors.find((e) => e.code === 'out-of-bounds')
+        || sim.errors[0];
+      this._emit('impact', { type: 'blocked', id });
+      return { ok: false, reason: 'impact-blocked', error: first?.message || '候选变更未通过安全检查', errors: sim.errors, cycle: sim.cycle };
+    }
+
+    // 3) 幂等：同快照 / 同结果指纹的 impact 事件已在分支链上 -> 直接复用
+    const branch = this.branches.find((b) => b.id === snap0.branchId);
+    const already = this._findImpactEvent(branch, snap0.id, sim.resultHash);
+    if (already) {
+      this._markImpactApplied(snap0, already, sim, { idempotent: true });
+      return { ok: true, idempotent: true, event: already, snapshot: this.impactById(id) };
+    }
+
+    // 4) 一次性原子提交：构造 impact 事件、推进分支 head、标记快照 applied、保存。
+    //    保存返回 409（应用在途时另一页面恰好提交了同分支）时回滚本地事件推进，快照保留候选与冲突原因。
+    const parent = this.eventsById.get(branch.headEventId);
+    const impactMeta = {
+      snapshotId: snap0.id,
+      docRev: snap0.docRev,
+      baseHeadId: snap0.headEventId,
+      baseHash: snap0.baseHash,
+      seed: structuredClone(snap0.seed),
+      changes: structuredClone(snap0.changes),
+      changeIds: sim.changeIds,
+      resultHash: sim.resultHash,
+      removedConstraintIds: sim.removedConstraintIds,
+    };
+    const ev = makeImpactEvent(parent, branch.id, sim.model, sim.report, {
+      actor: this.actor || '未署名',
+      label: label || `安全变更：${snap0.name}`,
+      t: Date.now(),
+      impact: impactMeta,
+    });
+
+    const prevBranch = this.branches.find((b) => b.id === branch.id);
+    const wasCurrent = this.currentBranchId === branch.id;
+    const prevCurrent = this.currentBranchId;
+    this.events = [...this.events, ev];
+    this.eventsById.set(ev.id, ev);
+    this._replaceBranch({ ...branch, headEventId: ev.id, redoTipId: null });
+    this.currentBranchId = branch.id;
+    this.replayEventId = null;
+    this.replaySnapshot = null;
+
+    const rollback = (info) => {
+      this.events = this.events.filter((x) => x.id !== ev.id);
+      this.eventsById.delete(ev.id);
+      this._replaceBranch(prevBranch);
+      this.currentBranchId = prevCurrent;
+      const conflict = {
+        reason: 'impact-branch-advanced',
+        branchId: branch.id, headEventId: info?.headEventId || null,
+        headSeq: info?.headSeq ?? null, serverRev: info?.serverRev ?? null, at: Date.now(),
+      };
+      const cur = this.impactById(snap0.id) || snap0;
+      this._replaceImpact(freeze({ ...cur, conflict }));
+      this._emit('impact', { type: 'conflict', id: snap0.id });
+    };
+
+    // 快照先以“应用中”状态保存（仍记录候选与基线，任何失败都不丢）。
+    // 用在途标记拦截 409：应用期间同分支被另一页面提交时，按 impact 专用冲突处理并回滚本地事件，
+    // 绝不设置全局 saveConflict（否则整个编辑器进入只读冲突态，候选也无法继续操作）。
+    this._impactApplying = { snapshotId: snap0.id, rollback, branchId: branch.id };
+    this._dirty = true;
+    let saveError = null;
+    try {
+      this.persist();
+      await this.flushed();
+    } catch (e) {
+      saveError = e;
+    }
+    const applying = this._impactApplying || null;
+    const impactConflictDuringApply = applying?.conflict || null;
+    this._impactApplying = null;
+    if (impactConflictDuringApply || this.saveConflict) {
+      const info = impactConflictDuringApply || { headSeq: this.saveConflict?.headSeq ?? null, serverRev: this.saveConflict?.serverRev ?? null };
+      if (this.saveConflict) this.saveConflict = null; // 由 impact 流程接管：回滚 + 候选保留，不锁编辑器
+      rollback(info);
+      // 采用服务端权威文档（候选快照在 mergeDocs 中按 id 合流保留），避免随后保存冲突状态时
+      // 再次撞上同分支 409 而进入全局只读冲突态；本地事件推进已在 rollback 中撤销。
+      await this._adoptServerAfterImpactConflict(applying?.snapshotId || snap0.id);
+      this._dirty = true;
+      this.persist();
+      return {
+        ok: false, status: 409, reason: 'impact-branch-advanced',
+        error: `应用期间分支已前进${info.headSeq ? `到 #${info.headSeq}` : ''}，已回滚本地修改，候选变更原样保留`,
+        conflict: this.impactById(snap0.id)?.conflict || null,
+      };
+    }
+    if (saveError && this.online) {
+      rollback(null);
+      return { ok: false, error: '保存失败，已回滚本地修改（候选变更保留），请稍后重试' };
+    }
+
+    // 5) 成功：回填完整影响报告，快照标记 applied
+    this._markImpactApplied(this.impactById(snap0.id) || snap0, ev, sim, {});
+    if (!wasCurrent) {
+      // 保持用户原分支选择；head 已推进的是快照分支
+      this.currentBranchId = prevCurrent;
+    }
+    this._reconcileTemplateStatuses();
+    this._dirty = true;
+    this.persist();
+    this._emit('impact', { type: 'apply', id: snap0.id, eventId: ev.id });
+    this._emit('branch', { type: 'impact-commit', id: branch.id });
+    this._emit('change', { label: 'impact' });
+    return { ok: true, idempotent: false, event: this.eventsById.get(ev.id), snapshot: this.impactById(snap0.id), simulation: sim };
+  }
+
+  /** 应用期间分支前进 409 后：采用服务端权威文档，同时保留本页 open 快照上的冲突原因与候选。 */
+  async _adoptServerAfterImpactConflict(activeSnapshotId) {
+    let serverDoc = null;
+    try { serverDoc = await this._fetchDoc(); } catch { serverDoc = null; }
+    if (!serverDoc) return; // 离线：保持本地状态（候选与冲突原因已写入快照）
+    // adopt 后当前分支 head 来自服务端权威文档：先把乐观基线前进到服务端 head，
+    // 否则随后保存冲突状态的 PUT 会携带过期 baseHeads 而再次撞上 branch-advanced 409。
+    const serverHeads = {};
+    for (const b of Array.isArray(serverDoc.branches) ? serverDoc.branches : []) {
+      if (b && typeof b.id === 'string') serverHeads[b.id] = b.headEventId;
+    }
+    // 带冲突原因的本地快照优先：时间戳推进到“现在”，确保跨 id 合流时压过服务端旧副本。
+    const localSnapshots = this.impactSnapshots.map((snap) => (snap.id === activeSnapshotId
+      ? { ...snap, conflict: snap.conflict || { reason: 'impact-branch-advanced', at: Date.now() }, updatedAt: Date.now() }
+      : snap));
+    const merged = mergeDocs(serverDoc, { ...this._payload(), impactSnapshots: localSnapshots, baseHeads: { ...this._syncedHeads, ...serverHeads } });
+    // 冲突 adopt 与普通几何合流不同：当前分支没有要保留的本地提交（应用已回滚），
+    // head 必须采用服务端权威值，否则 mergeDocs 会保留客户端旧 head 导致下一次保存再撞 409。
+    for (const [bid, headId] of Object.entries(serverHeads)) {
+      const mb = merged.branches.find((x) => x.id === bid);
+      const sb = serverDoc.branches.find((x) => x.id === bid);
+      if (mb && sb) merged.branches = merged.branches.map((x) => (x.id === bid ? freeze(sb) : x));
+      this._syncedHeads[bid] = headId;
+    }
+    // mergeDocs 已合流 impactSnapshots；再强制以本地冲突快照为准（冲突原因不能丢）
+    merged.impactSnapshots = mergeImpactSnapshots(serverDoc.impactSnapshots || [], localSnapshots);
+    const localConflictSnap = localSnapshots.find((x) => x.id === activeSnapshotId);
+    if (localConflictSnap?.conflict) {
+      merged.impactSnapshots = merged.impactSnapshots.map((x) => (x.id === activeSnapshotId ? localConflictSnap : x));
+      merged.activeImpactId = activeSnapshotId;
+    }
+    await this._adopt(merged, { seed: false, keepReviewConflict: true });
+    if (activeSnapshotId && this.impactById(activeSnapshotId)) this.activeImpactId = activeSnapshotId;
+    this.rev = Number.isFinite(merged.rev) ? merged.rev : this.rev;
+    // 应用在途的 409 已由 impact 流程处理：清掉可能残留的全局冲突锁，编辑器保持可编辑
+    this.saveConflict = null;
+    for (const b of this.branches) this._syncedHeads[b.id] = b.headEventId;
+  }
+
+  /** 应用前核对快照绑定分支的权威 head（本地优先；否则拉取服务端）；离线退回本地判断。 */
+  async _checkImpactAdvanced(snap) {
+    const b = this.branches.find((x) => x.id === snap.branchId);
+    if (!b) return { branchId: snap.branchId, headEventId: null, headSeq: null };
+    if (b.headEventId !== snap.headEventId) {
+      const head = this.eventsById.get(b.headEventId);
+      return { branchId: b.id, headEventId: b.headEventId, headSeq: head?.seq ?? null };
+    }
+    let serverDoc = null;
+    try { serverDoc = await this._fetchDoc(); } catch { serverDoc = null; }
+    if (!serverDoc) return null;
+    const srv = (Array.isArray(serverDoc.branches) ? serverDoc.branches : [])
+      .find((x) => x && x.id === snap.branchId);
+    if (srv && srv.headEventId && srv.headEventId !== snap.headEventId) {
+      const ev = (Array.isArray(serverDoc.events) ? serverDoc.events : [])
+        .find((e) => e && e.id === srv.headEventId);
+      return {
+        branchId: snap.branchId, headEventId: srv.headEventId,
+        headSeq: ev?.seq ?? null, serverRev: Number.isFinite(serverDoc.rev) ? serverDoc.rev : null,
+      };
+    }
+    return null;
+  }
+
+  _findImpactEvent(branch, snapshotId, resultHash) {
+    let cur = this.eventsById.get(branch.headEventId);
+    let guard = 0;
+    while (cur && guard++ < 100000) {
+      if (cur.kind === 'impact' && cur.impact && (cur.impact.snapshotId === snapshotId || cur.hash === resultHash)) return cur;
+      cur = cur.parentId ? this.eventsById.get(cur.parentId) : null;
+    }
+    return null;
+  }
+
+  _markImpactApplied(snap, ev, sim, { idempotent = false } = {}) {
+    const report = buildImpactReport({
+      ...snap,
+      status: 'applied',
+      appliedAt: ev.t,
+      appliedEventId: ev.id,
+      resultHash: ev.hash,
+    }, { generatedAt: ev.t, event: ev });
+    const applied = freeze({
+      ...snap,
+      status: 'applied',
+      appliedAt: ev.t,
+      appliedEventId: ev.id,
+      resultHash: ev.hash,
+      report,
+      conflict: null,
+      updatedAt: Date.now(),
+    });
+    this.impactSnapshots = this.impactSnapshots.map((x) => (x.id === snap.id ? applied : x));
+    if (this.activeImpactId === snap.id) this.activeImpactId = snap.id;
+    if (!idempotent) this._dirty = true;
+  }
+
+  _replaceImpact(next) {
+    const frozen = freeze(next);
+    this.impactSnapshots = this.impactSnapshots.map((x) => (x.id === next.id ? frozen : x));
+    return frozen;
+  }
+
+  /** 影响分析报告（导出用；open 快照也可导出当前模拟报告）。 */
+  impactReport(id = this.activeImpactId, { generatedAt = Date.now() } = {}) {
+    const snap = this.impactById(id);
+    if (!snap) return null;
+    if (snap.status === 'applied' && snap.report) return snap.report;
+    const ev = snap.appliedEventId ? this.eventsById.get(snap.appliedEventId) : null;
+    return buildImpactReport(snap, { generatedAt, event: ev });
   }
 
   /* ---------- 实验审计工作台（视图状态持久化） ---------- */

@@ -93,7 +93,7 @@ def _valid_shape(doc):
             m = e.get("model")
             if not isinstance(m, dict) or not isinstance(m.get("rects"), list) or not isinstance(m.get("constraints"), list):
                 return False
-            if e.get("kind") not in (None, "root", "edit", "fork-root", "merge"):
+            if e.get("kind") not in (None, "root", "edit", "fork-root", "merge", "impact"):
                 return False
         for b in branches:
             if not isinstance(b, dict) or not isinstance(b.get("id"), str) or not isinstance(b.get("name"), str):
@@ -168,9 +168,43 @@ def _valid_shape(doc):
     # 编辑分支三方合并草案（可为空）：轻量结构校验，共同祖先 / 环 / 越界对账在浏览器纯函数里
     if not _valid_merge_draft_shape(doc):
         return False
+    # 影响分析与安全变更快照（可为空）：轻量结构校验，影响图 / 模拟 / 版本对账在浏览器纯函数里
+    if not _valid_impact_shape(doc):
+        return False
     # 参数化约束模板与实例链接（可为空）：轻量结构校验，环 / 越界 / 槽位对账在浏览器纯函数里
     if not _valid_template_shape(doc):
         return False
+    return True
+
+
+def _valid_impact_shape(doc):
+    snaps = doc.get("impactSnapshots", [])
+    if not isinstance(snaps, list):
+        return False
+    for s in snaps:
+        if not isinstance(s, dict) or not isinstance(s.get("id"), str):
+            return False
+        if s.get("status") not in (None, "open", "applied", "abandoned"):
+            return False
+        for k in ("branchId", "headEventId"):
+            if not isinstance(s.get(k), str):
+                return False
+        seed = s.get("seed")
+        if not isinstance(seed, dict) or seed.get("kind") not in (None, "rect", "constraint"):
+            return False
+        bm = s.get("baseModel")
+        if not isinstance(bm, dict) or not isinstance(bm.get("rects"), list) or not isinstance(bm.get("constraints"), list):
+            return False
+        changes = s.get("changes", [])
+        if not isinstance(changes, list):
+            return False
+        for ch in changes:
+            if not isinstance(ch, dict) or not isinstance(ch.get("id"), str) or not isinstance(ch.get("kind"), str):
+                return False
+            if ch.get("kind") not in ("delete-rect", "move-rect", "delete-constraint", "modify-constraint"):
+                return False
+        if s.get("status") == "applied" and not isinstance(s.get("appliedEventId"), str):
+            return False
     return True
 
 
@@ -1222,6 +1256,35 @@ def _merge_merge_drafts(server_list, client_list):
 
 # ---- 参数化约束模板合流（同 web/js/geom/templates.js mergeTemplates / mergeInstances） ----
 
+def _merge_impact_snapshots(server_list, client_list):
+    """影响分析快照按 id 合流（同 web/js/geom/impact.js mergeImpactSnapshots）。"""
+    rank = {"open": 0, "abandoned": 1, "applied": 2}
+    by_id, order = {}, []
+    for s in list(server_list or []) + list(client_list or []):
+        if not isinstance(s, dict) or not isinstance(s.get("id"), str):
+            continue
+        sid = s["id"]
+        ex = by_id.get(sid)
+        if ex is None:
+            by_id[sid] = s
+            order.append(sid)
+            continue
+        rs, re_ = rank.get(s.get("status", "open"), 0), rank.get(ex.get("status", "open"), 0)
+        win = s if (rs != re_ and rs > re_) or (rs == re_ and int(s.get("updatedAt") or 0) >= int(ex.get("updatedAt") or 0)) else ex
+        merged = dict(ex)
+        merged.update(win)
+        done = ex if ex.get("status") == "applied" else (s if s.get("status") == "applied" else None)
+        if done:
+            merged["status"] = "applied"
+            merged["appliedEventId"] = done.get("appliedEventId")
+            merged["resultHash"] = done.get("resultHash")
+            merged["report"] = done.get("report") or merged.get("report")
+            merged["appliedAt"] = done.get("appliedAt")
+            merged["conflict"] = None
+        by_id[sid] = merged
+    return [by_id[i] for i in order]
+
+
 def _merge_templates(server_list, client_list):
     """模板按 id 并集：草稿 draftRev 更大者整体胜出；已发布版本按 no 并集且同 no 不改写。"""
     by_id, order = {}, []
@@ -1360,6 +1423,8 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
     releases = _merge_releases(server_doc.get("releases", []), client_doc.get("releases", []))
     migrations = _merge_migrations(server_doc.get("migrations", []), client_doc.get("migrations", []))
     merge_drafts = _merge_merge_drafts(server_doc.get("mergeDrafts", []), client_doc.get("mergeDrafts", []))
+    impact_snapshots = _merge_impact_snapshots(
+        server_doc.get("impactSnapshots", []), client_doc.get("impactSnapshots", []))
     # 参数化约束模板：草稿 draftRev 更大者胜出、版本 no 并集不可改写；实例 id 并集、detached 墓碑不复活
     templates = _merge_templates(server_doc.get("templates", []), client_doc.get("templates", []))
     template_instances = _merge_template_instances(
@@ -1381,6 +1446,7 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
         "releases": releases,
         "migrations": migrations,
         "mergeDrafts": merge_drafts,
+        "impactSnapshots": impact_snapshots,
         "templates": templates,
         "templateInstances": template_instances,
         "activeTemplateId": server_doc.get("activeTemplateId")
@@ -1389,6 +1455,9 @@ def _merge_docs(server_doc, client_doc, outbox_tombstones=None):
         "activeMergeDraftId": server_doc.get("activeMergeDraftId")
             if any(d.get("id") == server_doc.get("activeMergeDraftId") for d in merge_drafts)
             else (client_doc.get("activeMergeDraftId") if any(d.get("id") == client_doc.get("activeMergeDraftId") for d in merge_drafts) else None),
+        "activeImpactId": server_doc.get("activeImpactId")
+            if any(s.get("id") == server_doc.get("activeImpactId") for s in impact_snapshots)
+            else (client_doc.get("activeImpactId") if any(s.get("id") == client_doc.get("activeImpactId") for s in impact_snapshots) else None),
         "activeReleaseId": server_doc.get("activeReleaseId")
             or (client_doc.get("activeReleaseId") if any(r.get("id") == client_doc.get("activeReleaseId") for r in releases) else None),
         "activeReviewId": server_doc.get("activeReviewId")
