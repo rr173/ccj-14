@@ -191,6 +191,16 @@ def _valid_merge_draft_shape(doc):
                 return False
             if c.get("resolution") not in ("target", "source", "manual"):
                 return False
+        # 更新 head 后仅供参考、不会生效的旧选择（结构同 choices；可缺省）
+        prior = d.get("priorChoices", [])
+        if prior is not None:
+            if not isinstance(prior, list):
+                return False
+            for c in prior:
+                if not isinstance(c, dict) or not isinstance(c.get("key"), str):
+                    return False
+                if c.get("resolution") not in ("target", "source", "manual"):
+                    return False
     return True
 
 
@@ -1114,16 +1124,49 @@ def _merge_merge_drafts(server_list, client_list):
         merged = dict(ex)
         merged.update(win)
         if ex.get("status") == "open" and d.get("status") == "open":
-            chm = {}
             newer = int(d.get("updatedAt") or 0) >= int(ex.get("updatedAt") or 0)
             first, second = (ex, d) if newer else (d, ex)
-            for c in (first.get("choices") or []):
-                if isinstance(c, dict) and isinstance(c.get("key"), str):
-                    chm[c["key"]] = c
-            for c in (second.get("choices") or []):
-                if isinstance(c, dict) and isinstance(c.get("key"), str):
-                    chm[c["key"]] = c
-            merged["choices"] = sorted(chm.values(), key=lambda c: c["key"])
+
+            def cat(c, dr):
+                try:
+                    return int(c.get("at"))
+                except (TypeError, ValueError):
+                    return int(dr.get("updatedAt") or 0)
+
+            # priorChoices 同时充当已确认选择的墓碑：一页更新 head 后，
+            # 另一页迟到保存的旧 choices 不得把已重置的选择复活。
+            reset_at = {}
+            for dr in (first, second):
+                for c in (dr.get("priorChoices") or []):
+                    if isinstance(c, dict) and isinstance(c.get("key"), str):
+                        reset_at[c["key"]] = max(reset_at.get(c["key"], float("-inf")), cat(c, dr))
+            chm = {}
+            for dr in (first, second):
+                for c in (dr.get("choices") or []):
+                    if isinstance(c, dict) and isinstance(c.get("key"), str):
+                        at = cat(c, dr)
+                        if at < reset_at.get(c["key"], float("-inf")):
+                            continue
+                        prev = chm.get(c["key"])
+                        if prev is None or at >= prev[2]:
+                            chm[c["key"]] = (c, dr, at)
+            merged["choices"] = sorted((c for c, _, _ in chm.values()), key=lambda c: c["key"])
+            # 仅供参考的旧选择同样按键取新并集，再剔除已被重新确认的键（参考绝不覆盖已确认选择）
+            prm = {}
+            for dr in (first, second):
+                for c in (dr.get("priorChoices") or []):
+                    if isinstance(c, dict) and isinstance(c.get("key"), str):
+                        at = cat(c, dr)
+                        prev = prm.get(c["key"])
+                        if prev is None or at >= prev[2]:
+                            prm[c["key"]] = (c, dr, at)
+            merged["priorChoices"] = sorted(
+                (c for k, (c, _, _) in prm.items() if k not in chm),
+                key=lambda c: c["key"],
+            )
+            merged["refreshedAt"] = max(
+                int(first.get("refreshedAt") or 0), int(second.get("refreshedAt") or 0)
+            ) or None
             merged["status"] = "open"
         done = ex if ex.get("status") == "completed" else (d if d.get("status") == "completed" else None)
         if done:

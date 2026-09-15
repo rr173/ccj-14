@@ -844,6 +844,10 @@ button.mini.ok { color: var(--ok); border-color: #bfe6cd; }
 .mg-no-conflict { color: var(--ok); font-size: 12.5px; padding: 4px 0 8px; }
 .mg-conf { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 8px 0; background: #fcfcfe; }
 .mg-conf.resolved { border-color: #b9dcc6; background: #f7fdf9; }
+.mg-conf.pending { border-color: #e6c98a; background: #fffdf4; }
+.mg-prior { background: var(--warn-soft); border-left: 3px solid var(--warn); color: #7a5a14;
+  border-radius: 4px; padding: 5px 9px; font-size: 12px; margin: 4px 0 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mg-prior .mini { margin-left: auto; }
 .mg-conf-h { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
 .mg-cons-label { font-weight: 400; font-size: 12px; color: var(--muted); margin-top: 2px; }
 .mg-flag { font-size: 11px; color: var(--warn); background: var(--warn-soft); border-radius: 5px; padding: 1px 6px; margin-left: 6px; }

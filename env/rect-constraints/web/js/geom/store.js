@@ -67,7 +67,7 @@ import {
 import {
   buildMergePlan, assembleMergeModel, finalizeMergeModel,
   buildMergeReport, makeMergeDraft, mergeDraftId, findMergeBase,
-  choicesToMap, itemKey, mergeMergeDrafts,
+  choicesToMap, itemKey, mergeMergeDrafts, rebaseConflictChoices,
 } from './merge.js';
 
 const LS_KEY = 'rect-constraints-doc-v2';
@@ -1468,7 +1468,11 @@ export class Store extends EventTarget {
     if (!draft) return null;
     const view = this.viewForDraft(draft);
     if (!view.ok) return { draft, ok: false, reason: view.reason, message: view.message };
-    return { draft, ok: true, ...view, choices: choicesToMap(draft.choices) };
+    return {
+      draft, ok: true, ...view,
+      choices: choicesToMap(draft.choices),
+      priorChoices: choicesToMap(draft.priorChoices),
+    };
   }
 
   /** 目标分支是否已在草案打开后前进（仅本地视图）。 */
@@ -1543,10 +1547,13 @@ export class Store extends EventTarget {
       if (!chk.ok) return { ok: false, error: chk.error };
       manualNorm = chk.value;
     }
+    const nowSel = Date.now();
     const choices = draft.choices.filter((c) => c.key !== key);
-    choices.push({ key, resolution, ...(resolution === 'manual' ? { manual: manualNorm } : {}) });
+    choices.push({ key, resolution, at: nowSel, ...(resolution === 'manual' ? { manual: manualNorm } : {}) });
     choices.sort((a, b) => (a.key < b.key ? -1 : 1));
-    this._replaceMergeDraft({ ...draft, choices, updatedAt: Date.now() });
+    // 重新确认后，该项的旧选择不再需要作为参考提示
+    const priorChoices = (draft.priorChoices || []).filter((c) => c.key !== key);
+    this._replaceMergeDraft({ ...draft, choices, priorChoices, updatedAt: nowSel });
     this._dirty = true;
     this.persist();
     this._emit('merge', { type: 'resolution', id: draftId, key });
@@ -1610,8 +1617,12 @@ export class Store extends EventTarget {
 
   /**
    * 更新草案到最新的目标 / 来源 head（用户“更新到最新分支头”）。
-   * 已有冲突选择按 key 保留；新计划中不再是双方冲突的选择被忽略，
-   * 新出现 / 仍存在的冲突需要逐项重新确认（选择不自动套用）。
+   * 旧冲突选择一律【不再直接生效】：
+   *   - 新计划中仍是双方冲突的项，旧选择移入 priorChoices 仅供参考，冲突回到未确认状态，
+   *     必须逐项再次选择（每项可一键沿用旧选择，但仍是一次明确的重新确认）；
+   *   - 新计划里变成自动项 / 对象消失 / 两边趋同的旧选择直接丢弃；
+   *   - 新出现的冲突同样为未确认。
+   * 只有全部冲突重新选择后才允许提交。
    */
   refreshMergeDraftHeads(draftId, { targetHeadId = null, sourceHeadId = null } = {}) {
     const draft = this.mergeDraftById(draftId);
@@ -1626,18 +1637,22 @@ export class Store extends EventTarget {
     });
     if (!view.ok) return { ok: false, error: view.message };
     const newId = mergeDraftId(view.plan);
-    // 在新计划的冲突项里保留仍适用的旧选择；其余（自动项 / 消失项）丢弃
-    const newKeys = new Set([...view.plan.rects.conflicts, ...view.plan.constraints.conflicts].map(itemKey));
-    const carried = draft.choices.filter((c) => newKeys.has(c.key));
+    const conflictKeys = [...view.plan.rects.conflicts, ...view.plan.constraints.conflicts].map(itemKey);
+    const now = Date.now();
+    // 旧选择全部重置：仍存在冲突的移入参考列表，其余丢弃；新草案 choices 为空
+    const rebased = rebaseConflictChoices(draft.choices, conflictKeys, now);
 
     if (newId === draft.id) {
-      // head 未变（可能只是来源前进）：原地更新选择即可
-      this._replaceMergeDraft({ ...draft, choices: carried, updatedAt: Date.now() });
+      // head 未变（可能只是来源前进）：旧选择同样重置为未确认，仅保留参考
+      this._replaceMergeDraft({
+        ...draft, choices: rebased.choices, priorChoices: rebased.priorChoices,
+        refreshedAt: now, updatedAt: now,
+      });
     } else {
-      // head 变化：旧 open 草案标记 superseded（保留记录与来源关系），新建草案并复用 carried 选择
-      const old = { ...draft, status: 'superseded', supersededBy: newId, updatedAt: Date.now() };
+      // head 变化：旧 open 草案标记 superseded（保留记录与来源关系），新建草案；旧选择只作参考
+      const old = { ...draft, status: 'superseded', supersededBy: newId, updatedAt: now };
       const nd0 = makeMergeDraft(view.plan, { actor: draft.actor || this.actor || '未署名' });
-      const nd = freeze({ ...nd0, choices: carried });
+      const nd = freeze({ ...nd0, choices: [], priorChoices: rebased.priorChoices, refreshedAt: now });
       this.mergeDrafts = this.mergeDrafts.map((d) => (d.id === old.id ? freeze({ ...old }) : d));
       if (!this.mergeDrafts.some((d) => d.id === nd.id)) this.mergeDrafts = [...this.mergeDrafts, nd];
       this.activeMergeDraftId = nd.id;
@@ -1646,7 +1661,7 @@ export class Store extends EventTarget {
     this._dirty = true;
     this.persist();
     this._emit('merge', { type: 'refresh-heads', id: this.activeMergeDraftId });
-    return { ok: true, id: this.activeMergeDraftId, carried: carried.length };
+    return { ok: true, id: this.activeMergeDraftId, prior: rebased.priorChoices.length };
   }
 
   /** 放弃草案（不影响任何事件）。 */
@@ -4058,7 +4073,8 @@ const MERGE_DRAFT_STATUSES = new Set(['open', 'completed', 'abandoned', 'superse
 /**
  * 载入时清洗合并草案（确定性、幂等、不重算几何）：
  * - 丢弃结构不完整 / 重复 id（保留第一条）的草案；
- * - choices 只保留 {key,resolution,manual?} 且 resolution 合法；
+ * - choices 只保留 {key,resolution,manual?} 且 resolution 合法（仅已确认选择）；
+ * - priorChoices（更新 head 后仅供参考的旧选择）同构清洗，同样只保留合法 resolution；
  * - completed 必须带 mergeEventId/resultHash，否则回退 open（事件可能尚未合流到本页）。
  */
 export function sanitizeMergeDrafts(list) {
@@ -4077,13 +4093,20 @@ export function sanitizeMergeDrafts(list) {
     if (status === 'completed' && (typeof d0.mergeEventId !== 'string' || typeof d0.resultHash !== 'string')) {
       status = 'open';
     }
-    const choices = (Array.isArray(d0.choices) ? d0.choices : [])
+    const cleanChoices = (raw) => (Array.isArray(raw) ? raw : [])
       .filter((c) => c && typeof c.key === 'string' && ['target', 'source', 'manual'].includes(c.resolution))
       .map((c) => ({
         key: c.key,
         resolution: c.resolution,
         ...(c.resolution === 'manual' && c.manual && typeof c.manual === 'object' ? { manual: c.manual } : {}),
+        ...(Number.isFinite(c.at) ? { at: c.at } : {}),
       }));
+    const choices = cleanChoices(d0.choices);
+    // 参考选择里凡已确认的键一律剔除（参考不得与已确认选择并存/覆盖）
+    const confirmedKeys = new Set(choices.map((c) => c.key));
+    const priorChoices = cleanChoices(d0.priorChoices)
+      .filter((c) => !confirmedKeys.has(c.key))
+      .filter((c, i, arr) => arr.findIndex((x) => x.key === c.key) === i);
     out.push({
       id: d0.id,
       createdAt: Number.isFinite(d0.createdAt) ? d0.createdAt : 0,
@@ -4099,6 +4122,8 @@ export function sanitizeMergeDrafts(list) {
       targetHeadHash: typeof d0.targetHeadHash === 'string' ? d0.targetHeadHash : '',
       sourceHeadHash: typeof d0.sourceHeadHash === 'string' ? d0.sourceHeadHash : '',
       choices,
+      priorChoices,
+      refreshedAt: Number.isFinite(d0.refreshedAt) ? d0.refreshedAt : null,
       completedAt: Number.isFinite(d0.completedAt) ? d0.completedAt : null,
       mergeEventId: typeof d0.mergeEventId === 'string' ? d0.mergeEventId : null,
       resultHash: typeof d0.resultHash === 'string' ? d0.resultHash : null,

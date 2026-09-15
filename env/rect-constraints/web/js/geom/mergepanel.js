@@ -4,7 +4,8 @@
  * - 预览矩形位置尺寸、约束、自动合并项、冲突项；
  * - 每个冲突可选 保留目标 / 采用来源 / 手动填写结果；
  * - 合并后悬空引用 / 循环依赖 / 越界 / 未解决冲突都明确阻止完成；
- * - 合并期间目标分支前进 -> 版本冲突，本地选择保留，更新到最新 head 后逐项重新确认；
+ * - 合并期间目标分支前进 -> 版本冲突，本地选择保留；更新到最新 head 后旧选择仅作参考，
+ *   仍存在的冲突全部回到未确认状态，逐项再次选择（可一键沿用旧选择）后才允许提交；
  * - 完成后在目标分支生成 merge 审计事件，可查看合并前后差异与逐项裁决报告。
  */
 
@@ -127,7 +128,7 @@ export class MergePanel {
       </div>`;
 
     this._renderBlockers(host.querySelector('#mg-blockers'), preview, advanced);
-    this._renderConflicts(host.querySelector('#mg-conflicts'), view, choices);
+    this._renderConflicts(host.querySelector('#mg-conflicts'), view, choices, view.priorChoices);
     this._renderAutos(host.querySelector('#mg-autos'), plan);
     const diffHost = host.querySelector('#mg-diff');
     if (preview.ok) {
@@ -149,7 +150,7 @@ export class MergePanel {
         else if (act === 'commit') this._commit(draft.id);        else if (act === 'refresh-heads') {
           const r = s.refreshMergeDraftHeads(draft.id);
           if (!r.ok) this._toast(r.error, 'error');
-          else this._toast(`已更新到最新分支头，${r.carried} 项已有选择保留，请逐项重新确认`);
+          else this._toast(`已更新到最新分支头，${r.prior} 项旧选择仅作参考，仍存在的冲突须逐项重新确认`);
         }
       };
     });
@@ -169,7 +170,8 @@ export class MergePanel {
       headText = `目标分支「${tb?.name || ''}」已前进到 #${th?.seq ?? '?'}`;
     }
     return `<div class="mg-conflict-banner">
-      ⚠ <b>版本冲突：${escapeHtml(headText)}</b>。本地冲突选择已保留，完成合并被阻止。请先
+      ⚠ <b>版本冲突：${escapeHtml(headText)}</b>。当前选择已保留在本草案中，完成合并被阻止。更新后旧选择仅作参考，
+      所有仍存在的冲突都要逐项重新确认。请先
       <button class="mini" data-act="refresh-heads">更新到最新分支头并逐项重新确认</button>。
     </div>`;
   }
@@ -197,16 +199,22 @@ export class MergePanel {
 
   /* ---------- 冲突项 ---------- */
 
-  _renderConflicts(host, view, choices) {
+  static RESOLUTION_TEXT = { target: '保留目标', source: '采用来源', manual: '手动填写' };
+
+  _renderConflicts(host, view, choices, priorChoices) {
     const { plan, models } = view;
+    priorChoices = priorChoices || new Map();
     const items = [...plan.rects.conflicts, ...plan.constraints.conflicts];
     if (!items.length) { host.innerHTML = '<div class="mg-no-conflict">两边改动互不相交：没有需要人工解决的冲突。</div>'; return; }
     host.innerHTML = '<h4 class="ver-h">需逐项解决的冲突</h4>' + items.map((item) => {
       const key = itemKey(item);
       const ch = choices.get(key);
+      const prior = ch ? null : priorChoices.get(key); // 已重新确认后不再显示旧选择参考
       const res = ch?.resolution || '';
-      return `<div class="mg-conf ${res ? 'resolved' : 'open'}" data-key="${key}" data-kind="${item.kind}">
+      const state = ch ? 'resolved' : (prior ? 'pending' : 'open');
+      return `<div class="mg-conf ${state}" data-key="${key}" data-kind="${item.kind}">
         ${this._conflictHeader(item)}
+        ${prior ? this._priorHint(prior) : ''}
         <div class="mg-sides">
           <div class="mg-side target">${this._sideValue(item, 'target', models)}</div>
           <div class="mg-side source">${this._sideValue(item, 'source', models)}</div>
@@ -215,7 +223,7 @@ export class MergePanel {
           <label><input type="radio" name="${key}" value="target" ${res === 'target' ? 'checked' : ''}/> 保留目标</label>
           <label><input type="radio" name="${key}" value="source" ${res === 'source' ? 'checked' : ''}/> 采用来源</label>
           <label><input type="radio" name="${key}" value="manual" ${res === 'manual' ? 'checked' : ''}/> 手动填写</label>
-          <label class="mg-del-manual"><input type="checkbox" data-f="manualdelete" ${res === 'manual' && !ch.manual ? 'checked' : ''}/> 手动删除</label>
+          <label class="mg-del-manual"><input type="checkbox" data-f="manualdelete" ${res === 'manual' && !ch?.manual ? 'checked' : ''}/> 手动删除</label>
         </div>
         <div class="mg-manual" ${res === 'manual' ? '' : 'hidden'}>${this._manualEditor(item, ch)}</div>
       </div>`;
@@ -253,7 +261,28 @@ export class MergePanel {
         if (!r.ok) this._toast(r.error, 'error');
         else this._toast('已采用手动填写结果');
       };
+      // 更新 head 后：一键沿用旧选择（仍是一次明确的逐项重新确认）
+      const adopt = card.querySelector('[data-act=adopt-prior]');
+      if (adopt) {
+        adopt.onclick = () => {
+          const prior = priorChoices.get(key);
+          if (!prior) return;
+          const r = this.store.setMergeResolution(draftId, key, prior.resolution, prior.manual || null);
+          if (!r.ok) this._toast(r.error, 'error');
+          else this._toast(`已重新确认：${MergePanel.RESOLUTION_TEXT[prior.resolution] || prior.resolution}`);
+        };
+      }
     });
+  }
+
+  /** 更新 head 后保留的旧选择提示（仅供参考，不会自动生效）。 */
+  _priorHint(prior) {
+    const label = MergePanel.RESOLUTION_TEXT[prior.resolution] || prior.resolution;
+    const detail = prior.resolution === 'manual'
+      ? (prior.manual ? `（${escapeHtml(prior.manual.name || prior.manual.id || JSON.stringify(prior.manual))}）` : '（删除该对象）')
+      : '';
+    return `<div class="mg-prior">🕘 更新前的旧选择：<b>${escapeHtml(label)}</b>${detail}，分支头已更新，请重新确认
+      <button class="mini" data-act="adopt-prior">沿用旧选择</button></div>`;
   }
 
   _conflictHeader(item) {
@@ -473,10 +502,12 @@ export class MergePanel {
       const sb = s.branches.find((b) => b.id === d.sourceBranchId)?.name || d.sourceBranchId;
       const st = { open: '进行中', completed: '已完成', abandoned: '已放弃', superseded: '已更新' }[d.status] || d.status;
       const cls = { open: 'st-open', completed: 'st-done', abandoned: 'st-ab', superseded: 'st-su' }[d.status] || '';
+      const priorN = d.priorChoices?.length || 0;
+      const priorText = priorN ? ` · 旧选择参考 ${priorN}（待重新确认）` : '';
       return `<div class="mg-draft ${d.id === s.activeMergeDraftId ? 'active' : ''}" data-id="${d.id}">
         <span class="mg-st ${cls}">${st}</span>
         <b>⎀ ${escapeHtml(sb)} → ${escapeHtml(tb)}</b>
-        <span class="mg-draft-meta">冲突选择 ${d.choices.length} · ${d.completedAt ? new Date(d.completedAt).toLocaleDateString() : '未完成'}</span>
+        <span class="mg-draft-meta">冲突选择 ${d.choices.length}${priorText} · ${d.completedAt ? new Date(d.completedAt).toLocaleDateString() : '未完成'}</span>
         <span class="spacer"></span>
         <button class="mini" data-act="open">${d.status === 'completed' ? '查看报告' : '打开'}</button>
       </div>`;

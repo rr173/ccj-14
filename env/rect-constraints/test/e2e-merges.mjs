@@ -110,15 +110,25 @@ ok(rep2 && rep2.diff, '刷新后合并报告仍可查看');
 // 合并期间目标分支前进：另一页面推进 main，本页旧草案提交返回 409
 const s3 = new Store({ base: BASE });
 await s3.load();
-// 先再造一对分叉用于前进场景
-s3.commit((m) => m.rects.push(newRect(400, 400, 40, 40, '第二次分叉点')), { label: '第二次分叉点' });
+// 先再造一对分叉用于前进场景（含一个改名冲突，验证更新后必须逐项重新确认）
+s3.commit((m) => m.rects.push(newRect(400, 400, 40, 40, '第二次分叉矩形')), { label: '第二次分叉点' });
+const forkRectId = s3.model.rects.find((r) => r.name === '第二次分叉矩形').id;
 const base2 = s3.branch.headEventId;
 const fk2 = s3.forkFromEvent(base2, 'E2E 第二来源');
 const src2 = fk2.branch.id;
-s3.commit((m) => m.rects.push(newRect(80, 80, 30, 30, '第二来源矩形')), { label: '来源2' });
+s3.commit((m) => {
+  m.rects.push(newRect(80, 80, 30, 30, '第二来源矩形'));
+  m.rects.find((r) => r.id === forkRectId).name = '分叉矩形(来源改名)';
+}, { label: '来源2' });
 await s3.flushed();
 s3.switchBranch('main');
+// 目标在 fork 之后也改同一矩形的名字 -> 与来源改名冲突
+s3.commit((m) => { m.rects.find((r) => r.id === forkRectId).name = '分叉矩形(目标改名)'; }, { label: '目标侧改名' });
+await s3.flushed();
 const op2 = s3.openMergeDraft('main', src2);
+ok(op2.plan.counts.conflicts === 1, `第二次草案含 1 个冲突（实际 ${op2.plan.counts.conflicts}）`);
+const ckey = 'rect:' + forkRectId;
+ok(s3.setMergeResolution(op2.draft.id, ckey, 'source').ok, '更新前先为冲突选择“采用来源”');
 await s3.flushed();
 
 const other = new Store({ base: BASE });
@@ -130,16 +140,26 @@ const rejected = await s3.commitMerge(op2.draft.id);
 ok(!rejected.ok && rejected.status === 409 && rejected.reason === 'merge-target-advanced', '目标分支前进时提交返回 409');
 ok(s3.events.filter((e) => e.kind === 'merge').length === 1, '409 后没有产生第二条 merge 事件');
 
-// 更新到最新 head：旧选择保留、逐项重确认后可完成
+// 更新到最新 head：旧选择只作参考，冲突回到未确认，未重新选择前不能提交
 await s3.load();
 const rr = s3.refreshMergeDraftHeads(op2.draft.id);
 ok(rr.ok, '更新到最新分支头');
-const pv2 = s3.previewMerge(s3.activeMergeDraftId);
+ok(rr.prior === 1, `旧冲突选择保留为参考（实际 ${rr.prior}）`);
+const ndId = s3.activeMergeDraftId;
+const nView = s3.mergeDraftView(ndId);
+ok(nView.draft.choices.length === 0, '更新后已确认选择被清空');
+ok(nView.priorChoices.get(ckey)?.resolution === 'source', '旧选择保留在 priorChoices 供参考');
+const blockedAgain = await s3.commitMerge(ndId);
+ok(!blockedAgain.ok && /冲突|未选择/.test(blockedAgain.error || ''), '未逐项重新确认前仍阻止提交');
+// 逐项重新确认（沿用旧选择，但这是一次新的明确操作）后才允许提交
+ok(s3.setMergeResolution(ndId, ckey, 'source').ok, '逐项重新确认冲突');
+const pv2 = s3.previewMerge(ndId);
 ok(pv2.ok, JSON.stringify(pv2.errors || {}));
 ok(pv2.model.rects.some((r) => r.name === '第二来源矩形'), '更新后仍含来源改动');
 ok(pv2.model.rects.some((r) => r.name === '插入矩形'), '更新后含目标新增');
-const cm3 = await s3.commitMerge(s3.activeMergeDraftId);
-ok(cm3.ok, cm3.error || '更新 head 后合并成功');
+ok(pv2.model.rects.some((r) => r.name === '分叉矩形(来源改名)'), '重新确认后采用来源改名');
+const cm3 = await s3.commitMerge(ndId);
+ok(cm3.ok, cm3.error || '更新 head 且逐项重确认后合并成功');
 ok(s3.model.rects.some((r) => r.name === '第二来源矩形') && s3.model.rects.some((r) => r.name === '插入矩形'), '最终合并包含三方内容');
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`);

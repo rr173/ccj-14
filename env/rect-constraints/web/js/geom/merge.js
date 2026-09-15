@@ -430,15 +430,41 @@ export function makeMergeDraft(plan, { id = null, createdAt = Date.now(), actor 
     baseHash: plan.baseHash,
     targetHeadHash: plan.targetHeadHash,
     sourceHeadHash: plan.sourceHeadHash,
-    // 逐项冲突选择：{key, resolution, manual?}；自动项不存（由 plan 确定性推出）
+    // 逐项冲突选择（仅保存用户【已确认】的选择）：{key, resolution, manual?}；自动项不存（由 plan 确定性推出）
     choices: [],
+    // “更新到最新分支头”后，旧草案里对【仍存在的冲突】的旧选择仅作参考保留：
+    // 它们不再生效（不参与组装 / 提交），用户必须逐项再次确认；确认后从这里移入 choices。
+    priorChoices: [],
     // 完成后回填
     completedAt: null,
     mergeEventId: null,
     resultHash: null,
     report: null,
     conflictStale: null, // 目标分支在合并期间前进时记录 {fromHeadId,toHeadId,at}
+    refreshedAt: null,   // 最近一次更新到最新分支头的时间（旧选择重置为参考的时间点）
   });
+}
+
+/**
+ * 更新到最新分支头时重映射旧冲突选择。
+ * 旧选择绝不能在新计划上直接生效（旧冲突裁决可能已过时）：
+ *   - 旧草案 choices 中、键仍属于新计划冲突项的 -> 全部移入 priorChoices，仅供页面参考；
+ *   - 键已不再是冲突（变自动项 / 对象消失 / 趋同）-> 直接丢弃；
+ *   - 新草案的已确认 choices 一律为空，所有仍存在的冲突必须逐项再次选择。
+ * 返回 { choices: [], priorChoices }。
+ */
+export function rebaseConflictChoices(oldChoices, newConflictKeys, at = Date.now()) {
+  const keys = new Set(newConflictKeys || []);
+  const prior = (oldChoices || [])
+    .filter((c) => c && ['target', 'source', 'manual'].includes(c.resolution) && keys.has(c.key))
+    .map((c) => ({
+      key: c.key,
+      resolution: c.resolution,
+      ...(c.resolution === 'manual' && c.manual ? { manual: structuredClone(c.manual) } : {}),
+      at, // 同时作为该键已确认选择的墓碑时间戳（跨页签合流时阻止旧选择复活）
+    }))
+    .sort((a, b) => (a.key < b.key ? -1 : 1));
+  return { choices: [], priorChoices: prior };
 }
 
 /** 草案确定性 id：同一对分支 head 的草案永远是同一个（幂等的关键）。 */
@@ -461,6 +487,9 @@ export function choicesToMap(choices) {
   for (const c of choices || []) m.set(c.key, { resolution: c.resolution, manual: c.manual || null });
   return m;
 }
+
+/** 单个选择的时间戳（用于跨页签合流时判断同键新旧；旧数据无时间戳按 0 处理）。 */
+const choiceAt = (c, fallback = 0) => (Number.isFinite(c?.at) ? c.at : fallback);
 export function mapToChoices(map) {
   return [...map.entries()]
     .filter(([, v]) => v && ['target', 'source', 'manual'].includes(v.resolution))
@@ -486,6 +515,8 @@ const MERGE_DRAFT_RANK = { open: 0, abandoned: 1, superseded: 2, completed: 3 };
  * 合并草案跨分支合流（与服务端 _merge_merge_drafts 同构）：
  * - 按 id 并集；同 id 走得更远的状态胜出（completed > superseded > abandoned > open）；
  * - open 草案 choices 按键并集（updatedAt 更新一方的同键选择优先）；
+ * - priorChoices（更新 head 后仅供参考的旧选择）同样按键并集，
+ *   但任何已在 choices 里被用户重新确认的键都要从参考列表剔除——参考选择绝不能覆盖已确认选择；
  * - completed 结果（mergeEventId / resultHash / report）不被 open 旧副本降级。
  */
 export function mergeMergeDrafts(serverList, clientList) {
@@ -501,12 +532,46 @@ export function mergeMergeDrafts(serverList, clientList) {
     else win = (d.updatedAt || 0) >= (ex.updatedAt || 0) ? d : ex;
     const merged = { ...ex, ...win };
     if (ex.status === 'open' && d.status === 'open') {
-      const chMap = new Map();
       const newer = (d.updatedAt || 0) >= (ex.updatedAt || 0);
       const first = newer ? ex : d, second = newer ? d : ex;
-      for (const c of first.choices || []) chMap.set(c.key, c);
-      for (const c of second.choices || []) chMap.set(c.key, c);
-      merged.choices = [...chMap.values()].sort((a, b) => (a.key < b.key ? -1 : 1));
+      const fallbackAt = (dr) => dr.updatedAt || 0;
+      // 同键选择按条目自身时间戳（缺省回退所属草案 updatedAt）取新。
+      // 一页“更新 head”后，旧已确认选择移入 priorChoices（参考）并带 at：
+      // 它同时充当该键已确认选择的【墓碑】——另一页迟到保存的旧 choices 不会把它复活。
+      const resetAt = new Map(); // key -> 更新 head 重置为参考的时间戳
+      const noteReset = (dr) => {
+        for (const c of dr.priorChoices || []) {
+          if (!c || typeof c.key !== 'string') continue;
+          const at = choiceAt(c, fallbackAt(dr));
+          if (at >= (resetAt.get(c.key) ?? Number.NEGATIVE_INFINITY)) resetAt.set(c.key, at);
+        }
+      };
+      noteReset(first); noteReset(second);
+      const chMap = new Map();
+      const putChoice = (c, dr) => {
+        if (!c || typeof c.key !== 'string') return;
+        const at = choiceAt(c, fallbackAt(dr));
+        if (at < (resetAt.get(c.key) ?? Number.NEGATIVE_INFINITY)) return; // 已被更新 head 重置
+        const prev = chMap.get(c.key);
+        if (!prev || at >= prev.at) chMap.set(c.key, { win: c, dr, at });
+      };
+      for (const c of first.choices || []) putChoice(c, first);
+      for (const c of second.choices || []) putChoice(c, second);
+      merged.choices = [...chMap.values()].map((x) => x.win).sort((a, b) => (a.key < b.key ? -1 : 1));
+      // 仅供参考的旧选择同样按键取新并集，再剔除已被重新确认的键（参考绝不覆盖已确认选择）
+      const prMap = new Map();
+      const putPrior = (c, dr) => {
+        if (!c || typeof c.key !== 'string') return;
+        const at = choiceAt(c, fallbackAt(dr));
+        const prev = prMap.get(c.key);
+        if (!prev || at >= prev.at) prMap.set(c.key, { win: c, dr, at });
+      };
+      for (const c of first.priorChoices || []) putPrior(c, first);
+      for (const c of second.priorChoices || []) putPrior(c, second);
+      merged.priorChoices = [...prMap.values()].map((x) => x.win)
+        .filter((c) => !chMap.has(c.key))
+        .sort((a, b) => (a.key < b.key ? -1 : 1));
+      merged.refreshedAt = Math.max(first.refreshedAt || 0, second.refreshedAt || 0) || null;
       merged.status = 'open';
     }
     const done = ex.status === 'completed' ? ex : (d.status === 'completed' ? d : null);

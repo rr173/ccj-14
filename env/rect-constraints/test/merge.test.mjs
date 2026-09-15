@@ -32,7 +32,7 @@ const { Store } = await import('../web/js/geom/store.js');
 const { newRect, newSnap, newMinGap } = await import('../web/js/geom/model.js');
 const {
   findMergeBase, buildMergePlan, assembleMergeModel, finalizeMergeModel,
-  choicesToMap, itemKey, mergeMergeDrafts,
+  choicesToMap, itemKey, mergeMergeDrafts, rebaseConflictChoices,
 } = await import('../web/js/geom/merge.js');
 
 function makeHarness() {
@@ -547,7 +547,7 @@ test('合并期间目标分支被另一页面推进：提交返回版本冲突�
   assert.ok(p1.model.rects.some((x) => x.name === '后来的矩形'));
 });
 
-test('目标前进导致旧选择的冲突消失/变化时，更新后只保留仍适用的选择', async () => {
+test('目标前进后更新 head：旧选择只作参考（priorChoices），仍存在的冲突全部回到未确认，必须逐项重新选择', async () => {
   const { s: p1 } = await diverged({
     sourceEdit: (m) => { m.rects.find((x) => x.name === '基线矩形').name = '来源名'; },
     targetEdit: (m) => { m.rects.find((x) => x.name === '基线矩形').name = '目标名'; },
@@ -567,14 +567,92 @@ test('目标前进导致旧选择的冲突消失/变化时，更新后只保留�
   await p1.load();
   const r = p1.refreshMergeDraftHeads(opened.draft.id);
   assert.ok(r.ok);
-  const view = p1.mergeDraftView(p1.activeMergeDraftId);
-  // 两边结果现在相同：tri 仍标记双方 changed（相对各自 base），但 sameResult=true；
-  // 选择仍按 key 保留，提交结果确定（=来源名）
-  const carried = view.draft.choices;
-  assert.ok(carried.some((c) => c.key === key), '仍适用的选择保留');
-  const cm = await p1.commitMerge(p1.activeMergeDraftId);
+  assert.equal(r.prior, 1, '1 项旧选择保留为参考');
+  const ndId = p1.activeMergeDraftId;
+  const view = p1.mergeDraftView(ndId);
+  // 两边结果现在相同：tri 仍标记双方 changed（相对各自 base），sameResult=true，冲突项仍在
+  assert.equal(view.plan.rects.conflicts.length, 1);
+  // 旧选择绝不直接生效：新草案 choices 为空，冲突未确认
+  assert.deepEqual(view.draft.choices, [], '更新后已确认选择被清空');
+  assert.ok(!view.choices.has(key), '组装用的已确认选择不含旧项');
+  assert.equal(view.priorChoices.get(key)?.resolution, 'source', '旧选择仅保留在 priorChoices 供参考');
+  // 未逐项重新确认前，预览报告未解决冲突、提交被阻止
+  const pv0 = p1.previewMerge(ndId);
+  assert.equal(pv0.ok, false);
+  assert.deepEqual(pv0.unresolved, [key]);
+  const cm0 = await p1.commitMerge(ndId);
+  assert.equal(cm0.ok, false);
+  assert.match(cm0.error, /未选择处理方式|冲突/);
+
+  // 逐项重新确认（这里沿用旧选择，但必须是一次新的明确操作）后才允许提交
+  const again = p1.setMergeResolution(ndId, key, 'source');
+  assert.ok(again.ok);
+  const view2 = p1.mergeDraftView(ndId);
+  assert.deepEqual(view2.draft.priorChoices, [], '重新确认后参考提示消失');
+  const cm = await p1.commitMerge(ndId);
   assert.ok(cm.ok, cm.error);
   assert.ok(p1.model.rects.some((x) => x.name === '来源名'));
+});
+
+test('更新 head 后：旧选择仅保留在 priorChoices，不进入组装用的 choices', async () => {
+  const { s: p1 } = await diverged({
+    sourceEdit: (m) => { m.rects.find((x) => x.name === '基线矩形').name = '来源名'; },
+    targetEdit: (m) => { m.rects.find((x) => x.name === '基线矩形').name = '目标名'; },
+  });
+  const src = p1.branches.find((b) => b.name === '来源分支').id;
+  const opened = p1.openMergeDraft(MAIN_BRANCH, src);
+  const key = itemKey(opened.plan.rects.conflicts[0]);
+  p1.setMergeResolution(opened.draft.id, key, 'source');
+  await p1.flushed();
+
+  // 另一页面：目标把矩形改到与来源一致 -> 冲突项仍在（双方 changed），本用例验证参考语义
+  const p2 = new Store({ base: '' });
+  await p2.load();
+  p2.commit((m) => { m.rects.find((x) => x.name === '目标名').name = '来源名'; }, { label: '目标趋同' });
+  await p2.flushed();
+
+  await p1.load();
+  const rr = p1.refreshMergeDraftHeads(opened.draft.id);
+  assert.ok(rr.ok);
+  const ndId = p1.activeMergeDraftId;
+  const view = p1.mergeDraftView(ndId);
+  assert.deepEqual(view.draft.choices, [], '已确认选择清空');
+  assert.equal(view.priorChoices.get(key)?.resolution, 'source', '仍存在冲突的旧选择保留为参考');
+  assert.ok(![...view.choices.keys()].includes(key), '参考选择不出现在已确认 choices 中');
+});
+
+test('更新 head 后旧冲突彻底消失（变自动项）时，旧选择既不生效也不保留为参考', async () => {
+  const { s: p1 } = await diverged({
+    sourceEdit: (m) => { m.rects.find((x) => x.name === '基线矩形').name = '来源名'; },
+    targetEdit: (m) => { m.rects.find((x) => x.name === '基线矩形').name = '目标名'; },
+  });
+  const src = p1.branches.find((b) => b.name === '来源分支').id;
+  const opened = p1.openMergeDraft(MAIN_BRANCH, src);
+  const key = itemKey(opened.plan.rects.conflicts[0]);
+  p1.setMergeResolution(opened.draft.id, key, 'target');
+  await p1.flushed();
+
+  // 另一页面：目标放弃自己的改名（把名字改回基线），新计划里该矩形只有来源一方改动 -> 自动项
+  const p2 = new Store({ base: '' });
+  await p2.load();
+  p2.commit((m) => { m.rects.find((x) => x.name === '目标名').name = '基线矩形'; }, { label: '目标回退' });
+  await p2.flushed();
+
+  await p1.load();
+  const rr = p1.refreshMergeDraftHeads(opened.draft.id);
+  assert.ok(rr.ok);
+  assert.equal(rr.prior, 0, '消失的旧选择不保留为参考');
+  const ndId = p1.activeMergeDraftId;
+  const view = p1.mergeDraftView(ndId);
+  assert.equal(view.plan.rects.conflicts.length, 0);
+  assert.deepEqual(view.draft.choices, []);
+  assert.deepEqual(view.draft.priorChoices, []);
+  // 无冲突：自动采用来源改名，可直接提交
+  const pv = p1.previewMerge(ndId);
+  assert.ok(pv.ok, JSON.stringify(pv.errors));
+  assert.ok(pv.model.rects.some((x) => x.name === '来源名'));
+  const cm = await p1.commitMerge(ndId);
+  assert.ok(cm.ok, cm.error);
 });
 
 /* ---------- 刷新 / 重启一致性 ---------- */
@@ -637,6 +715,60 @@ test('完成后重启：草案为 completed，merge 事件可回放，报告与�
 });
 
 /* ---------- 草案跨页面合流（纯函数） ---------- */
+
+test('rebaseConflictChoices：旧选择全部转为参考，不再生效；消失项丢弃', () => {
+  const old = [
+    { key: 'rect:a', resolution: 'source' },
+    { key: 'rect:b', resolution: 'manual', manual: { id: 'b', name: 'm', x: 1, y: 2, w: 3, h: 4 } },
+    { key: 'constraint:c1', resolution: 'target' },
+  ];
+  const r = rebaseConflictChoices(old, ['rect:a', 'rect:b', 'rect:new']);
+  assert.deepEqual(r.choices, [], '重置后没有任何已确认选择');
+  assert.deepEqual(r.priorChoices.map((c) => c.key), ['rect:a', 'rect:b']);
+  // 不再是冲突的选择直接丢弃
+  assert.ok(!r.priorChoices.some((c) => c.key === 'constraint:c1'));
+  // 手动结果随参考保留（拷贝，不共享引用）
+  const b = r.priorChoices.find((c) => c.key === 'rect:b');
+  assert.equal(b.manual.name, 'm');
+  assert.notEqual(b.manual, old[1].manual);
+  // 非法条目被忽略
+  assert.deepEqual(rebaseConflictChoices([{ key: 'x', resolution: 'bogus' }], ['x']).priorChoices, []);
+});
+
+test('mergeMergeDrafts：priorChoices 按键并集，已重新确认的键从参考列表剔除', () => {
+  const reset = { id: 'd1', status: 'open', updatedAt: 2, choices: [], priorChoices: [{ key: 'rect:a', resolution: 'source' }] };
+  const confirmed = { id: 'd1', status: 'open', updatedAt: 3, choices: [{ key: 'rect:a', resolution: 'target' }], priorChoices: [] };
+  const m = mergeMergeDrafts([reset], [confirmed]);
+  assert.deepEqual(m[0].choices.map((c) => c.key), ['rect:a']);
+  assert.deepEqual(m[0].priorChoices, [], '已确认的键不再保留参考');
+});
+
+test('mergeMergeDrafts：更新 head 的重置是墓碑，另一页迟到的旧已确认选择不会复活', () => {
+  // 页 A 已更新 head：选择清空为参考（at=10）
+  const a = {
+    id: 'd1', status: 'open', updatedAt: 10, choices: [],
+    priorChoices: [{ key: 'rect:a', resolution: 'source', at: 10 }], refreshedAt: 10,
+  };
+  // 页 B 尚未同步，稍后保存带着旧的已确认选择（旧草案 at=5）
+  const b = {
+    id: 'd1', status: 'open', updatedAt: 5, choices: [{ key: 'rect:a', resolution: 'target' }],
+    priorChoices: [],
+  };
+  for (const m of [mergeMergeDrafts([a], [b]), mergeMergeDrafts([b], [a])]) {
+    assert.deepEqual(m[0].choices, [], '旧选择不得复活为已确认');
+    assert.equal(m[0].priorChoices.length, 1);
+    assert.equal(m[0].priorChoices[0].resolution, 'source');
+    assert.equal(m[0].refreshedAt, 10);
+  }
+  // 页 A 重新确认（at=12，晚于墓碑）后并集：重新确认生效，参考移除
+  const a2 = {
+    id: 'd1', status: 'open', updatedAt: 12, choices: [{ key: 'rect:a', resolution: 'target', at: 12 }],
+    priorChoices: [],
+  };
+  const m2 = mergeMergeDrafts([a], [a2]);
+  assert.deepEqual(m2[0].choices.map((c) => c.resolution), ['target']);
+  assert.deepEqual(m2[0].priorChoices, []);
+});
 
 test('mergeMergeDrafts：open 选择按键并集；completed 不被 open 旧副本降级', () => {
   const open1 = { id: 'd1', status: 'open', updatedAt: 1, choices: [{ key: 'rect:a', resolution: 'source' }] };
